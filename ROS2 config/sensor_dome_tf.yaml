@@ -1,0 +1,229 @@
+# =============================================================
+# ROS2 Static TF Transforms — Sensor Dome v17c
+#
+# All transforms: parent (imu_link) -> child (sensor_link)
+# Translation in meters, rotation as quaternion (x, y, z, w)
+#
+# Coordinate system: ROS REP 103
+#   +X = Forward (front of vehicle)
+#   +Y = Left
+#   +Z = Up
+#
+# IMU frame (imu_link):
+#   Origin at Point-One Atlas Duo Center of Navigation (CoN)
+#   XY = (0, 0) — geometric center of hex plate
+#   Z  = L1 plate top + atlas_con_z_from_mount_surface
+#
+# atlas_con_z_from_mount_surface: 18.5 mm
+#   Verified from Pointonenav-assembly-atlas-duo.pdf side view drawing.
+#   CoN is 18.5 mm above the bottom mounting surface of the Atlas Duo.
+#
+# Geometry source: sensor_dome.scad parameters
+#   lidar_ring_radius:  90.0 mm
+#   lidar_angles:       [0, 120, 240] deg
+#   L2_z_bottom:        166.0 mm (LiDAR mount surface)
+#   L2_z_top:           178.0 mm (camera mount surface)
+#   rgb_cam_x:          105.0 mm (radial offset)
+#   rgb_cam_y:           52.0 mm (lateral offset)
+#   plate_thickness:      6.0 mm
+#   atlas_con_z_from_mount_surface: 18.5 mm (verified from drawing)
+#   CoN Z in SCAD coords: 24.5 mm
+# =============================================================
+
+# ----- Configuration -----
+# To recalculate Z values for a different CoN height, adjust
+# atlas_con_z_from_mount_surface and recompute:
+#   lidar_z  = (166.0 - 6.0 - 18.5) / 1000 = 0.1415 m
+#   camera_z = (178.0 - 6.0 - 18.5) / 1000 = 0.1535 m
+
+# =============================================================
+# LiDAR Transforms (lidar2imu)
+#
+# 3× Seyond Robin W1G, top-mounted on L2 underside at 120° intervals.
+#
+# LiDAR origin (from Seyond-Robin-W1G-Manual.pdf §2.4):
+#   "The coordinate Origin is located at the center of the Cross
+#    on top of the housing." This is the top mounting surface,
+#   which sits against L2 bottom → z = L2_z_bottom in SCAD coords.
+#
+# Robin W1G native frame (§1.3 / §2.4): X=up, Y=right, Z=forward.
+# The seyond_lidar_ros driver is configured to transform point cloud
+# output to ROS REP 103 convention (X=fwd, Y=left, Z=up) at the
+# driver level via config.yaml / launch file parameters.
+#
+# With driver-level transformation enabled, each lidar_link frame
+# follows REP 103:
+#   +X = scanning direction (radially outward),
+#   +Y = left (tangential CCW), +Z = up.
+# Rotation is yaw-only (rotation about Z by mounting angle).
+# =============================================================
+
+static_transforms:
+
+  # --- LiDAR: Front (Side 1, 0°) ---
+  # Faces +X (forward). No rotation relative to IMU frame.
+  - frame_id: "imu_link"
+    child_frame_id: "lidar_front_link"
+    translation:
+      x:  0.090000
+      y:  0.000000
+      z:  0.141500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+      w:  1.000000
+
+  # --- LiDAR: Rear-Left (Side 3, 120°) ---
+  # Faces 120° from +X (rear-left).
+  - frame_id: "imu_link"
+    child_frame_id: "lidar_rear_left_link"
+    translation:
+      x: -0.045000
+      y:  0.077942
+      z:  0.141500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.866025
+      w:  0.500000
+
+  # --- LiDAR: Rear-Right (Side 5, 240°) ---
+  # Faces 240° from +X (rear-right).
+  - frame_id: "imu_link"
+    child_frame_id: "lidar_rear_right_link"
+    translation:
+      x: -0.045000
+      y: -0.077942
+      z:  0.141500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.866025
+      w: -0.500000
+
+# =============================================================
+# Camera Transforms (camera2imu)
+#
+# 4× RouteCAM_P_CU25_CXLC_IP67, bottom-mounted on L2 top surface.
+# camera_link frame: +X = optical axis (radially outward),
+#                    +Y = left, +Z = up.
+# For camera_optical_frame (used by image_pipeline):
+#   +Z = optical axis, +X = right, +Y = down.
+#   Apply additional rotation from camera_link to optical_frame:
+#     roll=-π/2, pitch=0, yaw=-π/2
+#     quaternion: (x=-0.5, y=0.5, z=-0.5, w=0.5)
+#
+# Front stereo pair: both face +X (0°), baseline = 104.0 mm.
+# Rear pair: symmetric about X axis (120° and 240°).
+# =============================================================
+
+  # --- Camera: Front-Right (0°, +Y offset) ---
+  # Faces +X (forward), offset +52mm in Y (left).
+  - frame_id: "imu_link"
+    child_frame_id: "cam_front_right_link"
+    translation:
+      x:  0.105000
+      y:  0.052000
+      z:  0.153500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+      w:  1.000000
+
+  # --- Camera: Front-Left (0°, -Y offset) ---
+  # Faces +X (forward), offset -52mm in Y (right).
+  - frame_id: "imu_link"
+    child_frame_id: "cam_front_left_link"
+    translation:
+      x:  0.105000
+      y: -0.052000
+      z:  0.153500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+      w:  1.000000
+
+  # --- Camera: Rear-Left (120°, +Y offset) ---
+  # Faces 120° from +X. Global position: (-97.5, +64.9) mm.
+  - frame_id: "imu_link"
+    child_frame_id: "cam_rear_left_link"
+    translation:
+      x: -0.097533
+      y:  0.064933
+      z:  0.153500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.866025
+      w:  0.500000
+
+  # --- Camera: Rear-Right (240°, -Y offset) ---
+  # Faces 240° from +X. Global position: (-97.5, -64.9) mm.
+  # Mirrors rear-left about X axis.
+  - frame_id: "imu_link"
+    child_frame_id: "cam_rear_right_link"
+    translation:
+      x: -0.097533
+      y: -0.064933
+      z:  0.153500
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.866025
+      w: -0.500000
+
+# =============================================================
+# Summary Table
+#
+# Sensor             X (m)     Y (m)     Z (m)    Yaw (°)
+# ---------------  --------  --------  --------  --------
+# lidar_front       0.0900    0.0000    0.1415      0
+# lidar_rear_left  -0.0450    0.0779    0.1415    120
+# lidar_rear_right -0.0450   -0.0779    0.1415    240
+# cam_front_right   0.1050    0.0520    0.1535      0
+# cam_front_left    0.1050   -0.0520    0.1535      0
+# cam_rear_left    -0.0975    0.0649    0.1535    120
+# cam_rear_right   -0.0975   -0.0649    0.1535    240
+#
+# All roll = 0, pitch = 0.
+# Front stereo baseline: 0.1040 m (104 mm).
+# Rear pair symmetric about X axis.
+# =============================================================
+
+# =============================================================
+# ROS2 Launch Usage Example
+#
+# Load these transforms in a launch file:
+#
+#   from launch import LaunchDescription
+#   from launch_ros.actions import Node
+#   import yaml
+#
+#   def generate_launch_description():
+#       with open('sensor_dome_tf.yaml', 'r') as f:
+#           config = yaml.safe_load(f)
+#
+#       nodes = []
+#       for tf in config['static_transforms']:
+#           t = tf['translation']
+#           r = tf['rotation']
+#           nodes.append(Node(
+#               package='tf2_ros',
+#               executable='static_transform_publisher',
+#               arguments=[
+#                   '--x', str(t['x']),
+#                   '--y', str(t['y']),
+#                   '--z', str(t['z']),
+#                   '--qx', str(r['x']),
+#                   '--qy', str(r['y']),
+#                   '--qz', str(r['z']),
+#                   '--qw', str(r['w']),
+#                   '--frame-id', tf['frame_id'],
+#                   '--child-frame-id', tf['child_frame_id'],
+#               ],
+#           ))
+#       return LaunchDescription(nodes)
+# =============================================================
