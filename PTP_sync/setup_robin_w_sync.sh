@@ -17,7 +17,7 @@
 # Prerequisites:
 #   - Step 1 (setup_ubuntu_sync.sh) completed
 #   - Robin W LiDARs powered on and connected to sensor Ethernet
-#   - Default LiDAR IPs: 172.168.1.10, .11, .12
+#   - Default LiDAR IPs: 192.168.1.10, .11, .12
 #
 # Usage:
 #   chmod +x setup_robin_w_sync.sh
@@ -25,15 +25,15 @@
 #
 # Examples:
 #   ./setup_robin_w_sync.sh --eth enp0s31f6
-#   ./setup_robin_w_sync.sh --eth enp0s31f6 --ips 172.168.1.10,172.168.1.11
-#   ./setup_robin_w_sync.sh --eth enp0s31f6 --ips 172.168.1.10  # single LiDAR
+#   ./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11
+#   ./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10  # single LiDAR
 # =============================================================
 
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────
 ETH_IFACE="${ETH_IFACE:-eth0}"
-LIDAR_IPS_STR="${LIDAR_IPS_STR:-172.168.1.10,172.168.1.11,172.168.1.12}"
+LIDAR_IPS_STR="${LIDAR_IPS_STR:-192.168.1.10,192.168.1.11,192.168.1.12}"
 ROS_DISTRO="jazzy"
 WS_DIR="$HOME/ros2_ws"
 

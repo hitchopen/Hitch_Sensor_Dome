@@ -35,7 +35,7 @@ set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────
 ETH_IFACE="${ETH_IFACE:-eth0}"
-HOST_IP="${HOST_IP:-172.168.1.1}"
+HOST_IP="${HOST_IP:-192.168.1.1}"   # RFC 1918 private — 192.168.1.x for sensor LAN
 ATLAS_SERIAL="${ATLAS_SERIAL:-/dev/ttyUSB0}"
 ROS_DISTRO="jazzy"
 WS_DIR="$HOME/ros2_ws"
@@ -170,9 +170,19 @@ info "Configuring ptp4l grandmaster on $ETH_IFACE..."
 sudo mkdir -p /etc/linuxptp
 sudo tee /etc/linuxptp/ptp4l-grandmaster.conf > /dev/null << EOF
 [global]
+# IEEE 1588 grandmaster priorities — lower = higher priority.
 priority1               127
 priority2               128
-clockClass              128
+# clockClass 6  = locked to a primary reference (GPS/PPS)
+# clockClass 7  = holdover after losing primary reference
+# clockClass 13 = application-specific, locked
+# clockClass 52 = application-specific, holdover
+# clockClass 128 = default, NOT synchronized — wrong for a GPS-disciplined GM.
+# The Atlas Duo PPS disciplines CLOCK_REALTIME via chrony, so advertise 6.
+# ptp4l does not auto-step this based on chrony state; if you anticipate long
+# GPS outages, add logic to switch to 7 (e.g. a watchdog that rewrites the
+# config via pmc SET GRANDMASTER_SETTINGS_NP and reloads).
+clockClass              6
 slaveOnly               0
 delay_mechanism         E2E
 logging_level           6
@@ -228,9 +238,13 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable gpsd.service chrony.service \
-    ptp4l-grandmaster.service phc2sys-grandmaster.service
-ok "systemd services created and enabled."
+# --now enables at boot AND starts immediately so the PTP chain is live
+# without requiring a reboot. If a service fails to start (e.g. no GPS yet),
+# systemctl still returns success; check status/journalctl below.
+sudo systemctl enable --now gpsd.service chrony.service \
+    ptp4l-grandmaster.service phc2sys-grandmaster.service || \
+    warn "One or more services did not start cleanly — check 'systemctl status <svc>'."
+ok "systemd services created, enabled, and started."
 
 # ─── 10. ROS 2 Jazzy ────────────────────────────────────────
 info "Installing ROS 2 $ROS_DISTRO..."

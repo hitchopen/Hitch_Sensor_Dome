@@ -9,6 +9,18 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 - 1× Survey-grade GNSS antenna — on commercial magnetic stand, centered above CoN
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 cameras — front stereo pair (104 mm baseline) + rear symmetric pair
 
+## Sensor Layout
+
+The diagrams below (generated from the v17c SCAD model) label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).
+
+![Top-down sensor layout](3D%20files/sensor_dome_layout_top.jpg)
+
+*Top-down view. LiDARs 1–3 face outward at 0° / 120° / 240°; cameras 1–2 form the 104 mm front stereo baseline flanking LiDAR 1; cameras 3–4 sit on the rear-left and rear-right hex faces.*
+
+![Isometric sensor layout](3D%20files/sensor_dome_layout_iso.jpg)
+
+*Isometric view showing the two-level dome: LiDARs hang from the underside of L2, cameras sit on top of L2, and the GNSS antenna rises above the plate center on its magnetic stand.*
+
 ## Repository Structure
 
 ```
@@ -43,6 +55,16 @@ See [`3D files/README.md`](3D%20files/README.md) for full design specifications,
 
 - **+X** = Forward, **+Y** = Left, **+Z** = Up
 - **Origin** = Atlas Duo Center of Navigation (CoN)
+
+## Credits
+
+This project was designed and is maintained by **Dr. Allen Y. Yang** (University of California, Berkeley).
+
+Please cite or credit this repository when reusing any of the mechanical design, the ROS 2 TF configuration, or the PTP synchronization pipeline in derivative work:
+
+> Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
+
+Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, and Aravis communities whose open-source tooling this project builds on.
 
 ## License
 

@@ -12,3 +12,17 @@ ehthumbs.db
 # OpenSCAD backup/cache files
 *.scad~
 *.scad.bak
+
+# Office documents (generated review reports, drafts, etc. — do not commit)
+*.docx
+*.doc
+~$*.docx
+~$*.doc
+*.xlsx
+*.xls
+~$*.xlsx
+~$*.xls
+*.pptx
+*.ppt
+~$*.pptx
+~$*.ppt

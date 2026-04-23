@@ -53,7 +53,7 @@ A 3D-printable modular base for mounting 3× Seyond Robin W LiDARs, 1× Point-On
 - L1 has a rectangular flange at hex side 4 extending to x = −150 mm to cover the rear bolt pair (at x = −141.3 mm)
 
 ### GNSS Antenna Mount (commercial stand, v15)
-- A commercial magnetic GNSS antenna stand (e.g. ArduSimple AS-ACC-SURVEYSTAND-01) with a 5/8"-11 threaded metal pole is glued into a ø86 mm × 3 mm circular recess on L2's top center.
+- A commercial magnetic GNSS antenna stand (e.g. ArduSimple AS-ACC-SURVEYSTAND-01) with a 5/8"-11 threaded metal pole is glued into a ø86 mm × 8 mm circular recess on L2's top center (leaves a 4 mm floor in the 12 mm plate).
 - No printed thread, no bolts — the stand is bonded with epoxy or construction adhesive.
 - The metal pole and 5/8"-11 thread are far stronger than printed plastic.
 - **Measure your stand's base diameter** and adjust `gnss_stand_base_dia` in the SCAD file if it differs from the 88 mm default.
@@ -135,22 +135,22 @@ All centers (GNSS antenna → CoN → camera mount) coaxial along Z at X = 0, Y 
 ### Complete Screws Shopping List
 | Size | Qty | Used for |
 |------|-----|----------|
-| **M3 × 12 mm SHCS** | **16** | RGB cameras (4 per camera × 4 cameras, through L2 into camera bottom threads) |
+| **M3 × 16 mm SHCS** | **16** | RGB cameras (4 per camera × 4 cameras, through L2 into camera bottom threads) |
 | **M4 × 10 mm SHCS** | **4** | Atlas Duo INS → L1 plate |
 | **M6 × 20 mm BHCS** | **12** | Brackets (hex-vertex + Atlas-side) through L2 into L1 |
 | **M6 × 16 mm SHCS** | **12** | Robin W LiDARs (4 per LiDAR × 3 LiDARs, countersunk through L2) |
 | **1/4"-20 UNC threaded insert** (heat-set or press-fit) | **1** | Camera suction cup mount |
 
 > Three bolt sizes: M3 (cameras), M4 (Atlas), and M6 (everything else). 16× M3, 4× M4, 24× M6.
-> M3 bolts pass through L2 from below and thread into the camera's bottom M3×0.5 holes (5 mm thread depth).
+> M3 bolts pass through the 12 mm L2 from below and thread into the camera's bottom M3×0.5 holes (5 mm thread depth). M3×16 gives 4 mm thread engagement with ~1 mm bottom clearance.
 > All M6 bolts self-tap into printed features — no hex nuts or inserts.
 > **M6×20 BHCS:** clearance-only through 12 mm L2, 8 mm engagement in L1 tap holes.
-> **M6×16 SHCS:** through 8 mm L2 pass-through, 8 mm thread engagement in LiDAR top mount blind holes.
+> **M6×16 SHCS:** through 12 mm L2 pass-through, 4 mm thread engagement in the LiDAR top-mount blind holes (▽5, per datasheet). Engagement is marginal for M6×1.0 (ISO recommends ≥ 1×D = 6 mm). If an M6×18 fits without bottoming in the 5 mm blind hole on your specific unit, prefer that; otherwise budget for thread-locker and lower clamp load.
 
 ### Detailed Fastener Breakdown
 | Item | Qty | Location |
 |------|-----|----------|
-| M3 × 12 mm SHCS | 16 | RGB cameras (4 per camera × 4 cameras, through L2 from below) |
+| M3 × 16 mm SHCS | 16 | RGB cameras (4 per camera × 4 cameras, through L2 from below) |
 | M4 × 10 mm SHCS | 4 | Atlas Duo mounting (220 × 100 mm pattern on L1) |
 | M6 × 20 mm BHCS | 12 | L1 ↔ L2: hex-vertex brackets (8) + Atlas-side brackets (4), 2 bolts each |
 | M6 × 16 mm SHCS | 12 | Robin W top mount (4 per LiDAR × 3 LiDARs, through L2) |
@@ -181,7 +181,7 @@ All centers (GNSS antenna → CoN → camera mount) coaxial along Z at X = 0, Y 
 3. Place L2 onto L1's hex-vertex and Atlas-side brackets and secure with 12× M6×20 mm BHCS (2 per bracket, self-tapping — run screws in slowly the first time)
 4. Mount Atlas Duo to L1 top surface using 4× M4 bolts
 5. Attach Robin W LiDARs to L2 underside using 12× M6×16 mm SHCS from L2 top surface (4 per LiDAR, countersunk, threading down into LiDAR top mount holes)
-6. Mount 4× RouteCAM cameras on L2 top surface using 16× M3×12 mm SHCS from L2 underside (4 per camera). Front stereo pair flanks LiDAR@0° on both sides; rear pair at 120°/240° is symmetric about the X axis.
+6. Mount 4× RouteCAM cameras on L2 top surface using 16× M3×16 mm SHCS from L2 underside (4 per camera). Front stereo pair flanks LiDAR@0° on both sides; rear pair at 120°/240° is symmetric about the X axis.
 7. Glue the commercial GNSS magnetic stand base into the L2 center recess using epoxy or construction adhesive. Ensure the stand is centered and level; allow adhesive to cure fully before use.
 8. Thread the GNSS antenna onto the stand's 5/8"-11 metal stud
 9. Attach assembly to TELESIN suction cup via 1/4"-20
@@ -201,7 +201,7 @@ All dimensions are parametric in `sensor_dome.scad`. Key parameters:
 - `rgb_cam_mount_spacing` — M3 bolt pattern square spacing (default 16.5 mm)
 - `rgb_cam_layout` — camera positions: [angle, y_sign] pairs (default: front stereo + rear symmetric)
 - `plate_thickness` — L1 structural plate stiffness (default 6 mm)
-- `l2_thickness` — L2 plate thickness (default 12 mm)
+- `L2_thickness` — L2 plate thickness (default 12 mm, derived as `2 * plate_thickness`)
 - `atlas_flange_extent` — L1 flange rear extent (default 150 mm)
 - `lidar_angles` — LiDAR angular positions (default [0, 120, 240])
 

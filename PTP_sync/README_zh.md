@@ -23,13 +23,13 @@
 **第 2 步**在每个 Seyond Robin W LiDAR 上启用 PTP 同步并构建 Seyond ROS 2 驱动程序。当 LiDAR 通电并连接时运行。
 
 ```bash
-./setup_robin_w_sync.sh --eth enp0s31f6 --ips 172.168.1.10,172.168.1.11,172.168.1.12
+./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11,192.168.1.12
 ```
 
 **第 3 步**安装 Aravis GigE Vision 库、在每个 RouteCAM 摄像机上启用 IEEE 1588 PTP，以及安装 ROS 2 摄像机软件包。当摄像机通过 PoE 供电时运行。
 
 ```bash
-./setup_camera_sync.sh --eth enp0s31f6 --ips 172.168.1.20,172.168.1.21,172.168.1.22,172.168.1.23
+./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23
 ```
 
 第 2 步和第 3 步彼此独立——可以任意顺序集成 LiDAR 和摄像机。每个脚本末尾都包含自我测试，用于验证 PTP 同步质量、服务状态和传感器可达性。
@@ -121,22 +121,24 @@ ip link show
 
 | 配置 | 估计带宽 | 最小网卡 |
 |--------------|-------------------|-------------|
-| 1 Robin W | ~150 Mbps | 1 GbE |
-| 3 Robin W | ~450 Mbps | 1 GbE（边界） |
+| 1 Robin W | ~60 Mbps | 1 GbE |
+| 3 Robin W | ~180 Mbps | 1 GbE |
 | 4 RouteCAM (2MP @ 20fps) | ~400 Mbps | 1 GbE |
-| 3 Robin W + 4 RouteCAM + PTP | ~850 Mbps + overhead | **需要 10 GbE** |
+| 3 Robin W + 4 RouteCAM + PTP | ~600 Mbps + overhead | 1 GbE 可用；**推荐 10 GbE** 以留出余量并支持 jumbo frame |
+
+> **Robin W 带宽说明：** Seyond 官方数据表标定 Robin W 单机输出约 60 Mbps。早期文档误写为 150 Mbps（把峰值脉冲当作持续带宽），使总量高估约 3×。3× Robin W ≈ 180 Mbps 持续；建议按 1.5× 预留抖动/突发余量。
 
 **推荐网络拓扑：**
 
 ```
 Host NIC (10 GbE) → PoE+ Managed Switch (IEEE 1588 PTP boundary clock)
-                     ├── Robin W Front    (172.168.1.10)
-                     ├── Robin W Rear-L   (172.168.1.11)
-                     ├── Robin W Rear-R   (172.168.1.12)
-                     ├── RouteCAM FR      (172.168.1.20, PoE)
-                     ├── RouteCAM FL      (172.168.1.21, PoE)
-                     ├── RouteCAM RL      (172.168.1.22, PoE)
-                     └── RouteCAM RR      (172.168.1.23, PoE)
+                     ├── Robin W Front    (192.168.1.10)
+                     ├── Robin W Rear-L   (192.168.1.11)
+                     ├── Robin W Rear-R   (192.168.1.12)
+                     ├── RouteCAM FR      (192.168.1.20, PoE)
+                     ├── RouteCAM FL      (192.168.1.21, PoE)
+                     ├── RouteCAM RL      (192.168.1.22, PoE)
+                     └── RouteCAM RR      (192.168.1.23, PoE)
 ```
 
 ### 3.2 硬件 vs 软件时间戳
@@ -217,9 +219,9 @@ sudo python3 sensor_recorder_fast.py
 
 # 3 LiDARs
 sudo python3 sensor_recorder_fast.py --num-lidars 3 \
-    --lidar1-ip 172.168.1.10 \
-    --lidar2-ip 172.168.1.11 \
-    --lidar3-ip 172.168.1.12
+    --lidar1-ip 192.168.1.10 \
+    --lidar2-ip 192.168.1.11 \
+    --lidar3-ip 192.168.1.12
 
 # With YAML config
 sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
@@ -257,13 +259,13 @@ point_one_nav:
 
 lidars:
   - name: "robin_w_front"
-    ip: "172.168.1.10"
+    ip: "192.168.1.10"
     port: 8010
   - name: "robin_w_rear_left"
-    ip: "172.168.1.11"
+    ip: "192.168.1.11"
     port: 8010
   - name: "robin_w_rear_right"
-    ip: "172.168.1.12"
+    ip: "192.168.1.12"
     port: 8010
 
 recording:
@@ -372,7 +374,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 
 | 参数 | 默认值 | 说明 |
 |-----------|---------|-------|
-| IP Address | 172.168.1.10 | 通过网页 UI 或 `innovision_lidar_util` 更改 |
+| IP Address | 192.168.1.10 | 通过网页 UI 或 `innovision_lidar_util` 更改 |
 | Data Port | 8010 | TCP and UDP |
 | Coordinate Mode | 3 (forward/left/up) | 匹配 ROS REP-103 |
 | PTP | Supported | 由 `setup_robin_w_sync.sh` 启用 |

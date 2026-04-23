@@ -23,13 +23,13 @@ Three scripts automate the entire installation. Run them in order on a fresh Ubu
 **Step 2** enables PTP synchronization on each Seyond Robin W LiDAR and builds the Seyond ROS 2 driver. Run when LiDARs are powered and connected.
 
 ```bash
-./setup_robin_w_sync.sh --eth enp0s31f6 --ips 172.168.1.10,172.168.1.11,172.168.1.12
+./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11,192.168.1.12
 ```
 
 **Step 3** installs the Aravis GigE Vision library, enables IEEE 1588 PTP on each RouteCAM camera, and installs ROS 2 camera packages. Run when cameras are powered via PoE.
 
 ```bash
-./setup_camera_sync.sh --eth enp0s31f6 --ips 172.168.1.20,172.168.1.21,172.168.1.22,172.168.1.23
+./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23
 ```
 
 Steps 2 and 3 are independent of each other — integrate LiDARs and cameras in any order. Each script includes a self-test at the end that verifies PTP sync quality, service status, and sensor reachability.
@@ -121,22 +121,24 @@ Accurate time synchronization across all sensors is critical for sensor fusion. 
 
 | Configuration | Estimated Bandwidth | Minimum NIC |
 |--------------|-------------------|-------------|
-| 1 Robin W | ~150 Mbps | 1 GbE |
-| 3 Robin W | ~450 Mbps | 1 GbE (marginal) |
+| 1 Robin W | ~60 Mbps | 1 GbE |
+| 3 Robin W | ~180 Mbps | 1 GbE |
 | 4 RouteCAM (2MP @ 20fps) | ~400 Mbps | 1 GbE |
-| 3 Robin W + 4 RouteCAM + PTP | ~850 Mbps + overhead | **10 GbE required** |
+| 3 Robin W + 4 RouteCAM + PTP | ~600 Mbps + overhead | 1 GbE OK; **10 GbE recommended** for headroom and jumbo-frame stability |
+
+> **Robin W raw bandwidth:** the Seyond datasheet lists the Robin W output at ~60 Mbps per unit. Earlier drafts of this doc cited 150 Mbps (conflating peak burst with sustained), which overestimates the aggregate by roughly 3×. 3× Robin W = ~180 Mbps sustained; plan jitter/burst headroom at ~1.5× for safety.
 
 **Recommended network topology:**
 
 ```
 Host NIC (10 GbE) → PoE+ Managed Switch (IEEE 1588 PTP boundary clock)
-                     ├── Robin W Front    (172.168.1.10)
-                     ├── Robin W Rear-L   (172.168.1.11)
-                     ├── Robin W Rear-R   (172.168.1.12)
-                     ├── RouteCAM FR      (172.168.1.20, PoE)
-                     ├── RouteCAM FL      (172.168.1.21, PoE)
-                     ├── RouteCAM RL      (172.168.1.22, PoE)
-                     └── RouteCAM RR      (172.168.1.23, PoE)
+                     ├── Robin W Front    (192.168.1.10)
+                     ├── Robin W Rear-L   (192.168.1.11)
+                     ├── Robin W Rear-R   (192.168.1.12)
+                     ├── RouteCAM FR      (192.168.1.20, PoE)
+                     ├── RouteCAM FL      (192.168.1.21, PoE)
+                     ├── RouteCAM RL      (192.168.1.22, PoE)
+                     └── RouteCAM RR      (192.168.1.23, PoE)
 ```
 
 ### 3.2 Hardware vs Software Timestamping
@@ -217,9 +219,9 @@ sudo python3 sensor_recorder_fast.py
 
 # 3 LiDARs
 sudo python3 sensor_recorder_fast.py --num-lidars 3 \
-    --lidar1-ip 172.168.1.10 \
-    --lidar2-ip 172.168.1.11 \
-    --lidar3-ip 172.168.1.12
+    --lidar1-ip 192.168.1.10 \
+    --lidar2-ip 192.168.1.11 \
+    --lidar3-ip 192.168.1.12
 
 # With YAML config
 sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
@@ -257,13 +259,13 @@ point_one_nav:
 
 lidars:
   - name: "robin_w_front"
-    ip: "172.168.1.10"
+    ip: "192.168.1.10"
     port: 8010
   - name: "robin_w_rear_left"
-    ip: "172.168.1.11"
+    ip: "192.168.1.11"
     port: 8010
   - name: "robin_w_rear_right"
-    ip: "172.168.1.12"
+    ip: "192.168.1.12"
     port: 8010
 
 recording:
@@ -372,7 +374,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| IP Address | 172.168.1.10 | Change via web UI or `innovusion_lidar_util` |
+| IP Address | 192.168.1.10 | Change via web UI or `innovusion_lidar_util` |
 | Data Port | 8010 | TCP and UDP |
 | Coordinate Mode | 3 (forward/left/up) | Matches ROS REP-103 |
 | PTP | Supported | Enabled by `setup_robin_w_sync.sh` |

@@ -16,7 +16,7 @@
 # Prerequisites:
 #   - Step 1 (setup_ubuntu_sync.sh) completed
 #   - Cameras powered via PoE switch on sensor Ethernet
-#   - Default camera IPs: 172.168.1.20–.23
+#   - Default camera IPs: 192.168.1.20–.23
 #
 # Usage:
 #   chmod +x setup_camera_sync.sh
@@ -24,14 +24,14 @@
 #
 # Examples:
 #   ./setup_camera_sync.sh --eth enp0s31f6
-#   ./setup_camera_sync.sh --eth enp0s31f6 --ips 172.168.1.20,172.168.1.21
+#   ./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21
 # =============================================================
 
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────
 ETH_IFACE="${ETH_IFACE:-eth0}"
-CAM_IPS_STR="${CAM_IPS_STR:-172.168.1.20,172.168.1.21,172.168.1.22,172.168.1.23}"
+CAM_IPS_STR="${CAM_IPS_STR:-192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23}"
 CAM_NAMES=("cam_front_right" "cam_front_left" "cam_rear_left" "cam_rear_right")
 ROS_DISTRO="jazzy"
 WS_DIR="$HOME/ros2_ws"
@@ -168,7 +168,12 @@ for i in "${!CAM_IPS[@]}"; do
 done
 
 # ─── 7. Verify camera streaming ──────────────────────────────
-info "Testing camera streaming (5-second capture from first reachable camera)..."
+# NOTE: `arv-tool-0.8` has no `snapshot` subcommand (valid subcommands are
+# control, description, discovery, features, genicam, register). The correct
+# Aravis frame-grab CLI is `arv-camera-test-0.8`, and the GUI viewer is
+# `arv-viewer-0.8`. We verify the control link here with a real GenICam read
+# and point to arv-camera-test-0.8 for actual streaming.
+info "Testing camera control link (reading GenICam feature from first reachable camera)..."
 
 FIRST_CAM=""
 for ip in "${CAM_IPS[@]}"; do
@@ -179,15 +184,17 @@ for ip in "${CAM_IPS[@]}"; do
 done
 
 if [ -n "$FIRST_CAM" ]; then
-    info "  Grabbing test frame from $FIRST_CAM..."
-    if arv-tool-0.8 -a "$FIRST_CAM" snapshot 2>/dev/null; then
-        ok "  Test frame captured from $FIRST_CAM"
+    info "  Reading DeviceVendorName / Width from $FIRST_CAM..."
+    if arv-tool-0.8 -a "$FIRST_CAM" control DeviceVendorName Width Height PixelFormat 2>/dev/null; then
+        ok "  GenICam control link healthy on $FIRST_CAM"
+        info "  Grab a live frame with:  arv-camera-test-0.8 -n 1 <camera_name>"
+        info "  Live GUI viewer:         arv-viewer-0.8"
     else
-        warn "  Could not capture test frame (camera may need configuration)"
-        warn "  Try manually: arv-tool-0.8 -a $FIRST_CAM snapshot"
+        warn "  Could not read GenICam features (camera may need IP/config)."
+        warn "  Try manually: arv-tool-0.8 -a $FIRST_CAM control DeviceVendorName"
     fi
 else
-    warn "No cameras reachable for streaming test."
+    warn "No cameras reachable for control-link test."
 fi
 
 # =============================================================
@@ -310,20 +317,29 @@ verify_camera_sync() {
         ((WARN_COUNT++))
     fi
 
-    # ── Test 6: Frame capture test ──
-    info "Test 6/7: Test frame capture"
+    # ── Test 6: Control-link sanity + streaming tool availability ──
+    # (arv-tool-0.8 has no `snapshot` subcommand; use arv-camera-test-0.8
+    # for actual frame grabs.)
+    info "Test 6/7: GenICam control link + streaming tool"
     if command -v arv-tool-0.8 &>/dev/null && [ ${#LIVE_IPS[@]} -gt 0 ]; then
         TEST_IP="${LIVE_IPS[0]}"
-        info "  Capturing test frame from $TEST_IP..."
-        if arv-tool-0.8 -a "$TEST_IP" snapshot 2>/dev/null; then
-            ok "  Frame captured successfully from $TEST_IP"
+        info "  Reading GenICam features from $TEST_IP..."
+        if arv-tool-0.8 -a "$TEST_IP" control DeviceVendorName Width Height 2>/dev/null | \
+                grep -qiE "width|height|vendor"; then
+            ok "  GenICam control link OK on $TEST_IP"
             ((PASS++))
         else
-            warn "  Frame capture failed — camera may need stream configuration"
+            warn "  GenICam read failed — camera may need stream configuration"
+            ((WARN_COUNT++))
+        fi
+        if command -v arv-camera-test-0.8 &>/dev/null; then
+            ok "  arv-camera-test-0.8 available (use: arv-camera-test-0.8 -n 1 <camera_name>)"
+        else
+            warn "  arv-camera-test-0.8 not found — install the aravis-tools package"
             ((WARN_COUNT++))
         fi
     else
-        warn "  No cameras available for capture test"
+        warn "  No cameras available for control-link test"
         ((WARN_COUNT++))
     fi
 
@@ -359,10 +375,11 @@ verify_camera_sync() {
     fi
     echo ""
     echo " Useful commands:"
-    echo "   arv-tool-0.8                    # List cameras"
-    echo "   arv-viewer-0.8                  # Live camera viewer"
-    echo "   arv-tool-0.8 -a IP snapshot     # Capture single frame"
-    echo "   tcpdump -i $ETH_IFACE host IP -w cam.pcap  # Record raw"
+    echo "   arv-tool-0.8                                 # List cameras"
+    echo "   arv-tool-0.8 -a IP control Width Height      # Read GenICam features"
+    echo "   arv-camera-test-0.8 -n 1 <camera_name>       # Grab one frame"
+    echo "   arv-viewer-0.8                               # Live GUI viewer"
+    echo "   tcpdump -i $ETH_IFACE host IP -w cam.pcap    # Record raw packets"
     echo ""
     echo " Full sync chain now active:"
     echo "   GPS → Atlas Duo PPS → gpsd → chrony → ptp4l → LiDARs + cameras"
