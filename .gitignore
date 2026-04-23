@@ -1,0 +1,14 @@
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Thumbnails
+Thumbs.db
+ehthumbs.db
+
+# OpenSCAD backup/cache files
+*.scad~
+*.scad.bak
