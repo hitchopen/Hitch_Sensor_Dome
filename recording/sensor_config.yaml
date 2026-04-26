@@ -1,0 +1,180 @@
+# =============================================================
+# Hitch Sensor Dome — Recording Configuration
+#
+# Used by recording/sensor_recorder.py
+#
+# Topology (matches PTP_sync/README.md and ROS2 config/sensor_dome_tf.yaml):
+#   - 1× Point One Nav Atlas Duo (GNSS + IMU + pose, GPS-disciplined PPS)
+#   - 3× Seyond Robin W LiDARs (front 0°, rear-left 120°, rear-right 240°)
+#   - 4× e-con RouteCAM_P_CU25_CXLC_IP67 (front stereo + rear pair)
+# =============================================================
+
+network:
+  # NIC connected to the sensor switch. Override with --eth on the CLI.
+  interface: "enp0s31f6"
+
+# -------------------------------------------------------------
+# Point One Nav Atlas Duo (GNSS / INS)
+# -------------------------------------------------------------
+point_one_nav:
+  enabled: true
+  device_port: "/dev/ttyUSB0"
+  baud_rate: 460800
+  frame_id: "imu_link"
+  # ROS topics published by fusion-engine-driver
+  topics:
+    imu: "/imu/data"           # sensor_msgs/Imu       @ 200 Hz
+    gps_fix: "/gps/fix"        # sensor_msgs/NavSatFix @ 10 Hz
+    pose: "/pose"              # geometry_msgs/PoseStamped @ 10 Hz
+
+# -------------------------------------------------------------
+# Seyond Robin W LiDARs (3× directional)
+# -------------------------------------------------------------
+lidars:
+  - name: "robin_w_front"
+    ip: "192.168.1.10"
+    port: 8010
+    frame_id: "lidar_front_link"
+    topic: "/robin_w_front/points"     # sensor_msgs/PointCloud2 @ 10 Hz
+  - name: "robin_w_rear_left"
+    ip: "192.168.1.11"
+    port: 8010
+    frame_id: "lidar_rear_left_link"
+    topic: "/robin_w_rear_left/points"
+  - name: "robin_w_rear_right"
+    ip: "192.168.1.12"
+    port: 8010
+    frame_id: "lidar_rear_right_link"
+    topic: "/robin_w_rear_right/points"
+
+# -------------------------------------------------------------
+# RouteCAM cameras (4× GigE Vision, IEEE 1588 PTP)
+# -------------------------------------------------------------
+cameras:
+  - name: "cam_front_right"
+    ip: "192.168.1.20"
+    frame_id: "cam_front_right_link"
+    topic: "/cam_front_right/image_raw"     # sensor_msgs/Image       @ 20 Hz
+    info_topic: "/cam_front_right/camera_info"
+  - name: "cam_front_left"
+    ip: "192.168.1.21"
+    frame_id: "cam_front_left_link"
+    topic: "/cam_front_left/image_raw"
+    info_topic: "/cam_front_left/camera_info"
+  - name: "cam_rear_left"
+    ip: "192.168.1.22"
+    frame_id: "cam_rear_left_link"
+    topic: "/cam_rear_left/image_raw"
+    info_topic: "/cam_rear_left/camera_info"
+  - name: "cam_rear_right"
+    ip: "192.168.1.23"
+    frame_id: "cam_rear_right_link"
+    topic: "/cam_rear_right/image_raw"
+    info_topic: "/cam_rear_right/camera_info"
+
+# -------------------------------------------------------------
+# Clock-sync tolerances
+# (See PTP_sync/README.md §3 for expected accuracy at each stage.)
+# -------------------------------------------------------------
+sync:
+  # Behavior when checks exceed tolerance: "prompt" warns and asks y/N.
+  # Other modes available in the script: "hard" (refuse) and "log" (continue).
+  mode: "prompt"
+
+  # chrony — host clock vs. GPS-disciplined PPS.
+  chrony_offset_ns: 1000      # 1 µs — generous margin for GPS-PPS systems
+  chrony_max_age_s: 30        # last update must be within 30 s
+
+  # ptp4l — NIC PHC vs. host clock (master offset).
+  # Use the larger HW number even for software TS to avoid noisy prompts.
+  ptp_master_offset_ns_hw: 1000   # < 1 µs (hardware timestamping)
+  ptp_master_offset_ns_sw: 50000  # < 50 µs (software timestamping)
+
+  # PTP slaves — Robin W LiDARs and RouteCAM cameras.
+  lidar_offset_ns: 1000        # 1 µs (Robin W typically 300–800 ns)
+  camera_offset_ns: 10000      # 10 µs (GigE Vision typically 1–10 µs)
+
+# -------------------------------------------------------------
+# Recording options
+# -------------------------------------------------------------
+recording:
+  # Output root. Resolved relative to this YAML's directory, so the
+  # default path is <repo>/recording/data/. Override with --output or
+  # an absolute path here (e.g. "/mnt/ssd/sessions") if you want to
+  # store sessions on a faster / larger drive.
+  output_dir: "data"
+  session_name: "session_{ts}"
+
+  # rosbag2 storage plugin. mcap is Foxglove-native and recommended.
+  storage: "mcap"
+  compression_mode: "file"        # "none", "file", or "message"
+  compression_format: "zstd"      # "zstd" (mcap) — fast, lossless
+
+  # Auto-include /tf and /tf_static so all frames stitch in Foxglove.
+  include_tf: true
+
+  # Rate monitor publishes diagnostic_msgs/DiagnosticArray on this topic
+  # which the Foxglove layout binds to a Diagnostics panel.
+  rate_topic: "/sensor_dome/rates"
+  rate_window_s: 2.0
+
+# -------------------------------------------------------------
+# Foxglove live visualization
+# -------------------------------------------------------------
+foxglove:
+  enabled: true
+  bridge_port: 8765
+  layout_file: "foxglove/sensor_dome_layout.json"
+
+# -------------------------------------------------------------
+# ROS 2 driver launch commands (used to spawn driver nodes).
+# Override per-installation. {arg} placeholders are substituted.
+# -------------------------------------------------------------
+drivers:
+  point_one_nav:
+    cmd: ["ros2", "run", "fusion_engine_driver", "fusion_engine_ros_driver",
+          "--ros-args",
+          "-p", "connection_type:=tty",
+          "-p", "tty_port:={device_port}",
+          "-p", "tty_baud:={baud_rate}",
+          "-p", "frame_id:={frame_id}",
+          "-r", "imu:={topics.imu}",
+          "-r", "gps_fix:={topics.gps_fix}",
+          "-r", "pose:={topics.pose}"]
+  seyond_lidar:
+    # One driver instance per LiDAR. frame_id MUST match the
+    # child_frame_id in ROS2 config/sensor_dome_tf.yaml so Foxglove
+    # can transform the cloud into imu_link. Parameter names are
+    # taken from Seyond-Inc/seyond_ros_driver start.py.
+    #
+    # coordinate_mode:=3 selects REP-103 (X=fwd, Y=left, Z=up).
+    # This is the driver's default but we pin it explicitly so the
+    # static-TF rotations in sensor_dome_tf.yaml (yaw-only) remain
+    # correct regardless of upstream driver-default changes.
+    # Other modes (0..4) per Robin W Manual §4.2.5; 3 is the only
+    # one compatible with the TF YAML in this repo.
+    cmd: ["ros2", "launch", "seyond", "start.py",
+          "lidar_name:={name}",
+          "lidar_ip:={ip}",
+          "port:={port}",
+          "frame_id:={frame_id}",
+          "frame_topic:={topic}",
+          "coordinate_mode:=3"]
+  routecam:
+    # camera_aravis2 driver — one node per camera.
+    cmd: ["ros2", "run", "camera_aravis2", "camera_driver_gv",
+          "--ros-args",
+          "-r", "__ns:=/{name}",
+          "-p", "guid:={ip}",
+          "-p", "frame_id:={frame_id}",
+          "-p", "PtpEnable:=true",
+          "-r", "image_raw:={topic}",
+          "-r", "camera_info:={info_topic}"]
+  static_tf:
+    # Loads ROS2 config/sensor_dome_tf.yaml via recording/launch/static_tf.launch.py.
+    # ros2 launch accepts an absolute path to a launch file (no installed
+    # ROS 2 package required).
+    cmd: ["ros2", "launch", "{launch_file}", "tf_yaml:={tf_yaml}"]
+  foxglove_bridge:
+    cmd: ["ros2", "launch", "foxglove_bridge", "foxglove_bridge_launch.xml",
+          "port:={port}"]

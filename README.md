@@ -39,6 +39,21 @@ Documents/           Component datasheets
 
 ROS2 config/         ROS2 integration files
   sensor_dome_tf.yaml  Static tf transforms (all sensors → imu_link)
+
+PTP_sync/            One-time host + sensor time-sync setup
+  setup_ubuntu_sync.sh    GPS-disciplined PTP grandmaster (gpsd → chrony → ptp4l)
+  setup_robin_w_sync.sh   Enable PTP on Seyond Robin W LiDARs
+  setup_camera_sync.sh    Enable IEEE 1588 PTP on RouteCAM cameras
+  README.md               Architecture, verification, troubleshooting
+
+recording/           Run-time data recording + Foxglove dashboard
+  sensor_recorder.py      Detect sensors → verify clock sync → record .mcap
+  rate_monitor.py         Per-topic Hz on /sensor_dome/rates
+  sensor_config.yaml      IPs, frame_ids, sync tolerances, driver commands
+  foxglove/               Pre-built Foxglove Studio layout
+  launch/                 Static-TF launch helper
+  data/                   Default output root for recorded sessions
+  README.md               Architecture and running procedure
 ```
 
 ## Quick Start
@@ -51,6 +66,23 @@ ROS2 config/         ROS2 integration files
 
 See [`3D files/README.md`](3D%20files/README.md) for full design specifications, BOM, and assembly instructions.
 
+## Recording & Visualization
+
+Once the dome is built and the sensors are connected, two folders take it from hardware to a usable dataset:
+
+1. **One-time setup** — run the scripts in [`PTP_sync/`](PTP_sync/) to bring up the GPS-disciplined PTP grandmaster on the host and enable IEEE 1588 PTP on every LiDAR and camera. After this, all sensors share a sub-microsecond GPS time base.
+
+2. **Per-session recording** — run [`recording/sensor_recorder.py`](recording/sensor_recorder.py) to auto-detect connected sensors, verify the clock-sync chain, and record GNSS / IMU / LiDAR / camera streams into a Foxglove-native MCAP rosbag. A bundled Foxglove Studio layout shows the three Robin W point clouds superimposed in the IMU frame, all four camera views, a GNSS map, an IMU plot, and live per-topic frame rates while the data is being captured.
+
+```bash
+# After PTP_sync/ has been run once:
+sudo python3 recording/sensor_recorder.py
+# Then in Foxglove: Open Connection → ws://localhost:8765
+#                   Layouts → Import → recording/foxglove/sensor_dome_layout.json
+```
+
+See [`recording/README.md`](recording/README.md) for the architecture diagram and running procedure.
+
 ## Coordinate System (ROS REP 103)
 
 - **+X** = Forward, **+Y** = Left, **+Z** = Up
@@ -58,13 +90,13 @@ See [`3D files/README.md`](3D%20files/README.md) for full design specifications,
 
 ## Credits
 
-This project was designed and is maintained by **Dr. Allen Y. Yang** (University of California, Berkeley).
+This project was designed and is maintained by **Dr. Allen Y. Yang** (Hitch Interactive · University of California, Berkeley).
 
-Please cite or credit this repository when reusing any of the mechanical design, the ROS 2 TF configuration, or the PTP synchronization pipeline in derivative work:
+Please cite or credit this repository when reusing any of the mechanical design, the ROS 2 TF configuration, the PTP synchronization pipeline, or the recording / visualization tooling in derivative work:
 
 > Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
 
-Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, and Aravis communities whose open-source tooling this project builds on.
+Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, Aravis, Foxglove, and MCAP communities whose open-source tooling this project builds on.
 
 ## License
 

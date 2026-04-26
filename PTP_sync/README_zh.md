@@ -115,6 +115,8 @@ ip link show
 | LiDAR PTP slave | 300–800 ns |
 | RouteCAM GigE Vision PTP slave | 1–10 µs |
 
+> RouteCAM 数值假设使用带 IEEE 1588 边界时钟的网管 PoE 交换机（如 Planet WGS-6325-8UP2X —— 见 §3.1）。若使用非网管交换机（无边界时钟），实际值约为 5–50 µs。
+
 **关键：** 主机时钟必须由 GPS 规范（通过 Atlas Duo PPS），而不是仅由互联网 NTP 规范。NTP 仅提供约 1–10 ms 精度，而 GPS PPS 提供 < 100 ns。
 
 ### 3.1 网络要求
@@ -128,18 +130,65 @@ ip link show
 
 > **Robin W 带宽说明：** Seyond 官方数据表标定 Robin W 单机输出约 60 Mbps。早期文档误写为 150 Mbps（把峰值脉冲当作持续带宽），使总量高估约 3×。3× Robin W ≈ 180 Mbps 持续；建议按 1.5× 预留抖动/突发余量。
 
-**推荐网络拓扑：**
+**参考网络设计**
+
+推荐的硬件组合是 **Teltonika RUTM50 / RUTM54** 5G/4G 蜂窝路由器（仅作为蜂窝 WAN 网关）配合 **Planet WGS-6325-8UP2X** 网管型 PoE++ 交换机（带 IEEE 1588 边界时钟和 10 GbE 上行的传感器局域网）。主机 PC 直接连接到交换机的 10 G SFP+ 端口 —— 不经过蜂窝路由器 —— 这样 PTP 报文的路径为 `主机 → 边界时钟 → 传感器`，不会穿越不支持 PTP 的路由器。
 
 ```
-Host NIC (10 GbE) → PoE+ Managed Switch (IEEE 1588 PTP boundary clock)
-                     ├── Robin W Front    (192.168.1.10)
-                     ├── Robin W Rear-L   (192.168.1.11)
-                     ├── Robin W Rear-R   (192.168.1.12)
-                     ├── RouteCAM FR      (192.168.1.20, PoE)
-                     ├── RouteCAM FL      (192.168.1.21, PoE)
-                     ├── RouteCAM RL      (192.168.1.22, PoE)
-                     └── RouteCAM RR      (192.168.1.23, PoE)
+Internet (5G/4G)
+       │
+       ▼
+┌──────────────────────────┐
+│ Teltonika RUTM50/RUTM54  │  192.168.1.1
+│  (仅作为蜂窝网关)         │  WAN 口未使用
+└─────────────┬────────────┘
+              │ 1 GbE  (RUTM50 LAN1 → Planet GbE 端口)
+              ▼
+┌────────────────────────────────────────────────────────┐
+│ Planet WGS-6325-8UP2X (网管 L3, IEEE 1588 BC, PoE++)    │  192.168.1.2 (管理)
+├────────────────────────────────────────────────────────┤
+│ 端口    类型             设备                    IP      │
+│ ----    ------------    --------------------    ------ │
+│ 1       1 GbE           → RUTM50 LAN1           (上行)  │
+│ 2       2.5 GbE PoE++   RouteCAM 前右           .20    │
+│ 3       2.5 GbE PoE++   RouteCAM 前左           .21    │
+│ 4       2.5 GbE PoE++   RouteCAM 后左           .22    │
+│ 5       2.5 GbE PoE++   RouteCAM 后右           .23    │
+│ 6       1 GbE  PoE++    Robin W 前              .10    │
+│ 7       1 GbE  PoE++    Robin W 后左            .11    │
+│ 8       1 GbE  PoE++    Robin W 后右            .12    │
+│ SFP1    10 G            主机 PC (10G 网卡)       .40    │
+│ SFP2    10 G            备用 (Atlas Duo 以太 / NAS)    │
+└────────────────────────────────────────────────────────┘
+
+Atlas Duo INS —— 三条到主机的物理通道（并非全部走以太网）：
+  PPS  ──► 主机 /dev/pps0     (BNC, 硬件 PPS —— 绝对时间源)
+  USB  ──► 主机 /dev/ttyUSB0  (NMEA + FusionEngine 报文)
+  以太 ──► Planet 交换机      (192.168.1.30, 仅用于 NTRIP RTK 校正)
 ```
+
+**IP 规划** —— 所有静态设备地址都在 `.100` 以下，因此 RUTM50 出厂默认 DHCP 池 (`.100–.249`) 保持不动，无需修改路由器配置：
+
+| 192.168.1.x | 角色 |
+|-------------|------|
+| .1 | RUTM50 路由器 + DHCP 服务器 + 默认网关 |
+| .2 | Planet WGS-6325-8UP2X 管理接口 |
+| .10 – .12 | Robin W 激光雷达（在传感器上设静态） |
+| .20 – .23 | RouteCAM 摄像头（通过 Aravis Web UI 设静态） |
+| .30 | Atlas Duo INS 以太网（静态，仅用于 NTRIP RTK） |
+| .40 | 主机 PC 10 GbE 网卡（通过 netplan / NetworkManager 设静态） |
+| .100 – .249 | RUTM50 DHCP 池 —— 出厂默认，保持不动 |
+
+**为什么主机连交换机而不是路由器**
+
+1. *PTP 完整性。* 主机是 PTP grandmaster。它的同步报文必须经过支持 PTP 的硬件才能到达每个从机。RUTM50 不是 PTP 边界时钟；如果主机挂在 RUTM50 LAN 口上，每个 PTP 报文都会经过路由器并产生驻留时间抖动，这会使边界时钟交换机的作用完全失效。
+2. *带宽。* 约 600 Mbps 的传感器流量进入 1 GbE LAN 口约占用 60%。主机到交换机 10 G SFP+ 链路消除瓶颈，并为 jumbo frame 和摄像头突发流量预留余量。
+
+RUTM50 → Planet 上行链路只承载 NTRIP RTCM3（约 5 kbps）和主机端的互联网流量（SSH、系统更新、NTP 备援），利用率约 0.1%。传感器数据从不离开 Planet 交换机。
+
+**Atlas Duo 以太网（RTK NTRIP）**
+
+Atlas Duo 的以太网口在本设计中只承担一项任务：从您的 caster（Trimble VRS Now、本地基站等）拉取 RTK NTRIP 校正（RTCM3）。通过 Atlas Web UI 配置：静态 IP `192.168.1.30`、网关 `192.168.1.1`、DNS `192.168.1.1`，将 NTRIP 客户端指向您的 caster。PPS 仍然走自己的 BNC 物理线缆到 `/dev/pps0`，保持作为绝对时间源 —— 以太网通道仅添加 RTK，不改变时间同步链。
 
 ### 3.2 硬件 vs 软件时间戳
 

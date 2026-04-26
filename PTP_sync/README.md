@@ -115,6 +115,8 @@ Accurate time synchronization across all sensors is critical for sensor fusion. 
 | LiDAR PTP slave | 300–800 ns |
 | RouteCAM GigE Vision PTP slave | 1–10 µs |
 
+> The RouteCAM number assumes a managed PoE switch with an IEEE 1588 boundary clock (e.g. Planet WGS-6325-8UP2X — see §3.1). Through an unmanaged switch (no boundary clock), expect 5–50 µs instead.
+
 **Critical:** The host clock MUST be disciplined by GPS (via the Atlas Duo PPS), not by internet NTP alone. NTP provides only ~1–10 ms accuracy, whereas GPS PPS provides < 100 ns.
 
 ### 3.1 Network Requirements
@@ -128,18 +130,65 @@ Accurate time synchronization across all sensors is critical for sensor fusion. 
 
 > **Robin W raw bandwidth:** the Seyond datasheet lists the Robin W output at ~60 Mbps per unit. Earlier drafts of this doc cited 150 Mbps (conflating peak burst with sustained), which overestimates the aggregate by roughly 3×. 3× Robin W = ~180 Mbps sustained; plan jitter/burst headroom at ~1.5× for safety.
 
-**Recommended network topology:**
+**Reference network design**
+
+The recommended hardware combination is a **Teltonika RUTM50 / RUTM54** 5G/4G cellular router (cellular WAN gateway) paired with a **Planet WGS-6325-8UP2X** managed PoE++ switch (sensor LAN with IEEE 1588 boundary clock and 10 GbE uplink). The host PC connects directly to the switch's 10 G SFP+ port — never through the cellular router — so PTP messages travel `host → boundary clock → sensor` and never cross the non-PTP-aware router.
 
 ```
-Host NIC (10 GbE) → PoE+ Managed Switch (IEEE 1588 PTP boundary clock)
-                     ├── Robin W Front    (192.168.1.10)
-                     ├── Robin W Rear-L   (192.168.1.11)
-                     ├── Robin W Rear-R   (192.168.1.12)
-                     ├── RouteCAM FR      (192.168.1.20, PoE)
-                     ├── RouteCAM FL      (192.168.1.21, PoE)
-                     ├── RouteCAM RL      (192.168.1.22, PoE)
-                     └── RouteCAM RR      (192.168.1.23, PoE)
+Internet (5G/4G)
+       │
+       ▼
+┌──────────────────────────┐
+│ Teltonika RUTM50/RUTM54  │  192.168.1.1
+│  (cellular gateway only) │  WAN port unused
+└─────────────┬────────────┘
+              │ 1 GbE  (RUTM50 LAN1 → Planet GbE port)
+              ▼
+┌────────────────────────────────────────────────────────┐
+│ Planet WGS-6325-8UP2X (managed L3, IEEE 1588 BC, PoE++)│  192.168.1.2 (mgmt)
+├────────────────────────────────────────────────────────┤
+│ Port    Type            Device                  IP      │
+│ ----    ------------    --------------------    ------ │
+│ 1       1 GbE           → RUTM50 LAN1           (uplink)
+│ 2       2.5 GbE PoE++   RouteCAM Front-Right    .20    │
+│ 3       2.5 GbE PoE++   RouteCAM Front-Left     .21    │
+│ 4       2.5 GbE PoE++   RouteCAM Rear-Left      .22    │
+│ 5       2.5 GbE PoE++   RouteCAM Rear-Right     .23    │
+│ 6       1 GbE  PoE++    Robin W Front           .10    │
+│ 7       1 GbE  PoE++    Robin W Rear-Left       .11    │
+│ 8       1 GbE  PoE++    Robin W Rear-Right      .12    │
+│ SFP1    10 G            Host PC (10G NIC)       .40    │
+│ SFP2    10 G            spare (Atlas Duo Eth / NAS)    │
+└────────────────────────────────────────────────────────┘
+
+Atlas Duo INS — three physical paths to the host (not all over Ethernet):
+  PPS  ──► host /dev/pps0     (BNC, hardware PPS — absolute time origin)
+  USB  ──► host /dev/ttyUSB0  (NMEA + FusionEngine messages)
+  Eth  ──► Planet switch      (192.168.1.30, NTRIP RTK corrections only)
 ```
+
+**IP plan** — every static device sits below `.100`, so the RUTM50's factory DHCP pool (`.100–.249`) stays untouched and no router configuration is required:
+
+| 192.168.1.x | Role |
+|-------------|------|
+| .1 | RUTM50 router + DHCP server + default gateway |
+| .2 | Planet WGS-6325-8UP2X management interface |
+| .10 – .12 | Robin W LiDARs (static on sensor) |
+| .20 – .23 | RouteCAM cameras (static via Aravis web UI) |
+| .30 | Atlas Duo INS Ethernet (static, NTRIP RTK only) |
+| .40 | Host PC 10 GbE NIC (static via netplan / NetworkManager) |
+| .100 – .249 | RUTM50 DHCP pool — factory default, untouched |
+
+**Why the host connects to the switch, not the router**
+
+1. *PTP integrity.* The host is the PTP grandmaster. Its sync messages must reach every slave through PTP-aware hardware. The RUTM50 is not a PTP boundary clock; if the host sat on a RUTM50 LAN port, every PTP packet would traverse the router and pick up residence-time jitter that defeats the entire purpose of the boundary-clock switch.
+2. *Bandwidth.* ~600 Mbps of sensor traffic onto a 1 GbE LAN port runs at ~60% saturation. A 10 G SFP+ link host-to-switch eliminates the bottleneck and gives headroom for jumbo frames and bursty camera traffic.
+
+The RUTM50 → Planet uplink carries only NTRIP RTCM3 (~5 kbps) and any host-side internet traffic (SSH, OS updates, NTP fallback). It runs at ~0.1% utilization. Sensor data never leaves the Planet switch.
+
+**Atlas Duo Ethernet (RTK NTRIP)**
+
+The Atlas Duo's Ethernet port has one job in this design: pull RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30`, gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. PPS still travels its own physical BNC wire to `/dev/pps0` and remains the absolute time origin — the Ethernet path adds RTK without altering the time-sync chain.
 
 ### 3.2 Hardware vs Software Timestamping
 

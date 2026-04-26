@@ -13,6 +13,18 @@ ehthumbs.db
 *.scad~
 *.scad.bak
 
+# Python cache
+__pycache__/
+*.pyc
+
+# Recording sessions (large MCAP bags — keep out of git).
+# The recording/data/ folder itself is tracked via .gitkeep, but
+# every session_* subdir written by sensor_recorder.py is ignored.
+recordings/
+recording/sessions/
+recording/data/*
+!recording/data/.gitkeep
+
 # Office documents (generated review reports, drafts, etc. — do not commit)
 *.docx
 *.doc

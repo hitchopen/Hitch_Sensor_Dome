@@ -1,0 +1,190 @@
+{
+  "configById": {
+    "3D!dome": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 18,
+        "phi": 60,
+        "thetaOffset": 45,
+        "targetOffset": [0, 0, 0],
+        "near": 0.5,
+        "far": 5000,
+        "fovy": 45
+      },
+      "followMode": "follow-pose",
+      "followTf": "imu_link",
+      "scene": {
+        "enableStats": false,
+        "backgroundColor": "#0e1116",
+        "labelScaleFactor": 1
+      },
+      "transforms": {
+        "frame:imu_link": { "visible": true },
+        "frame:lidar_front_link": { "visible": true },
+        "frame:lidar_rear_left_link": { "visible": true },
+        "frame:lidar_rear_right_link": { "visible": true },
+        "frame:cam_front_left_link": { "visible": true },
+        "frame:cam_front_right_link": { "visible": true },
+        "frame:cam_rear_left_link": { "visible": true },
+        "frame:cam_rear_right_link": { "visible": true }
+      },
+      "topics": {
+        "/robin_w_front/points": {
+          "visible": true,
+          "colorField": "intensity",
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "pointSize": 2,
+          "pointShape": "circle"
+        },
+        "/robin_w_rear_left/points": {
+          "visible": true,
+          "colorField": "intensity",
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "pointSize": 2,
+          "pointShape": "circle"
+        },
+        "/robin_w_rear_right/points": {
+          "visible": true,
+          "colorField": "intensity",
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "pointSize": 2,
+          "pointShape": "circle"
+        },
+        "/imu/data": { "visible": true },
+        "/pose": { "visible": true }
+      },
+      "publish": { "type": "point", "poseTopic": "/move_base_simple/goal" },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "imu_link",
+          "size": 30,
+          "divisions": 30,
+          "color": "#1c2230",
+          "position": [0, 0, 0],
+          "rotation": [0, 0, 0],
+          "lineWidth": 1
+        }
+      }
+    },
+    "Image!cam_front_left": {
+      "cameraTopic": "/cam_front_left/image_raw",
+      "calibrationTopic": "/cam_front_left/camera_info",
+      "synchronize": true,
+      "smooth": true
+    },
+    "Image!cam_front_right": {
+      "cameraTopic": "/cam_front_right/image_raw",
+      "calibrationTopic": "/cam_front_right/camera_info",
+      "synchronize": true,
+      "smooth": true
+    },
+    "Image!cam_rear_left": {
+      "cameraTopic": "/cam_rear_left/image_raw",
+      "calibrationTopic": "/cam_rear_left/camera_info",
+      "synchronize": true,
+      "smooth": true
+    },
+    "Image!cam_rear_right": {
+      "cameraTopic": "/cam_rear_right/image_raw",
+      "calibrationTopic": "/cam_rear_right/camera_info",
+      "synchronize": true,
+      "smooth": true
+    },
+    "Map!gnss": {
+      "center": { "lat": 37.8719, "lon": -122.2585 },
+      "zoom": 17,
+      "topicColors": {
+        "/gps/fix": "#22c55e"
+      },
+      "followTopic": "/gps/fix",
+      "layer": "map"
+    },
+    "DiagnosticSummary!rates": {
+      "minLevel": 0,
+      "pinnedIds": [],
+      "hardwareIdFilter": "",
+      "topicToRender": "/sensor_dome/rates",
+      "sortByLevel": true,
+      "secondsUntilStale": 5
+    },
+    "Plot!imu": {
+      "paths": [
+        { "value": "/imu/data.linear_acceleration.x", "enabled": true, "label": "ax" },
+        { "value": "/imu/data.linear_acceleration.y", "enabled": true, "label": "ay" },
+        { "value": "/imu/data.linear_acceleration.z", "enabled": true, "label": "az" },
+        { "value": "/imu/data.angular_velocity.z",   "enabled": true, "label": "yaw rate" }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 240,
+      "followingViewWidth": 30
+    },
+    "Indicator!lock": {
+      "path": "/gps/fix.status.status",
+      "style": "background",
+      "fallbackColor": "#a3a3a3",
+      "fallbackLabel": "no fix",
+      "rules": [
+        { "operator": "=", "rawValue": "0", "color": "#facc15", "label": "FIX 2D" },
+        { "operator": "=", "rawValue": "1", "color": "#22c55e", "label": "FIX 3D" },
+        { "operator": "=", "rawValue": "2", "color": "#06b6d4", "label": "DGPS" },
+        { "operator": "=", "rawValue": "-1", "color": "#ef4444", "label": "NO FIX" }
+      ]
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "first": {
+      "first": "3D!dome",
+      "second": {
+        "first": {
+          "first": "Image!cam_front_left",
+          "second": "Image!cam_front_right",
+          "direction": "row",
+          "splitPercentage": 50
+        },
+        "second": {
+          "first": "Image!cam_rear_left",
+          "second": "Image!cam_rear_right",
+          "direction": "row",
+          "splitPercentage": 50
+        },
+        "direction": "column",
+        "splitPercentage": 50
+      },
+      "direction": "row",
+      "splitPercentage": 60
+    },
+    "second": {
+      "first": "Map!gnss",
+      "second": {
+        "first": "DiagnosticSummary!rates",
+        "second": {
+          "first": "Indicator!lock",
+          "second": "Plot!imu",
+          "direction": "column",
+          "splitPercentage": 25
+        },
+        "direction": "row",
+        "splitPercentage": 35
+      },
+      "direction": "row",
+      "splitPercentage": 35
+    },
+    "direction": "column",
+    "splitPercentage": 65
+  }
+}
