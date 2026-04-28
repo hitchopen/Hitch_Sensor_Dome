@@ -14,25 +14,66 @@
 
 三个脚本可自动化整个安装过程。在全新的 Ubuntu 24.04 系统上按顺序运行它们。
 
+**运行任何脚本之前**，请先编辑 [`../config/network_config.yaml`](../config/network_config.yaml) 一次，使其匹配您的安装 —— 至少要把 `host.interface` 设为您的网卡名（如 `enp0s31f6`、`eno1`、`eth0` —— 用 `ip link show` 查看）。三个脚本都从该文件读取默认值，因此下面的命令不需要任何参数。命令行参数和环境变量在运行时仍然可以覆盖 YAML。
+
 **第 1 步**安装所有系统前提条件、配置 GPS 校准 PTP 主时钟（gpsd → chrony → ptp4l → phc2sys）、安装 ROS 2 Jazzy 以及构建 Point One Nav 驱动程序和主机工具。
 
 ```bash
-./setup_ubuntu_sync.sh --eth enp0s31f6
+./setup_ubuntu_sync.sh
 ```
 
 **第 2 步**在每个 Seyond Robin W LiDAR 上启用 PTP 同步并构建 Seyond ROS 2 驱动程序。当 LiDAR 通电并连接时运行。
 
 ```bash
-./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11,192.168.1.12
+./setup_robin_w_sync.sh
 ```
 
 **第 3 步**安装 Aravis GigE Vision 库、在每个 RouteCAM 摄像机上启用 IEEE 1588 PTP，以及安装 ROS 2 摄像机软件包。当摄像机通过 PoE 供电时运行。
 
 ```bash
-./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23
+./setup_camera_sync.sh
+```
+
+> **以上三条命令就是推荐的调用方式。** 它们使用您在 `config/network_config.yaml` 中设置的值。下方的代码块只是参考，演示*如何*在临时一次运行时覆盖配置 —— 正常安装时您不需要输入其中任何内容。
+
+```bash
+# ─── 如何覆盖 YAML 默认值（仅供参考） ─────────────────────────
+# 三个脚本都从 config/network_config.yaml 读取默认值。需要在
+# 单次运行中临时覆盖（不修改 YAML）时，可以使用命令行参数或
+# 环境变量。优先级：环境变量 > 命令行 > YAML。
+
+# --- 命令行参数形式：仅对当前调用生效 ---
+./setup_ubuntu_sync.sh  --eth eno1                       # 不同网卡
+./setup_ubuntu_sync.sh  --serial /dev/ttyACM0            # 不同 Atlas 串口
+./setup_ubuntu_sync.sh  --host-ip 192.168.1.41           # 不同主机 IP
+./setup_robin_w_sync.sh --ips 192.168.1.10               # 只配置一台 LiDAR
+./setup_camera_sync.sh  --ips 192.168.1.20,192.168.1.21  # 部分摄像机
+
+# --- 环境变量形式：同样仅对该次调用生效 ---
+ETH_IFACE=enp1s0f0     ./setup_ubuntu_sync.sh
+LIDAR_IPS_STR=...      ./setup_robin_w_sync.sh
+CAM_IPS_STR=...        ./setup_camera_sync.sh
+
+# --- 完全不带参数（推荐）：所有值都从 YAML 读取 ---
+./setup_ubuntu_sync.sh
 ```
 
 第 2 步和第 3 步彼此独立——可以任意顺序集成 LiDAR 和摄像机。每个脚本末尾都包含自我测试，用于验证 PTP 同步质量、服务状态和传感器可达性。
+
+### 1.1 网络配置文件
+
+[`../config/network_config.yaml`](../config/network_config.yaml) 是系统相关网络参数的单一信息源：网卡名、主机静态 IP、各传感器 IP、路由器 / 交换机 IP，以及 DHCP 池范围。一次性编辑该文件即可配置三个设置脚本（以及任何其它通过 `config/load_network_config.sh` 加载它的 shell 工具）。
+
+| YAML 键 | 导出的环境变量 | 被哪些脚本使用 |
+|----------|-------------------|---------|
+| `host.interface` | `NETCFG_ETH` | 三个脚本（`--eth`） |
+| `host.ip` | `NETCFG_HOST_IP` | `setup_ubuntu_sync.sh`（`--host-ip`） |
+| `atlas_duo.serial_port` | `NETCFG_ATLAS_SERIAL` | `setup_ubuntu_sync.sh`（`--serial`） |
+| `lidars[*].ip` | `NETCFG_LIDAR_IPS` | `setup_robin_w_sync.sh`（`--ips`） |
+| `cameras[*].ip` | `NETCFG_CAMERA_IPS` | `setup_camera_sync.sh`（`--ips`） |
+| `gateway`、`subnet`、`router.ip`、`switch.ip`、`atlas_duo.ethernet_ip` | `NETCFG_GATEWAY`、`NETCFG_SUBNET`、`NETCFG_ROUTER_IP`、`NETCFG_SWITCH_IP`、`NETCFG_ATLAS_IP` | 预留给后续脚本和主机 IP / NTRIP 配置 |
+
+YAML 加载器为 [`../config/load_network_config.sh`](../config/load_network_config.sh)；它通过 `python3 + pyyaml` 解析 YAML 并将每个值导出为 shell 变量。
 
 ---
 
@@ -40,26 +81,35 @@
 
 设置脚本处理大部分安装，但运行脚本前需要手动执行两个步骤。
 
-### 2.1 安装 PREEMPT_RT 内核
+### 2.1 PREEMPT_RT 内核 —— 仅在硬实时控制场景下需要
 
-需要 Ubuntu Pro（个人用户在最多 5 台计算机上免费）。这些脚本不会安装内核，因为它需要您的个人 Pro 令牌和重启。
+**仅做传感器数据采集时，您不需要 RT 内核。** 本仓库 [`recording/`](../recording/) 工作流（把 GNSS / IMU / LiDAR / 摄像头采到 Foxglove 原生 MCAP 包中，用于离线建图、感知训练或 SLAM 评估）属于*感知与定位的数据采集*用途，**Ubuntu 24.04 标准（generic）内核就足够了**。在通用内核上的 PTP 时序通常落在第 3 节给出的 RT 内核数值的 1–2× 范围内，远在传感器自身能分辨的精度之内。
+
+只有当主机需要*以受限延迟实际响应*传感器数据时，RT 内核才真正必要：例如闭合实时控制环（转向、制动、机械臂伺服）、运行确定性安全监控，或任何无法接受毫秒级调度抖动的场景。如果您的应用属于"先记录，再离线处理"，本节可整段跳过。
+
+| 用途 | 内核 | 原因 |
+|----------|--------|-----|
+| 建图、感知、训练、离线分析的数据采集 | **Generic（默认）** | 安装更简单，NVIDIA / CUDA / TensorRT 全部可用，PTP 精度仍能满足传感器融合需求 |
+| 实时控制、确定性安全回路、硬件在环测试 | PREEMPT_RT | 牺牲 CUDA 支持换取受限的调度延迟 —— 见附录 C |
+
+如果确实需要 RT，通过 Ubuntu Pro 安装（个人用户在最多 5 台计算机上免费）：
 
 ```bash
-# Get a free token at ubuntu.com/pro
+# 在 ubuntu.com/pro 获取免费令牌
 sudo pro attach YOUR_TOKEN_HERE
 sudo pro status
 sudo pro enable realtime-kernel
 sudo reboot
 ```
 
-重启后，验证：
+重启后验证：
 
 ```bash
 uname -a
-# Should show: ... SMP PREEMPT_RT ...
+# 应显示： ... SMP PREEMPT_RT ...
 ```
 
-**NVIDIA GPU 注意事项：** NVIDIA 内核模块（`nvidia.ko`）无法在 PREEMPT_RT 内核上加载。引导到 RT 内核时不提供 CUDA、cuDNN 或 TensorRT。使用 Intel iGPU 显示。参见[附录 C](#c-nvidia-gpu-和-rt-内核兼容性)了解推荐工作流程（在 RT 上记录，在通用内核上处理）。
+**NVIDIA GPU 注意（仅 RT 内核）：** NVIDIA 内核模块（`nvidia.ko`）无法在 PREEMPT_RT 上加载 —— 引导到 RT 内核时 CUDA、cuDNN、TensorRT 全部不可用。使用 Intel iGPU 显示。参见[附录 C](#c-nvidia-gpu-和-rt-内核兼容性)了解双内核工作流（在 RT 上记录，在通用内核上处理）。
 
 ### 2.2 确定您的以太网接口
 

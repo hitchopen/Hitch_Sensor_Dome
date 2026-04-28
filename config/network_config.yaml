@@ -1,0 +1,73 @@
+# =============================================================
+# Hitch Sensor Dome — Network Reference Design
+#
+# Single source of truth for system-dependent network parameters.
+# All PTP_sync setup scripts read defaults from this file. Edit
+# the values below for your installation; the scripts will pick
+# them up automatically without --eth / --ips flags.
+#
+# CLI flags and environment variables still override these
+# defaults at runtime (env > CLI > this YAML > built-in).
+#
+# Reference topology (see PTP_sync/README.md §3.1):
+#   Internet → Teltonika RUTM50/RUTM54 (router, .1)
+#                → Planet WGS-6325-8UP2X (managed PoE++ switch, .2)
+#                    → Host PC 10G NIC          (.40)
+#                    → 4× RouteCAM cameras      (.20–.23)
+#                    → 3× Robin W LiDARs        (.10–.12)
+#                    → Atlas Duo Eth (NTRIP)    (.30)
+# =============================================================
+
+# ─── Network identity ──────────────────────────────────────
+subnet:    "192.168.1.0/24"
+gateway:   "192.168.1.1"        # RUTM50 router LAN IP
+dns:       "192.168.1.1"        # router does DNS forwarding
+broadcast: "192.168.1.255"
+
+# ─── Host workstation (PTP grandmaster) ────────────────────
+# Run `ip link show` to find your interface name. Common names:
+#   enp0s31f6   onboard NIC (Lenovo ThinkPad P1 Gen 6, default)
+#   eno1        legacy "predictable" name on many servers
+#   eth0        kernel-style name (older Ubuntu, USB adapters)
+#   enp1s0f0    PCIe NIC slot 1 port 0 (e.g. Intel X550-T2)
+host:
+  interface: "enp0s31f6"        # CHANGE THIS for your system
+  ip:        "192.168.1.40"     # static, below RUTM50 DHCP pool
+
+# ─── Infrastructure ────────────────────────────────────────
+router:
+  model: "Teltonika RUTM50"     # or RUTM54 — same LAN behavior
+  ip:    "192.168.1.1"
+switch:
+  model: "Planet WGS-6325-8UP2X"
+  ip:    "192.168.1.2"          # management interface (optional)
+
+# ─── Atlas Duo INS ─────────────────────────────────────────
+# Ethernet path is for NTRIP RTK only.  PPS travels its own BNC
+# wire to /dev/pps0; FusionEngine messages travel USB serial.
+atlas_duo:
+  ethernet_ip: "192.168.1.30"
+  serial_port: "/dev/ttyUSB0"
+  pps_device:  "/dev/pps0"
+
+# ─── Seyond Robin W LiDARs ─────────────────────────────────
+# IPs are set on each unit via its web UI or innovusion_lidar_util.
+lidars:
+  - { name: "robin_w_front",      ip: "192.168.1.10" }
+  - { name: "robin_w_rear_left",  ip: "192.168.1.11" }
+  - { name: "robin_w_rear_right", ip: "192.168.1.12" }
+
+# ─── e-con RouteCAM_P_CU25_CXLC_IP67 cameras ───────────────
+# IPs are set via the Aravis web UI / arv-tool-0.8.
+cameras:
+  - { name: "cam_front_right",  ip: "192.168.1.20" }
+  - { name: "cam_front_left",   ip: "192.168.1.21" }
+  - { name: "cam_rear_left",    ip: "192.168.1.22" }
+  - { name: "cam_rear_right",   ip: "192.168.1.23" }
+
+# ─── DHCP pool (informational) ─────────────────────────────
+# RUTM50 factory default — leave alone unless you're moving sensors
+# above .100, in which case shrink this pool accordingly.
+dhcp_pool:
+  start: "192.168.1.100"
+  end:   "192.168.1.249"

@@ -19,19 +19,29 @@
 #   - Default camera IPs: 192.168.1.20–.23
 #
 # Usage:
+# Defaults are pulled from ../config/network_config.yaml — edit
+# that file once for your installation, and these flags become
+# optional. CLI flags and env vars still override the YAML.
+#
 #   chmod +x setup_camera_sync.sh
+#   ./setup_camera_sync.sh                              # use YAML defaults
 #   ./setup_camera_sync.sh [--eth IFACE] [--ips IP1,IP2,IP3,IP4]
 #
 # Examples:
-#   ./setup_camera_sync.sh --eth enp0s31f6
+#   ./setup_camera_sync.sh
 #   ./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21
 # =============================================================
 
 set -euo pipefail
 
-# ─── Configuration ───────────────────────────────────────────
-ETH_IFACE="${ETH_IFACE:-eth0}"
-CAM_IPS_STR="${CAM_IPS_STR:-192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23}"
+# ─── Load defaults from /config/network_config.yaml ──────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../config/load_network_config.sh
+source "$SCRIPT_DIR/../config/load_network_config.sh"
+
+# ─── Configuration (env > CLI > YAML defaults) ───────────────
+ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
+CAM_IPS_STR="${CAM_IPS_STR:-$NETCFG_CAMERA_IPS}"
 CAM_NAMES=("cam_front_right" "cam_front_left" "cam_rear_left" "cam_rear_right")
 ROS_DISTRO="jazzy"
 WS_DIR="$HOME/ros2_ws"

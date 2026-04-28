@@ -14,25 +14,66 @@ Installation and configuration guide for a high-performance GNSS/IMU/LiDAR/camer
 
 Three scripts automate the entire installation. Run them in order on a fresh Ubuntu 24.04 system.
 
+**Before running anything**, edit [`../config/network_config.yaml`](../config/network_config.yaml) once to match your installation — at minimum, set `host.interface` to your NIC name (e.g. `enp0s31f6`, `eno1`, `eth0` — find yours with `ip link show`). All three scripts pull their defaults from that file, so the commands below need no flags. CLI flags and environment variables still override the YAML at runtime.
+
 **Step 1** installs all system prerequisites, configures the GPS-disciplined PTP grandmaster (gpsd → chrony → ptp4l → phc2sys), installs ROS 2 Jazzy, and builds the Point One Nav driver and host tools.
 
 ```bash
-./setup_ubuntu_sync.sh --eth enp0s31f6
+./setup_ubuntu_sync.sh
 ```
 
 **Step 2** enables PTP synchronization on each Seyond Robin W LiDAR and builds the Seyond ROS 2 driver. Run when LiDARs are powered and connected.
 
 ```bash
-./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11,192.168.1.12
+./setup_robin_w_sync.sh
 ```
 
 **Step 3** installs the Aravis GigE Vision library, enables IEEE 1588 PTP on each RouteCAM camera, and installs ROS 2 camera packages. Run when cameras are powered via PoE.
 
 ```bash
-./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23
+./setup_camera_sync.sh
+```
+
+> **The three commands above are the recommended invocation.** They use the values you set in `config/network_config.yaml`. The block below is a reference for *how* to override on a one-off run — you do not need to type any of it for a normal install.
+
+```bash
+# ─── How to override YAML defaults (reference only) ─────────────
+# All three scripts read defaults from config/network_config.yaml.
+# Override on a per-run basis — without editing the YAML — using
+# CLI flags or environment variables. Precedence: env > CLI > YAML.
+
+# --- CLI flag form: applies only to that invocation ---
+./setup_ubuntu_sync.sh  --eth eno1                       # different NIC
+./setup_ubuntu_sync.sh  --serial /dev/ttyACM0            # different Atlas serial
+./setup_ubuntu_sync.sh  --host-ip 192.168.1.41           # different host IP
+./setup_robin_w_sync.sh --ips 192.168.1.10               # only one LiDAR
+./setup_camera_sync.sh  --ips 192.168.1.20,192.168.1.21  # subset of cameras
+
+# --- Environment variable form: also one-shot ---
+ETH_IFACE=enp1s0f0     ./setup_ubuntu_sync.sh
+LIDAR_IPS_STR=...      ./setup_robin_w_sync.sh
+CAM_IPS_STR=...        ./setup_camera_sync.sh
+
+# --- No flags at all (recommended): values come from the YAML ---
+./setup_ubuntu_sync.sh
 ```
 
 Steps 2 and 3 are independent of each other — integrate LiDARs and cameras in any order. Each script includes a self-test at the end that verifies PTP sync quality, service status, and sensor reachability.
+
+### 1.1 Network configuration file
+
+[`../config/network_config.yaml`](../config/network_config.yaml) is the single source of truth for system-dependent network parameters: NIC name, host static IP, sensor IPs, router/switch IPs, and DHCP-pool boundaries. Editing one file once configures all three setup scripts (and any other shell tooling that sources `config/load_network_config.sh`).
+
+| YAML key | Exported variable | Used by |
+|----------|-------------------|---------|
+| `host.interface` | `NETCFG_ETH` | all 3 scripts (`--eth`) |
+| `host.ip` | `NETCFG_HOST_IP` | `setup_ubuntu_sync.sh` (`--host-ip`) |
+| `atlas_duo.serial_port` | `NETCFG_ATLAS_SERIAL` | `setup_ubuntu_sync.sh` (`--serial`) |
+| `lidars[*].ip` | `NETCFG_LIDAR_IPS` | `setup_robin_w_sync.sh` (`--ips`) |
+| `cameras[*].ip` | `NETCFG_CAMERA_IPS` | `setup_camera_sync.sh` (`--ips`) |
+| `gateway`, `subnet`, `router.ip`, `switch.ip`, `atlas_duo.ethernet_ip` | `NETCFG_GATEWAY`, `NETCFG_SUBNET`, `NETCFG_ROUTER_IP`, `NETCFG_SWITCH_IP`, `NETCFG_ATLAS_IP` | reserved for future scripts and host-IP / NTRIP setup |
+
+The YAML loader is [`../config/load_network_config.sh`](../config/load_network_config.sh); it parses the YAML through `python3 + pyyaml` and exports each value as a shell variable.
 
 ---
 
@@ -40,9 +81,18 @@ Steps 2 and 3 are independent of each other — integrate LiDARs and cameras in 
 
 The setup scripts handle most installation, but two steps require manual action before running them.
 
-### 2.1 Install the PREEMPT_RT Kernel
+### 2.1 PREEMPT_RT Kernel — only needed for hard-real-time control
 
-Ubuntu Pro is required (free for personal use on up to 5 machines). The scripts do not install the kernel because it requires your personal Pro token and a reboot.
+**You do not need the RT kernel just to record sensor data.** For perception and localization data collection — the [`recording/`](../recording/) workflow that captures GNSS / IMU / LiDAR / camera into a Foxglove-native MCAP bag for offline mapping, perception training, or SLAM evaluation — the **stock Ubuntu 24.04 generic kernel is sufficient**. PTP timing on the generic kernel typically lands within 1–2× of the RT-kernel numbers in §3, which is well inside what every sensor in this dome can resolve.
+
+The RT kernel matters when the host has to *act* on sensor data with bounded latency: closing a real-time control loop (steering, braking, manipulator servoing), running a deterministic safety monitor, or any scenario where a millisecond of scheduler jitter is unacceptable. If your application is "record now, process later," skip this section entirely.
+
+| Use case | Kernel | Why |
+|----------|--------|-----|
+| Recording for mapping, perception, training, offline analysis | **Generic (default)** | Simpler install, full NVIDIA / CUDA / TensorRT, PTP still meets sensor-fusion requirements |
+| Real-time control, deterministic safety loops, hardware-in-the-loop | PREEMPT_RT | Bounded scheduling latency at the cost of CUDA support — see Appendix C |
+
+If you do need RT, install via Ubuntu Pro (free for personal use on up to 5 machines):
 
 ```bash
 # Get a free token at ubuntu.com/pro
@@ -59,7 +109,7 @@ uname -a
 # Should show: ... SMP PREEMPT_RT ...
 ```
 
-**NVIDIA GPU note:** The NVIDIA kernel module (`nvidia.ko`) does not load on the PREEMPT_RT kernel. No CUDA, cuDNN, or TensorRT is available when booted into the RT kernel. Use Intel iGPU for display. See [Appendix C](#c-nvidia-gpu-and-rt-kernel-compatibility) for recommended workflows (record on RT, process on generic).
+**NVIDIA GPU note (RT kernel only):** The NVIDIA kernel module (`nvidia.ko`) does not load on PREEMPT_RT — no CUDA, cuDNN, or TensorRT when booted into the RT kernel. Use Intel iGPU for display. See [Appendix C](#c-nvidia-gpu-and-rt-kernel-compatibility) for the dual-boot workflow (record on RT, process on generic).
 
 ### 2.2 Identify Your Ethernet Interface
 
