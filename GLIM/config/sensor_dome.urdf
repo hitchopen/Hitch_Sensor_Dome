@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="sensor_dome">
+  <!-- Auto-generated from config/sensor_dome_tf.yaml — DO NOT EDIT BY HAND. Re-run GLIM/config/generate_sensor_dome_urdf.py to regenerate.-->
+  <link name="imu_link"/>
+  <link name="lidar_front_link"/>
+  <joint name="imu_to_lidar_front_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="lidar_front_link"/>
+    <origin xyz="0.090000 0.000000 0.141500" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="lidar_rear_left_link"/>
+  <joint name="imu_to_lidar_rear_left_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="lidar_rear_left_link"/>
+    <origin xyz="-0.045000 0.077942 0.141500" rpy="0.000000 0.000000 2.094394"/>
+  </joint>
+  <link name="lidar_rear_right_link"/>
+  <joint name="imu_to_lidar_rear_right_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="lidar_rear_right_link"/>
+    <origin xyz="-0.045000 -0.077942 0.141500" rpy="0.000000 -0.000000 -2.094394"/>
+  </joint>
+  <link name="cam_front_right_link"/>
+  <joint name="imu_to_cam_front_right_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="cam_front_right_link"/>
+    <origin xyz="0.105000 0.052000 0.153500" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="cam_front_left_link"/>
+  <joint name="imu_to_cam_front_left_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="cam_front_left_link"/>
+    <origin xyz="0.105000 -0.052000 0.153500" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="cam_rear_left_link"/>
+  <joint name="imu_to_cam_rear_left_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="cam_rear_left_link"/>
+    <origin xyz="-0.097533 0.064933 0.153500" rpy="0.000000 0.000000 2.094394"/>
+  </joint>
+  <link name="cam_rear_right_link"/>
+  <joint name="imu_to_cam_rear_right_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="cam_rear_right_link"/>
+    <origin xyz="-0.097533 -0.064933 0.153500" rpy="0.000000 -0.000000 -2.094394"/>
+  </joint>
+</robot>

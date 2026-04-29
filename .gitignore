@@ -17,6 +17,16 @@ ehthumbs.db
 __pycache__/
 *.pyc
 
+# GLIM build artifacts (do not commit compiled output)
+GLIM/build/
+GLIM/install/
+GLIM/log/
+# Defensive: catch any accidental nested copy of glim/ inside GLIM/config/.
+GLIM/config/glim/
+
+# GLIM map output (large; produced per session)
+glim_maps/
+
 # Recording sessions (large MCAP bags — keep out of git).
 # The recording/data/ folder itself is tracked via .gitkeep, but
 # every session_* subdir written by sensor_recorder.py is ignored.

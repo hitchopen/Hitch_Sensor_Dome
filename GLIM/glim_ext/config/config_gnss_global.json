@@ -1,0 +1,55 @@
+{
+  // GNSS-aided global mapping for Hitch Sensor Dome.
+  //
+  // The Point One Atlas Duo is the primary GNSS source. The
+  // fusion_engine_driver publishes /gps/fix as sensor_msgs/NavSatFix at
+  // 10 Hz; that's enough to anchor the global graph in WGS-84 and
+  // prevent z-drift over multi-lap trajectories.
+  //
+  // gnss_topic / gnss_msg_type
+  //   /gps/fix is the project default (matches recording/sensor_config.yaml).
+  //   If you instead run a node that publishes nav_msgs/Odometry from the
+  //   Atlas Duo's full 6-DOF pose, change msg_type to
+  //   "nav_msgs/msg/Odometry" — both are supported by libgnss_global.so.
+  //
+  // min_baseline
+  //   Minimum motion (m) before a new GNSS factor is added.
+  //   Lowered from 1.0 m → 0.5 m so GNSS factors are added at twice the
+  //   spatial density. The original 1.0 m was tuned to "keep GNSS
+  //   responsive without flooding"; in multi-lap data the LiDAR factor
+  //   density vastly outnumbered GNSS factors, letting LiDAR z-drift win.
+  //   At 0.5 m and a typical 200 Hz IMU / 10 Hz LiDAR rate, GNSS still
+  //   contributes a tiny fraction of total factors but with enough
+  //   weight to keep z anchored. Lower to 0.25 m for very fast vehicles
+  //   where 0.5 m of motion only takes 6 ms.
+  //
+  // prior_inf_scale
+  //   Information matrix diagonal (x, y, z) for the GNSS prior factor.
+  //   Must be non-zero on every axis to actually constrain the optimizer
+  //   — earlier deployments had [0, 0, 0] which silently disabled GNSS
+  //   entirely.
+  //
+  //   The z component is now 5× larger than horizontal (1e4 → 5e4)
+  //   because the canonical multi-lap failure mode is z-drift toward the
+  //   sky during repeated laps. Atlas Duo + RTK delivers ~1 cm vertical
+  //   accuracy, so giving GNSS extra authority on the z axis is justified
+  //   — and the elevated weight is what closes the chicken-and-egg loop
+  //   in implicit loop closure: it prevents lap 1 from accumulating
+  //   enough z-drift to push lap 2 out of VGICP's convergence basin.
+  //
+  //   If you observe horizontal jitter (the Atlas Duo's RTK fix is much
+  //   tighter horizontally than vertically isn't typical, but it can
+  //   happen with multipath), lower x/y to 5e3 instead of raising z
+  //   further. If your GNSS is float-only (no RTK fix), drop z back to
+  //   1e4 — the underlying covariance is too noisy for 5e4 to be safe.
+  "gnss": {
+    "gnss_topic": "/gps/fix",
+    "gnss_msg_type": "sensor_msgs/msg/NavSatFix",
+    "min_baseline": 0.5,
+    "prior_inf_scale": [
+      1e4,
+      1e4,
+      5e4
+    ]
+  }
+}

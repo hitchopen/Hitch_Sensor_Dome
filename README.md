@@ -37,8 +37,10 @@ Documents/           Component datasheets
   e-con_RouteCAM_CU25_IP67_Lens_Datasheet.pdf
   Datasheet_Magnetic_Stand_for_Survey_GNSS_Antenna.pdf
 
-ROS2 config/         ROS2 integration files
-  sensor_dome_tf.yaml  Static tf transforms (all sensors → imu_link)
+config/              Project-wide configuration (single source of truth)
+  sensor_dome_tf.yaml     Static TF transforms (all sensors → imu_link)
+  network_config.yaml     NIC, host IP, sensor IPs, DHCP pool
+  load_network_config.sh  Sourced by setup_*.sh to export NETCFG_*
 
 PTP_sync/            One-time host + sensor time-sync setup
   setup_ubuntu_sync.sh    GPS-disciplined PTP grandmaster (gpsd → chrony → ptp4l)
@@ -54,6 +56,15 @@ recording/           Run-time data recording + Foxglove dashboard
   launch/                 Static-TF launch helper
   data/                   Default output root for recorded sessions
   README.md               Architecture and running procedure
+
+GLIM/                LiDAR-Inertial mapping (fork of koide3/glim)
+  config/                 sensor_dome.urdf + URDF generator
+  launch/                 hitch_sensor_dome.launch.py
+  docs/                   Multi-lap loop-closure debugging guide
+  glim/                   Upstream GLIM core (with project tuning)
+  glim_ext/               Upstream extensions (GNSS prior re-enabled)
+  glim_ros2/              Upstream ROS 2 wrapper (unmodified)
+  README.md               Fork notice, integration, multi-lap fix
 ```
 
 ## Quick Start
@@ -83,6 +94,30 @@ sudo python3 recording/sensor_recorder.py
 
 See [`recording/README.md`](recording/README.md) for the architecture diagram and running procedure.
 
+## Mapping (GLIM)
+
+For SLAM and 3D mapping the project ships an integrated fork of **GLIM** — *Graph-based LiDAR-Inertial Mapping* by Kenji Koide et al. (AIST), upstream at <https://github.com/koide3/glim>. The fork preserves the upstream `glim`, `glim_ext`, `glim_ros2` packages largely untouched and adds:
+
+- A URDF generator (`GLIM/config/generate_sensor_dome_urdf.py`) that turns `config/sensor_dome_tf.yaml` into the URDF GLIM uses for `T_lidar_imu` and multi-LiDAR stitching, so the same TF YAML is the single source of truth across recording, visualization, and mapping.
+- `base_frame_id = "imu_link"` so the global map is built body-relative to the Atlas Duo Center of Navigation. Per-vehicle integrators publish their own static `imu_link → base_link` transform downstream, keeping the map vehicle-agnostic and reusable.
+- A launch helper (`GLIM/launch/hitch_sensor_dome.launch.py`) that publishes the static TFs from `sensor_dome_tf.yaml`, starts `glim_rosnode` against the project's tuned configs, and spawns `foxglove_bridge` for live visualization.
+- A targeted multi-lap loop-closure fix that prevents the second-lap-tilts-to-the-sky failure mode (stronger GNSS z-prior, denser GNSS factors, wider VGICP convergence basin, looser implicit-loop thresholds). Documented in [`GLIM/docs/multi_lap_loop_closure.md`](GLIM/docs/multi_lap_loop_closure.md).
+
+```bash
+# (one-time) generate sensor_dome.urdf from sensor_dome_tf.yaml
+cd GLIM/config && python3 generate_sensor_dome_urdf.py
+
+# Live mapping against the recording stack:
+ros2 launch GLIM/launch/hitch_sensor_dome.launch.py
+
+# Or offline against a recorded MCAP bag:
+ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
+    --ros-args -p config_path:=GLIM/glim/config \
+                -p dump_path:=glim_maps/session_<ts>
+```
+
+See [`GLIM/README.md`](GLIM/README.md) for the full fork notice (upstream credits, license preservation, citation), the integration details, and the build instructions.
+
 ## Coordinate System (ROS REP 103)
 
 - **+X** = Forward, **+Y** = Left, **+Z** = Up
@@ -96,7 +131,7 @@ Please cite or credit this repository when reusing any of the mechanical design,
 
 > Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
 
-Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, Aravis, Foxglove, and MCAP communities whose open-source tooling this project builds on.
+Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, Aravis, Foxglove, and MCAP communities whose open-source tooling this project builds on. The mapping pipeline is built on **GLIM** by Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno (AIST) — see [`GLIM/README.md`](GLIM/README.md) for the full upstream attribution, license preservation, and citation.
 
 ## License
 

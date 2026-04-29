@@ -1,0 +1,85 @@
+{
+  /*** GlobalMapping ***
+  // --- General settings ---
+  // enable_imu                     : If true, create IMU preintegration factors
+  // enable_optimization            : If false, do not submap optimization (use only odom data)
+  // init_pose_damping_scale        : Damping scale for initial pose (to fix the gauge freedom)
+  //
+  // --- Relative pose factors ---
+  // create_between_factors         : If true, create relative pose factors between consecutive frames (i.e., odom_factor)
+  // between_registration_type      : Registration factor type for information matrix evaluation of relative pose factors ("NONE" / "GICP")
+  //
+  // --- Registration error factors ---
+  // registration_error_factor_type : Registration factor type for matching cost minimization ("VGICP" or "VGICP_GPU")
+  // randomsampling_rate            : Random sampling rate for registration error factors (1.0 = use all points)
+  // submap_voxel_resolution        : Base voxel resolution of submaps
+  // submp_voxelmap_levels          : Multi-resolution voxelmap levels (must be >= 1)
+  // submap_voxelmap_scaling_factor : Multi-resolution voxelmap scaling factor
+  // max_implicit_loop_distance     : Maximum distance between submaps for factor creation
+  // min_implicit_loop_overlap      : Overlap threshold for factor creation (smaller = more factors)
+  //
+  // --- Optimizer settings (see https://gtsam.org/doxygen/4.0.0/a03679.html) ---
+  // use_isam2_dogleg               : If true, use dogleg optimizer (robust but slow)
+  // isam2_relinearize_skip         : Relinearization is performed every $isam2_relinearize_skip optimization calls
+  // isam2_relinearize_thresh       : Relinearization is performed only when linear delta gets larger than this
+  */
+  "global_mapping": {
+    "so_name": "libglobal_mapping.so",
+    // General settings
+    "enable_imu": true,
+    "enable_optimization": true,
+    "init_pose_damping_scale": 1e10,
+    // Relative pose factors
+    "create_between_factors": false,
+    "between_registration_type": "GICP",
+    // Registration error factors.
+    // submap_voxel_resolution lowered 0.5 → 0.3 for tighter loop closure.
+    // The 0.5 value is fine for trajectory-following, but produces loose
+    // alignment when the same area is revisited (loop closure depends on
+    // submap-to-submap voxel overlap). Tighter base voxels here improve
+    // close-the-loop accuracy without the per-frame VGICP cost — global
+    // mapping runs at submap rate, not LiDAR rate.
+    // submap_voxel_resolution: base 0.3 m for tight loop-closure alignment.
+    // submap_voxel_resolution_max: raised 1.0 → 2.0 m. This is the
+    // multi-resolution VGICP ceiling. With a 2 m top-level voxel,
+    // submap-to-submap registration retains a usable convergence basin
+    // even when the initial pose estimate has drifted by ~1 m in z (the
+    // canonical multi-lap failure mode). The 0.3 m base voxel is still
+    // used at close range, so map fidelity is not sacrificed — only the
+    // top of the multi-resolution ladder grows.
+    "registration_error_factor_type": "VGICP_GPU",
+    "randomsampling_rate": 1.0,
+    "submap_voxel_resolution": 0.3,
+    "submap_voxel_resolution_max": 2.0,
+    "submap_voxel_resolution_dmin": 5.0,
+    "submap_voxel_resolution_dmax": 20.0,
+    "submap_voxelmap_levels": 2,
+    "submap_voxelmap_scaling_factor": 2.0,
+    // Implicit loop closure — widened for multi-lap trajectories.
+    //
+    // max_implicit_loop_distance raised 100 → 200 m. A factor between
+    // submap j and k is only created if the current pose estimate has
+    // them within this distance. On a race-track length scale where lap
+    // 2 may have drifted several metres before its first overlapping
+    // submap reaches the optimizer, 100 m was being exceeded in the
+    // estimated frame even when the submaps were *physically* at the
+    // same spot. 200 m comfortably covers a typical track lap.
+    //
+    // min_implicit_loop_overlap lowered 0.2 → 0.1. A loop-closure factor
+    // is only created if VGICP estimates that the two submaps share at
+    // least this fraction of voxel overlap. With residual z-drift, two
+    // submaps from the same physical location can overlap < 20 % even
+    // when they're metres apart in z; 10 % is permissive enough to fire
+    // the factor and let the optimizer pull them back into alignment.
+    //
+    // Both knobs trade off compute (more factor candidates) against
+    // robustness; the multi-lap scenario benefits from the looser
+    // thresholds because the GNSS prior backstop prevents false closures.
+    "max_implicit_loop_distance": 200.0,
+    "min_implicit_loop_overlap": 0.1,
+    // Optimizer settings
+    "use_isam2_dogleg": false,
+    "isam2_relinearize_skip": 1,
+    "isam2_relinearize_thresh": 0.1
+  }
+}
