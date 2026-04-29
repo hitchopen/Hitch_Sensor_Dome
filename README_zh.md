@@ -6,8 +6,18 @@
 
 - 3× Seyond Robin W LiDAR —— 单台 120° 水平视场，按 120° 间隔排布，实现 360° 环视
 - 1× Point One Nav Atlas Duo INS —— 居中安装，导航中心 (CoN) 与几何原点重合
-- 1× 测量级 GNSS 天线 —— 商用磁吸支架，置于 CoN 正上方
+- 1× **Point One SP1** 多频段 (L1/L2/L5) GNSS 天线 —— 安装在 ArduSimple 测量支架上，置于 CoN 正上方
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 摄像头 —— 前向立体对 (104 mm 基线) + 后向对称对
+
+> **GNSS 天线说明。** Atlas Duo 的 GNSS 端口为有源 LNA 提供 **3.3 V DC 偏置** (见 [Point One Atlas User Guide](https://pointonenav.com/wp-content/uploads/2024/06/Atlas-User-Guide.pdf))。[Point One SP1](https://store.pointonenav.com/products/sp1-high-precision-gnss-antenna) 出厂即与该电源匹配，是推荐默认选择。BOM 中所用 ArduSimple "Magnetic Stand for Survey GNSS Antenna" 采用 **5/8"-11 UNC** 螺纹（测量杆的标准接口），各候选天线与该支架的螺纹匹配情况如下表所示。
+>
+> | 天线 | 频段 | 与 ArduSimple 支架的螺纹匹配 |
+> |------|------|-------------------------------|
+> | [Point One SP1](https://store.pointonenav.com/products/sp1-high-precision-gnss-antenna) | L1 / L2 / L5 | **直接匹配。** SP1 套件出厂自带磁吸底座 + 75 mm 立柱，带 5/8"-11 UNC 螺纹。 |
+> | [Tallysman TW3972](https://www.tallysman.com/product/tw3972-triple-band-gnss-antenna-with-l-band/) | L1 / L2 / L5 + L-band | **需转接器。** 原生为穿孔 / 平底安装，需加一个 Calian / Tallysman [Pipe Mount Adapter PN 23-0065-0](https://www.calian.com/advanced-technologies/gnss_product/pipe-mount-adapter-screw-compression-pn-23-0065-0/)（或 PN 23-0040-0 L 形支架）以引出 5/8"-11 UNC 螺纹。 |
+> | [Harxon HX-CSX601A](https://en.harxon.com/product/detail/99) | GPS/GLONASS/Galileo/BeiDou 多频段 | **请以最新数据手册为准。** 测量级，TNC-F 接头。公开资料对其螺纹是 5/8"-11 UNC（测量行业标准）还是 5/8"-12 说法不一；下单前请核对 Harxon 当前发布的产品手册再决定。 |
+>
+> 接入前请核对每个候选天线的 LNA 电压 / 电流是否与 3.3 V 兼容；若该天线已由其它电源供电，需加一个 DC block 串联保护。**请勿**直接借用某些 LTE + GNSS 组合天线（如 Peplink 系列）的 GNSS 馈线 —— 即使是较高端的组合天线，在频段覆盖与噪声系数上也明显逊于 SP1，会显著降低 RTK 解算质量。
 
 ## 传感器布局
 

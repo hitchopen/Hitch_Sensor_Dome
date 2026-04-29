@@ -6,8 +6,18 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 
 - 3× Seyond Robin W LiDAR — 120° HFOV each, arranged at 120° intervals for full 360° surround coverage
 - 1× Point-One Nav Atlas Duo INS — center-mounted, CoN at geometric origin
-- 1× Survey-grade GNSS antenna — on commercial magnetic stand, centered above CoN
+- 1× **Point One SP1** multi-frequency (L1/L2/L5) GNSS antenna — on ArduSimple survey stand, centered above CoN
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 cameras — front stereo pair (104 mm baseline) + rear symmetric pair
+
+> **GNSS antenna note.** The Atlas Duo's GNSS port supplies **3.3 V DC bias** for a powered LNA (per the [Point One Atlas User Guide](https://pointonenav.com/wp-content/uploads/2024/06/Atlas-User-Guide.pdf)). The [Point One SP1](https://store.pointonenav.com/products/sp1-high-precision-gnss-antenna) ships voltage-matched to this rail and is the recommended default. The ArduSimple "Magnetic Stand for Survey GNSS Antenna" used in the BOM has a **5/8"-11 UNC** thread (the surveying-pole standard); thread compatibility of each candidate antenna is summarized below.
+>
+> | Antenna | Bands | Thread fit on the ArduSimple stand |
+> |---------|-------|-------------------------------------|
+> | [Point One SP1](https://store.pointonenav.com/products/sp1-high-precision-gnss-antenna) | L1 / L2 / L5 | **Drop-in.** SP1 kit ships with a magnetic mount + 75 mm riser carrying a 5/8"-11 UNC thread. |
+> | [Tallysman TW3972](https://www.tallysman.com/product/tw3972-triple-band-gnss-antenna-with-l-band/) | L1 / L2 / L5 + L-band | **Adapter required.** Native mount is through-hole / flat-bottom. Add a Calian / Tallysman [Pipe Mount Adapter PN 23-0065-0](https://www.calian.com/advanced-technologies/gnss_product/pipe-mount-adapter-screw-compression-pn-23-0065-0/) (or PN 23-0040-0 L-bracket) to expose a 5/8"-11 UNC thread. |
+> | [Harxon HX-CSX601A](https://en.harxon.com/product/detail/99) | GPS/GLONASS/Galileo/BeiDou multi-band | **Verify on current datasheet.** Survey-grade, TNC-F. Public sources are inconsistent on whether the thread is 5/8"-11 UNC (the surveying standard) or 5/8"-12; confirm with Harxon's brochure for the unit you actually order before committing. |
+>
+> Verify each candidate's LNA voltage / current spec against 3.3 V before connecting, and add a DC block if the antenna is already powered from another source. Do **not** repurpose the GNSS pigtail off a combo LTE + GNSS antenna (Peplink, etc.) — even the better combo antennas are a meaningful regression from the SP1 in band coverage and noise figure, and the resulting RTK fix quality drops accordingly.
 
 ## Sensor Layout
 
