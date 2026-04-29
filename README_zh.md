@@ -127,6 +127,8 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 
 本项目由 **Dr. Allen Y. Yang** (Hitch Interactive · 加州大学伯克利分校) 设计并维护。
 
+实现测试与现场验证由 **Berkeley AI Racing Tech** 团队完成：来自 UC Berkeley（按姓氏字母顺序）—— Bryan Chang、Logan Kinajil-Moran、Moises Lopez Mendoza、Gary Passon、Tanishaa Viral Shah、Joshua Sun、Jovan Yap；来自 UC San Diego —— Kevin Shin。
+
 如在衍生工作中复用本仓库的机械设计、ROS 2 TF 配置、PTP 同步流水线，或采集 / 可视化工具，请引用：
 
 > Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
