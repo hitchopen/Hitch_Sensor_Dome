@@ -67,7 +67,7 @@ recording/           Run-time data recording + Foxglove dashboard
   data/                   Default output root for recorded sessions
   README.md               Architecture and running procedure
 
-GLIM/                LiDAR-Inertial mapping (fork of koide3/glim)
+GLIM_plusplus/                LiDAR-Inertial mapping (fork of koide3/glim)
   config/                 sensor_dome.urdf + URDF generator
   launch/                 hitch_sensor_dome.launch.py
   docs/                   Multi-lap loop-closure debugging guide
@@ -104,29 +104,45 @@ sudo python3 recording/sensor_recorder.py
 
 See [`recording/README.md`](recording/README.md) for the architecture diagram and running procedure.
 
-## Mapping (GLIM)
+## Mapping (GLIM++)
 
-For SLAM and 3D mapping the project ships an integrated fork of **GLIM** — *Graph-based LiDAR-Inertial Mapping* by Kenji Koide et al. (AIST), upstream at <https://github.com/koide3/glim>. The fork preserves the upstream `glim`, `glim_ext`, `glim_ros2` packages largely untouched and adds:
+For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of **GLIM** — *Graph-based LiDAR-Inertial Mapping* by Kenji Koide et al. (AIST), upstream at <https://github.com/koide3/glim>. The fork lives at [`GLIM_plusplus/`](GLIM_plusplus/) (the double-plus signals it is *not* stock GLIM). At a high level, GLIM++ differs from upstream in seven categories:
 
-- A URDF generator (`GLIM/config/generate_sensor_dome_urdf.py`) that turns `config/sensor_dome_tf.yaml` into the URDF GLIM uses for `T_lidar_imu` and multi-LiDAR stitching, so the same TF YAML is the single source of truth across recording, visualization, and mapping.
-- `base_frame_id = "imu_link"` so the global map is built body-relative to the Atlas Duo Center of Navigation. Per-vehicle integrators publish their own static `imu_link → base_link` transform downstream, keeping the map vehicle-agnostic and reusable.
-- A launch helper (`GLIM/launch/hitch_sensor_dome.launch.py`) that publishes the static TFs from `sensor_dome_tf.yaml`, starts `glim_rosnode` against the project's tuned configs, and spawns `foxglove_bridge` for live visualization.
-- A targeted multi-lap loop-closure fix that prevents the second-lap-tilts-to-the-sky failure mode (stronger GNSS z-prior, denser GNSS factors, wider VGICP convergence basin, looser implicit-loop thresholds). Documented in [`GLIM/docs/multi_lap_loop_closure.md`](GLIM/docs/multi_lap_loop_closure.md).
+1. **Sensor adaptation** — topics, frames, and field names switched from the previous AV-24 / Luminar deployment to the Hitch Sensor Dome (3× Robin W + Atlas Duo + 4× RouteCAM).
+2. **Vehicle-agnostic body frame** — `base_frame_id = imu_link`, so maps anchor to the Atlas Duo Center of Navigation and are portable across vehicles.
+3. **Outdoor / vehicle-scale tuning** — 24 parameter changes (loosened IMU noise, larger voxels, longer init window, sub-mapping density) calibrated for highway / track / vehicle motion.
+4. **Multi-lap loop-closure fix** — wider VGICP convergence basin, looser implicit-loop thresholds, and a stronger GNSS z-prior to prevent the canonical second-lap-tilts-to-the-sky failure mode.
+5. **Initialization rewrite (C++)** — gravity-from-accelerometer is removed; the optimizer now requires an external INS pose to start. Allows recordings that begin in motion (mid-session restarts, race-track replays, bag trims).
+6. **RTK-fixed gating for the initial pose** — three-stage gate on NavSatFix status, covariance, and multi-sample stability, with a bold-RED CLI warning if the gate is not met within the timeout.
+7. **RTK-gated GNSS factor bridge** — soft GNSS prior factors are added to the global graph throughout the session, but only when RTK is fixed. Suspends silently in tunnels and resumes on re-fix.
+
+A URDF generator and a `ros2 launch` helper round out the integration. See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the full file-by-file change log, upstream credits, license preservation, citation, and build instructions.
+
+> ### ⚠ Operational requirement — RTK-fixed GNSS to start a session
+>
+> **GLIM++ uses the Atlas Duo's RTK-fixed GNSS pose and velocity as the ground truth for initialization.** This replaces the upstream "stationary IMU calibration" requirement with a much sharper one: **a mapping session cannot begin until the Atlas Duo reports an RTK-fixed solution with centimetre-grade covariance.** GLIM++ enforces this in C++ via a three-stage gate (status, covariance, multi-sample stability) and prints a periodic bold-RED warning while waiting. It will not auto-abort — but it will not start collecting map factors either, until the gate passes.
+>
+> What this means in the field:
+>
+> - **Plan for RTK convergence.** Park with clear sky view and wait for RTK-fixed lock before launching GLIM++. Outdoor convergence is typically 30–120 s; longer in marginal conditions. Verify in the Atlas Duo web UI before starting.
+> - **NTRIP corrections must be flowing.** The Atlas Duo's Ethernet path to the cellular router (see [`PTP_sync/README.md`](PTP_sync/README.md) §3.1) must reach an NTRIP caster. RTK-fixed without NTRIP is not achievable.
+> - **Tunnels and urban canyons during the session are fine** — the per-message RTK gate suspends factor publishing during outages and resumes on re-fix. The session is *not* re-started; only the *initial* pose requires RTK-fixed.
+> - **Without RTK** (no base station, no NTRIP) — the gate can be relaxed via `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5`, accepting RTK-float or SBAS for init. The map is still useful but the world-frame anchor is loose at the metre scale rather than the centimetre scale. See [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) §"Operating without RTK".
 
 ```bash
 # (one-time) generate sensor_dome.urdf from sensor_dome_tf.yaml
-cd GLIM/config && python3 generate_sensor_dome_urdf.py
+cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 
 # Live mapping against the recording stack:
-ros2 launch GLIM/launch/hitch_sensor_dome.launch.py
+#   1. Park with clear sky and wait for Atlas Duo RTK-fixed lock.
+#   2. Launch:
+ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# Or offline against a recorded MCAP bag:
+# Or offline against a recorded MCAP bag (the bag must include /pose + /gps/fix):
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
-    --ros-args -p config_path:=GLIM/glim/config \
+    --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
 ```
-
-See [`GLIM/README.md`](GLIM/README.md) for the full fork notice (upstream credits, license preservation, citation), the integration details, and the build instructions.
 
 ## Coordinate System (ROS REP 103)
 
@@ -143,7 +159,7 @@ Please cite or credit this repository when reusing any of the mechanical design,
 
 > Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
 
-Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, Aravis, Foxglove, and MCAP communities whose open-source tooling this project builds on. The mapping pipeline is built on **GLIM** by Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno (AIST) — see [`GLIM/README.md`](GLIM/README.md) for the full upstream attribution, license preservation, and citation.
+Thanks to the OpenSCAD, ROS 2, linuxptp, chrony, Aravis, Foxglove, and MCAP communities whose open-source tooling this project builds on. The mapping pipeline is built on **GLIM** by Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno (AIST) — see [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the full upstream attribution, license preservation, and citation.
 
 ## License
 

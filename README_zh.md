@@ -67,7 +67,7 @@ recording/           运行期数据采集 + Foxglove 仪表盘
   data/                   会话录制的默认输出根目录
   README.md               架构和运行流程
 
-GLIM/                LiDAR-Inertial 建图 (koide3/glim 的 fork)
+GLIM_plusplus/                LiDAR-Inertial 建图 (koide3/glim 的 fork)
   config/                 sensor_dome.urdf + URDF 生成器
   launch/                 hitch_sensor_dome.launch.py
   docs/                   多圈回环调试指南
@@ -104,29 +104,45 @@ sudo python3 recording/sensor_recorder.py
 
 架构图与运行流程详见 [`recording/README.md`](recording/README.md)。
 
-## 建图 (GLIM)
+## 建图 (GLIM++)
 
-针对 SLAM 与 3D 建图，本项目集成了 **GLIM** 的 fork —— 由 AIST 的 Kenji Koide 等人开发的 *Graph-based LiDAR-Inertial Mapping*，上游仓库见 <https://github.com/koide3/glim>。本 fork 几乎完整保留了上游的 `glim`、`glim_ext`、`glim_ros2` 三个包，并在此基础上增加：
+针对 SLAM 与 3D 建图，本项目搭载 **GLIM++**，一个对 **GLIM** 做了深度修改的 fork —— 上游 *Graph-based LiDAR-Inertial Mapping* 由 AIST 的 Kenji Koide 等人开发，仓库地址 <https://github.com/koide3/glim>。本 fork 位于 [`GLIM_plusplus/`](GLIM_plusplus/)（双加号意在提示这并非原版 GLIM）。在高层视角下，GLIM++ 与上游的差异分为七个类别：
 
-- URDF 生成器 (`GLIM/config/generate_sensor_dome_urdf.py`)，把 `config/sensor_dome_tf.yaml` 转成 GLIM 用于 `T_lidar_imu` 与多 LiDAR 拼接的 URDF —— 使同一份 TF YAML 成为采集、可视化、建图三者共享的单一信息源。
-- `base_frame_id = "imu_link"`，使全局地图相对于 Atlas Duo 导航中心 (CoN) 在传感器主体坐标系中构建。下游车辆集成商再发布自己的 `imu_link → base_link` 静态变换 —— 这样地图就和具体载具解耦，可在不同车辆平台间复用。
-- 启动助手 (`GLIM/launch/hitch_sensor_dome.launch.py`)，从 `sensor_dome_tf.yaml` 发布静态 TF、用项目调好的配置启动 `glim_rosnode`，并起 `foxglove_bridge` 做实时可视化。
-- 针对多圈回环失败模式的修复 —— 防止"第二圈轨迹翘向天空"的现象 (更强的 GNSS z 先验、更密的 GNSS 因子、更宽的 VGICP 收敛域、更宽松的隐式回环阈值)。详见 [`GLIM/docs/multi_lap_loop_closure.md`](GLIM/docs/multi_lap_loop_closure.md)。
+1. **传感器适配** —— 把 topic、frame、字段名从此前的 AV-24 / Luminar 部署切换到 Hitch Sensor Dome（3× Robin W + Atlas Duo + 4× RouteCAM）。
+2. **车辆无关主体坐标系** —— `base_frame_id = imu_link`，地图围绕 Atlas Duo 导航中心建立，可跨车辆平台复用。
+3. **户外 / 车辆尺度调参** —— 24 项参数变更（放宽 IMU 噪声、增大 voxel、加长初始化窗口、提高 sub-mapping 密度），针对高速公路 / 赛道 / 车辆机动场景。
+4. **多圈回环修复** —— 拓宽 VGICP 收敛域、放宽隐式回环阈值、提升 GNSS z 先验权重，防止经典的"第二圈轨迹翘向天空"现象。
+5. **C++ 重写初始化** —— 移除"由加速度计估计重力"路径；优化器现在必须由外部 INS 位姿启动。这使得从运动状态开始的录制（中途重启、赛道重放、被截过的 bag）也能正常使用。
+6. **初始位姿的 RTK-fixed 准入门控** —— 三阶段门控（NavSatFix 状态、协方差、多采样稳定性），未通过时打印粗体红色 CLI 警告。
+7. **RTK 门控的 GNSS 因子桥** —— 整段会话期间向全局图持续注入 GNSS 软先验因子，但仅在 RTK 锁定时段；隧道期间静默暂停，重新锁定后自动恢复。
+
+URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更日志、上游致谢、license 保留、引用方式与编译说明请见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md)。
+
+> ### ⚠ 运行要求 —— 启动会话前必须有 RTK-fixed 的 GNSS
+>
+> **GLIM++ 把 Atlas Duo 的 RTK-fixed GNSS 位姿与速度作为初始化的 ground truth。** 它取代了上游"开机段 IMU 静止"的要求，换成一个更明确的硬性条件：**没有 Atlas Duo 报告 RTK-fixed 状态、协方差达到厘米级，就无法开启建图会话。** GLIM++ 在 C++ 中通过三阶段门控（状态、协方差、多采样稳定性）强制执行，等待期间会周期性打印粗体红色警告。它不会自动 abort —— 但门控未通过时也不会开始构造任何地图因子。
+>
+> 实战意义：
+>
+> - **预留 RTK 收敛时间。** 启动 GLIM++ 之前，把车停在天空开阔的位置等 RTK 锁定。室外典型收敛时间为 30–120 秒；条件较差时更久。启动前务必在 Atlas Duo 的 web UI 中确认。
+> - **NTRIP 校正必须畅通。** Atlas Duo 经蜂窝路由器接通 NTRIP caster 的链路（见 [`PTP_sync/README.md`](PTP_sync/README.md) §3.1）必须工作；否则无法达到 RTK-fixed。
+> - **会话进行中遇到隧道 / 城市峡谷不影响。** 后续每条消息的 RTK 门控只在失锁时段静默暂停因子发布，重新锁定后自动恢复，**不会重启会话** —— RTK 硬性要求只针对*初始位姿*。
+> - **完全没有 RTK** 的场景（既没有基站也没有 NTRIP），可通过 `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5` 放宽门控，允许 RTK-float / SBAS 初始化。地图依然可用，但世界坐标系锚点的精度从厘米级退化到米级。详见 [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) "Operating without RTK"一节。
 
 ```bash
 # (一次性) 从 sensor_dome_tf.yaml 生成 sensor_dome.urdf
-cd GLIM/config && python3 generate_sensor_dome_urdf.py
+cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 
 # 对接采集栈做实时建图：
-ros2 launch GLIM/launch/hitch_sensor_dome.launch.py
+#   1. 把车停在天空开阔的位置等 Atlas Duo RTK-fixed 锁定。
+#   2. 启动：
+ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# 或对已采集的 MCAP 包做离线建图：
+# 或对已采集的 MCAP 包做离线建图（bag 中必须包含 /pose 与 /gps/fix）：
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
-    --ros-args -p config_path:=GLIM/glim/config \
+    --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
 ```
-
-完整的 fork 声明（上游致谢、许可证保留、引用方式）、集成细节、编译说明请参考 [`GLIM/README.md`](GLIM/README.md)。
 
 ## 坐标系 (ROS REP 103)
 
@@ -143,7 +159,7 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 
 > Yang, A. Y. *Hitch Sensor Dome: a 3D-printable modular multi-sensor mount for vehicle-roof mapping.* GitHub repository, 2026.
 
-感谢 OpenSCAD、ROS 2、linuxptp、chrony、Aravis、Foxglove、MCAP 等社区，本项目基于这些开源工具搭建。建图管线建立在 **GLIM** 之上，作者为 AIST 的 Kenji Koide、Masashi Yokozuka、Shuji Oishi、Atsuhiko Banno —— 完整的上游致谢、许可证保留与引用方式见 [`GLIM/README.md`](GLIM/README.md)。
+感谢 OpenSCAD、ROS 2、linuxptp、chrony、Aravis、Foxglove、MCAP 等社区，本项目基于这些开源工具搭建。建图管线建立在 **GLIM** 之上，作者为 AIST 的 Kenji Koide、Masashi Yokozuka、Shuji Oishi、Atsuhiko Banno —— 完整的上游致谢、许可证保留与引用方式见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md)。
 
 ## License
 

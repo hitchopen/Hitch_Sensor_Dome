@@ -1,0 +1,66 @@
+{
+  // GNSS-aided global mapping for Hitch Sensor Dome.
+  //
+  // libgnss_global.so consumes pose-style messages and adds soft GNSS
+  // prior factors to GLIM's global graph. Upstream the module only
+  // dispatches on two message types:
+  //   - "nav_msgs/msg/Odometry"
+  //   - "geometry_msgs/msg/PoseWithCovarianceStamped"  (default branch)
+  //
+  // It does NOT understand sensor_msgs/msg/NavSatFix natively, so
+  // pointing it directly at /gps/fix silently drops every message. To
+  // close that gap (and to add per-message RTK-fixed gating, which the
+  // upstream module also lacks), the Hitch fork's glim_ros2 wrapper
+  // runs a small RTK-gated bridge:
+  //
+  //     /pose          (Atlas Duo INS, PoseStamped) ─┐
+  //     /gps/fix       (NavSatFix, gate signal)      │
+  //                                                  ▼
+  //                           GlimROS::try_publish_gnss_factor
+  //                           - require RTK-fixed (configurable)
+  //                           - require pos σ ≤ threshold
+  //                                                  │
+  //                                                  ▼
+  //                           /gnss/pose_rtk_only (PoseWithCovarianceStamped)
+  //                                                  │
+  //                                                  ▼
+  //                           libgnss_global.so subscribes here
+  //
+  // During RTK-fixed periods, every accepted /pose becomes a factor.
+  // During RTK-float / no-fix / tunnel periods, the bridge silently
+  // suspends — gnss_global gets no input and emits no factors,
+  // and the optimizer's LiDAR cost carries the trajectory through the
+  // gap. When RTK locks again, factors resume on the next /pose.
+  //
+  // gnss_topic / gnss_msg_type
+  //   /gnss/pose_rtk_only is the bridge's output, set to match the
+  //   gnss_factor_topic in config_ros.json. If you run an alternative
+  //   provider that publishes nav_msgs/Odometry directly, point at it
+  //   here and disable the bridge with gnss_factor_topic="" in
+  //   config_ros.json.
+  //
+  // min_baseline
+  //   Minimum motion (m) before a new GNSS factor is added by the
+  //   gnss_global module. The bridge already publishes at the source's
+  //   /pose rate (10 Hz Atlas Duo), so this just deduplicates within
+  //   gnss_global. 0.5 m is a sensible lap-mapping default; lower to
+  //   0.25 m for very fast vehicles.
+  //
+  // prior_inf_scale
+  //   Information matrix diagonal (x, y, z) for the GNSS prior factor.
+  //   The z component is 5× larger than horizontal because the
+  //   canonical multi-lap failure mode is z-drift; Atlas Duo + RTK
+  //   delivers ~1 cm vertical, so giving GNSS extra authority on z is
+  //   justified. Drop z back to 1e4 if you relax the bridge gate to
+  //   accept RTK-float (i.e., set gnss_factor_require_rtk_fixed=false).
+  "gnss": {
+    "gnss_topic": "/gnss/pose_rtk_only",
+    "gnss_msg_type": "geometry_msgs/msg/PoseWithCovarianceStamped",
+    "min_baseline": 0.5,
+    "prior_inf_scale": [
+      1e4,
+      1e4,
+      5e4
+    ]
+  }
+}

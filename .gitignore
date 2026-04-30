@@ -18,11 +18,11 @@ __pycache__/
 *.pyc
 
 # GLIM build artifacts (do not commit compiled output)
-GLIM/build/
-GLIM/install/
-GLIM/log/
-# Defensive: catch any accidental nested copy of glim/ inside GLIM/config/.
-GLIM/config/glim/
+GLIM_plusplus/build/
+GLIM_plusplus/install/
+GLIM_plusplus/log/
+# Defensive: catch any accidental nested copy of glim/ inside GLIM_plusplus/config/.
+GLIM_plusplus/config/glim/
 
 # GLIM map output (large; produced per session)
 glim_maps/
