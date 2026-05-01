@@ -451,6 +451,168 @@ def handle_sync_outcome(all_ok: bool, mode: str) -> bool:
 
 
 # ---------------------------------------------------------------------
+# RTK-fix pre-flight verification
+# ---------------------------------------------------------------------
+#
+# GLIM++ requires the Atlas Duo to report RTK-fixed GNSS + cm-grade
+# covariance to start a mapping session (see GLIM_plusplus/README.md §6).
+# If the recording starts before RTK has converged, the captured bag
+# either fails to init at replay time or inits part-way through (losing
+# the early portion of the trajectory).
+#
+# This pre-flight check briefly subscribes to /gps/fix and verifies that
+# every sample in the capture window passes the same gate the GLIM++
+# C++ wrapper uses. It mirrors the SyncVerifier pattern: a Result
+# dataclass, a show_*_report function, a handle_*_outcome function that
+# implements the prompt / hard / log modes.
+
+@dataclass
+class RtkResult:
+    name: str
+    ok: bool
+    detail: str
+    samples: int = 0
+    fix_status: Optional[int] = None
+    pos_stddev: Optional[float] = None
+    threshold: Optional[float] = None
+
+
+_FIX_NAMES = {
+    -1: "NO_FIX",
+    0:  "FIX (single-point)",
+    1:  "SBAS_FIX",
+    2:  "GBAS_FIX (RTK-class)",
+}
+
+
+class RtkVerifier:
+    """Subscribe briefly to /gps/fix and verify RTK-fixed quality.
+
+    Reuses rclpy. If rclpy isn't importable (no ROS environment sourced),
+    we degrade to "skipped" rather than aborting — the user can still
+    record without ROS-side gating, accepting the operational risk.
+    """
+
+    def __init__(self, cfg: Dict[str, Any]):
+        rcfg = cfg.get("rtk", {})
+        self.topic = rcfg.get("gnss_topic", "/gps/fix")
+        self.window_s = float(rcfg.get("capture_window_s", 3.0))
+        self.max_stddev = float(rcfg.get("max_position_stddev", 0.10))
+        self.require_rtk_fixed = bool(rcfg.get("require_rtk_fixed", True))
+
+    def check(self) -> RtkResult:
+        try:
+            import rclpy
+            from rclpy.qos import (QoSProfile, ReliabilityPolicy,
+                                   HistoryPolicy)
+            from sensor_msgs.msg import NavSatFix
+        except ImportError as ex:
+            return RtkResult("rtk_fix", False,
+                             f"rclpy/sensor_msgs not available: {ex} "
+                             "(skipped — source ROS 2 first)")
+
+        # Statuses to compare against (avoids importing NavSatStatus const).
+        STATUS_GBAS_FIX = 2
+
+        rclpy.init()
+        node = rclpy.create_node("rtk_preflight_check")
+        samples: list = []
+
+        def on_fix(msg):
+            cov = msg.position_covariance
+            sx, sy, sz = (max(0.0, cov[0]) ** 0.5,
+                          max(0.0, cov[4]) ** 0.5,
+                          max(0.0, cov[8]) ** 0.5)
+            samples.append((msg.status.status, max(sx, sy, sz),
+                            msg.latitude, msg.longitude, msg.altitude))
+
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=10)
+        node.create_subscription(NavSatFix, self.topic, on_fix, qos)
+        end = time.monotonic() + self.window_s
+        while time.monotonic() < end and rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+        node.destroy_node()
+        rclpy.shutdown()
+
+        if not samples:
+            return RtkResult(
+                "rtk_fix", False,
+                f"no NavSatFix on {self.topic} during {self.window_s:.1f} s "
+                "(driver not running, no antenna lock, or wrong topic?)")
+
+        # Worst sample drives the verdict.
+        worst_status = min(s[0] for s in samples)
+        worst_stddev = max(s[1] for s in samples)
+        last_lat = samples[-1][2]
+        last_lon = samples[-1][3]
+        last_alt = samples[-1][4]
+
+        status_ok = (not self.require_rtk_fixed) or (worst_status >= STATUS_GBAS_FIX)
+        cov_ok = worst_stddev <= self.max_stddev
+        ok = status_ok and cov_ok
+
+        detail = (
+            f"{len(samples)} samples, worst status={_FIX_NAMES.get(worst_status,'?')}, "
+            f"worst σ={worst_stddev:.3f} m (threshold {self.max_stddev:.2f} m); "
+            f"last fix=({last_lat:.6f}, {last_lon:.6f}, {last_alt:.2f})"
+        )
+        return RtkResult("rtk_fix", ok, detail,
+                         samples=len(samples), fix_status=worst_status,
+                         pos_stddev=worst_stddev, threshold=self.max_stddev)
+
+
+def show_rtk_report(result: RtkResult) -> bool:
+    banner("RTK-fix verification")
+    tag = color("[ok]  ", "green") if result.ok else color("[FAIL]", "red")
+    print(f"  {tag}  {result.name:14s}  {result.detail}")
+    return result.ok
+
+
+def handle_rtk_outcome(ok: bool, mode: str) -> bool:
+    """Return True to proceed, False to abort.
+
+    Modes mirror SyncVerifier:
+      - "prompt": warn and ask y/N
+      - "hard"  : refuse to start
+      - "log"   : note in metadata and continue
+    """
+    if ok:
+        info("RTK-fix check passed — Atlas Duo reports RTK-fixed with "
+             "cm-grade covariance.")
+        return True
+    if mode == "hard":
+        err("RTK not at fixed quality — aborting (mode=hard).")
+        return False
+    if mode == "log":
+        warn("RTK not at fixed quality — continuing (mode=log).")
+        return True
+    # mode == "prompt"
+    bar = "=" * 78
+    print(color(bar, "red"))
+    print(color("  ⚠  RTK NOT YET FIXED — GLIM++ will not be able to init", "red"))
+    print(color(bar, "red"))
+    print()
+    print("  GLIM++ requires Atlas Duo RTK-fixed status with cm-grade")
+    print("  covariance to start a mapping session. If you record now, the")
+    print("  bag will need either:")
+    print("    - To run long enough that RTK locks mid-bag (early data lost)")
+    print("    - Or to be replayed with the GLIM++ gate relaxed:")
+    print("        ros2 launch ... ins_require_rtk_fixed:=false")
+    print()
+    print("  Common remediations before recording:")
+    print("    1. Park with clear sky view; wait 30–120 s for RTK convergence.")
+    print("    2. Verify NTRIP corrections are flowing (Atlas Duo web UI).")
+    print("    3. Check the GNSS antenna cable and SP1 connector.")
+    print()
+    try:
+        ans = input("Proceed with recording anyway? [y/N] ").strip().lower()
+    except EOFError:
+        ans = ""
+    return ans in ("y", "yes")
+
+
+# ---------------------------------------------------------------------
 # Subprocess management
 # ---------------------------------------------------------------------
 
@@ -719,6 +881,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Auto-confirm sensor checklist")
     p.add_argument("--sync-mode", choices=["prompt", "hard", "log"],
                    help="Override sync.mode")
+    p.add_argument("--rtk-mode", choices=["prompt", "hard", "log"],
+                   help="Override rtk.mode (RTK-fix pre-flight check). "
+                        "GLIM++ requires RTK-fixed at session start; "
+                        "default 'prompt' warns and asks y/N.")
+    p.add_argument("--skip-rtk-check", action="store_true",
+                   help="Equivalent to --rtk-mode log: record regardless of "
+                        "RTK status (Atlas Duo cold-start, indoor smoke "
+                        "tests, etc.). The captured bag may not satisfy "
+                        "GLIM++'s init gate at replay time.")
     p.add_argument("--dry-run", action="store_true",
                    help="Detect + sync-check only, do not record")
     return p.parse_args(argv)
@@ -741,8 +912,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.setdefault("foxglove", {})["enabled"] = False
     if args.sync_mode:
         cfg.setdefault("sync", {})["mode"] = args.sync_mode
+    if args.rtk_mode:
+        cfg.setdefault("rtk", {})["mode"] = args.rtk_mode
+    if args.skip_rtk_check:
+        cfg.setdefault("rtk", {})["mode"] = "log"
     if args.headless:
         cfg.setdefault("sync", {})["mode"] = "log"
+        cfg.setdefault("rtk",  {}).setdefault("mode", "log")
 
     iface = cfg.get("network", {}).get("interface", "eth0")
     banner(f"Hitch Sensor Dome recorder  —  iface={iface}")
@@ -769,6 +945,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not handle_sync_outcome(all_ok, mode):
         err("Aborted by operator.")
         return 1
+
+    # 2a) RTK-fix pre-flight (only if Atlas Duo is enabled).
+    rtk_result: Optional[RtkResult] = None
+    if any(s.kind == "gnss_imu" and s.enabled for s in sensors):
+        step("Verifying RTK-fixed GNSS for GLIM++ initialization")
+        rtk_verifier = RtkVerifier(cfg)
+        rtk_result = rtk_verifier.check()
+        rtk_ok = show_rtk_report(rtk_result)
+        rtk_mode = cfg.get("rtk", {}).get("mode", "prompt")
+        if not handle_rtk_outcome(rtk_ok, rtk_mode):
+            err("Aborted by operator (RTK not fixed).")
+            return 1
+    else:
+        info("No Atlas Duo selected — skipping RTK-fix pre-flight.")
 
     if args.dry_run:
         info("--dry-run: stopping before recording.")

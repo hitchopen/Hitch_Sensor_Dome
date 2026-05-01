@@ -95,6 +95,39 @@ sync:
   camera_offset_ns: 10000      # 10 µs (GigE Vision typically 1–10 µs)
 
 # -------------------------------------------------------------
+# RTK-fix pre-flight check (matches GLIM++'s init gate)
+# -------------------------------------------------------------
+# GLIM++ requires the Atlas Duo to report RTK-fixed status with cm-grade
+# covariance to start a mapping session — see GLIM_plusplus/README.md §6.
+# This pre-flight subscribes to gnss_topic for capture_window_s and
+# verifies every NavSatFix sample passes the same gate the GLIM++ C++
+# wrapper uses, so an operator catches a not-yet-locked Atlas Duo before
+# committing to a long recording.
+rtk:
+  # Behavior when the gate fails:
+  #   "prompt" — bold-RED warning + y/N prompt (default)
+  #   "hard"   — refuse to start
+  #   "log"    — record anyway, note in metadata
+  mode: "prompt"
+
+  # NavSatFix topic to inspect — same as GLIM++'s ins_fix_topic.
+  gnss_topic: "/gps/fix"
+
+  # If true, require status >= STATUS_GBAS_FIX (RTK-class). Set to false
+  # for setups without a base station (RTK-float / SBAS will be accepted).
+  require_rtk_fixed: true
+
+  # Maximum allowed σ on the NavSatFix position covariance (m). Default
+  # matches GLIM++'s default ins_max_position_stddev — RTK-fixed reliably
+  # hits 1–5 cm, so 0.10 m is a comfortable threshold.
+  max_position_stddev: 0.10
+
+  # Subscribe for this many seconds before deciding. Long enough to catch
+  # a transient float-quality sample mid-window; short enough that a
+  # locked rig isn't held up.
+  capture_window_s: 3.0
+
+# -------------------------------------------------------------
 # Recording options
 # -------------------------------------------------------------
 recording:
