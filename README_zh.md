@@ -19,6 +19,19 @@
 >
 > 接入前请核对每个候选天线的 LNA 电压 / 电流是否与 3.3 V 兼容；若该天线已由其它电源供电，需加一个 DC block 串联保护。**请勿**直接借用某些 LTE + GNSS 组合天线（如 Peplink 系列）的 GNSS 馈线 —— 即使是较高端的组合天线，在频段覆盖与噪声系数上也明显逊于 SP1，会显著降低 RTK 解算质量。
 
+> ### ⭐ 双 GNSS 天线 —— 强烈推荐
+>
+> 在已知偏置位置加装第二根 SP1 类多频段 GNSS 天线，可以把 RTK-fixed 状态升级为**无漂移航向参考**（精度通常 0.1°–1°，取决于基线长度）。如果只装一根天线，车辆航向就只能从 IMU 陀螺仪积分得来，会随时间漂移 —— 这正是 GLIM++ 不得不去补偿的多圈 z-drift / yaw-drift 失败模式。
+>
+> **在本项目中启用双天线的步骤：**
+>
+> 1. 把第二根 SP1（或同级多频段天线）安装到与主天线已知相对位置的位置上。**车辆顶置安装推荐基线为 1.0–1.5 m**；最低 0.5 m 才能获得可用精度。
+> 2. 接入 Atlas Duo 的副 GNSS RF 输入（用天线分配器或 Atlas Duo 单元自带的副端口，如果有的话）。在 Atlas Duo Web UI 中开启双天线航向模式。
+> 3. **编辑 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)**，把默认的 `gnss_antenna_secondary_link` 平移 `(0, 0, 0)` 替换为副天线相对 `imu_link` 的实际坐标（米）。`(0, 0, 0)` 是显式禁用双天线模式的哨兵值 —— 任何实际安装都会有非零偏置。
+> 4. 重新生成 URDF：`cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`。脚本会打印 `GNSS antenna mode: DUAL` 以及基线长度和预期的 RTK-fixed 航向 σ。
+>
+> **若只装单根天线作为回退：** 保留 `gnss_antenna_secondary_link` 的默认 `(0, 0, 0)` 即可。GLIM++ 启动时识别该哨兵值并自动切换到单天线模式 —— 系统仍然可用，主天线一根就足以为 GLIM++ 的初始位姿和整段会话的 GNSS 因子流提供 RTK 位置。唯一损失的是双天线带来的航向收益（初始化门控保持单天线默认值，yaw 漂移仍然由 IMU 主导）。两种模式下的具体差异参见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) 中的对比表。
+
 ## 传感器布局
 
 下方示意图（由 v17c SCAD 模型生成）以 ROS REP 103 车体坐标系（+X 前、+Y 左、+Z 上）标注每个传感器相对于 Atlas Duo 导航中心 (原点) 的位置。

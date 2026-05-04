@@ -247,6 +247,37 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ins_min_quat_dot_            = config_ros.param<double>("glim_ros", "ins_min_quat_dot",            0.999);
   ins_init_timeout_s_          = config_ros.param<double>("glim_ros", "ins_init_timeout_s",          60.0);
 
+  // Dual-antenna RTK heading mode — auto-detected from
+  // sensor_dome_tf.yaml by the launch file and forwarded as ROS params.
+  // When enabled we tighten the init gate (orientation locks faster
+  // and more precisely with dual-antenna heading). The session-long
+  // factor bridge stamps the corresponding orientation covariance on
+  // every published message — see try_publish_gnss_factor below.
+  dual_antenna_enabled_       = config_ros.param<bool>(  "glim_ros", "dual_antenna_enabled",            false);
+  dual_antenna_baseline_m_    = config_ros.param<double>("glim_ros", "dual_antenna_baseline_m",         0.0);
+  dual_antenna_heading_sigma_rad_ =
+                                 config_ros.param<double>("glim_ros", "dual_antenna_heading_sigma_rad", 0.0);
+  if (dual_antenna_enabled_) {
+    // Tighter stability + shorter timeout — RTK-fixed dual-antenna
+    // heading converges within a few /pose samples, so we don't need
+    // the conservative single-antenna defaults.
+    ins_min_quat_dot_ = std::max(ins_min_quat_dot_, 0.9999);     // ≈ 0.8° vs 2.5°
+    ins_min_pose_window_samples_ = std::min(ins_min_pose_window_samples_, 5);
+    ins_init_timeout_s_ = std::min(ins_init_timeout_s_, 30.0);
+    spdlog::info(
+      "Hitch fork: DUAL-antenna mode — baseline={:.3f} m, expected "
+      "heading σ={:.3f} rad ({:.2f}°). Init gates auto-tightened: "
+      "min_quat_dot={:.4f}, window={} samples, timeout={:.0f} s.",
+      dual_antenna_baseline_m_, dual_antenna_heading_sigma_rad_,
+      dual_antenna_heading_sigma_rad_ * 180.0 / 3.14159265358979,
+      ins_min_quat_dot_, ins_min_pose_window_samples_, ins_init_timeout_s_);
+  } else {
+    spdlog::info(
+      "Hitch fork: SINGLE-antenna mode — heading derived from IMU "
+      "(drift-prone). Set the secondary antenna translation in "
+      "config/sensor_dome_tf.yaml to enable dual-antenna heading.");
+  }
+
   rclcpp::QoS ins_qos(20);
   ins_qos.reliable();
 
@@ -709,10 +740,22 @@ void GlimROS::try_publish_gnss_factor(
 
   // Prefer the upstream pose_cov (when Odometry was the source); fall
   // back to NavSatFix's position_covariance in the upper-left 3×3 block
-  // when the upstream had no covariance (PoseStamped). Either way the
-  // covariance is mostly informational — gnss_global ignores it (per
-  // its own header comment), but downstream tools / Foxglove / RViz2
-  // will read it for display.
+  // when the upstream had no covariance (PoseStamped).
+  //
+  // Position covariance: gnss_global ignores it (per its own header
+  // comment), but downstream tools / Foxglove / RViz2 will read it for
+  // display, and a future heading-aware ext module would.
+  //
+  // Orientation covariance: ALWAYS populated when dual_antenna_enabled.
+  // The bottom-right 3×3 of the 6×6 covariance matrix is rpy. We give:
+  //   - roll  : 1.0 rad²  (pose-stamped has no info; loose)
+  //   - pitch : 1.0 rad²  (same; pitch comes from IMU not GNSS)
+  //   - yaw   : (heading_sigma_rad)²   (TIGHT — RTK-derived heading)
+  // This data path is what an upcoming heading-constraint ext module
+  // would consume to inject yaw factors into the global graph and
+  // counteract IMU yaw drift over the session. Even without that
+  // module, the covariance is correct in the published message and
+  // visible to anything that reads PoseWithCovarianceStamped.
   bool any_cov = false;
   for (double v : pose_cov) if (v != 0.0) { any_cov = true; break; }
   if (any_cov) {
@@ -722,6 +765,14 @@ void GlimROS::try_publish_gnss_factor(
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j)
         out.pose.covariance[i * 6 + j] = last_fix_->position_covariance[i * 3 + j];
+  }
+  if (dual_antenna_enabled_ && dual_antenna_heading_sigma_rad_ > 0.0) {
+    // Indices in a 6×6 row-major covariance: [3,3]=roll, [4,4]=pitch,
+    // [5,5]=yaw — i.e., 3*6+3=21, 4*6+4=28, 5*6+5=35.
+    out.pose.covariance[21] = 1.0;   // roll  σ² ≈ 1 rad² (loose)
+    out.pose.covariance[28] = 1.0;   // pitch σ² ≈ 1 rad² (loose)
+    out.pose.covariance[35] =
+      dual_antenna_heading_sigma_rad_ * dual_antenna_heading_sigma_rad_;
   }
 
   gnss_pose_pub_->publish(out);

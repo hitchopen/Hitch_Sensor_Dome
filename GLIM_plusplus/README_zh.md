@@ -36,6 +36,24 @@
 
 涉及文件：`glim/config/config_sensors.json`、`glim/config/config_ros.json`。
 
+### 1.1 单天线 vs 双天线模式
+
+Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位置加装第二根天线即可启用无漂移 RTK 航向）。模式由 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 自动检测：副天线平移默认为哨兵值 `(0, 0, 0)`（单天线模式），任何非零平移（范数 ≥ 0.05 m）都会让 GLIM++ 在启动时切换到双天线模式。启用双天线的完整步骤参见项目 [根 README](../README.md#-双-gnss-天线--强烈推荐)；GLIM++ 在两种模式间的算法差异汇总如下。
+
+| 维度 | 单天线 | 双天线 |
+|--------|----------------|--------------|
+| **航向来源** | IMU 陀螺仪积分（随 bias 漂移） | RTK-fixed 双天线基线（无漂移，约 0.1°–1°，取决于基线长度） |
+| **Init 门控 `ins_min_quat_dot`** | `0.999`（相邻样本约 2.5°） | 自动收紧到 `0.9999`（约 0.8°） |
+| **Init 门控 `ins_min_pose_window_samples`** | `10` 条连续一致样本 | 自动缩短到 `5`（航向锁定更快） |
+| **Init 门控 `ins_init_timeout_s`** | `60 s` | 自动缩短到 `30 s` |
+| **Factor-bridge 朝向协方差** | 不填充（PoseStamped 的朝向信息不可用） | 由基线长度推导出的紧 yaw σ，松 pitch/roll —— 见 §7 |
+| **会话期航向漂移** | 随 IMU bias 累积；只能靠 LiDAR 扫描匹配抑制 | 在整段会话中由 RTK 航向约束（数据通路已就绪；见 `docs/moving_start_initialization.md` "Future work — session-long heading-constraint factor"一节） |
+| **长 / 多圈轨迹下的地图质量** | yaw 稳定性依赖 LiDAR 特征丰富度；只要 RTK 位置 fixed，z 锚点仍可靠 | 初始化时朝向精度更高，并为后续会话期航向修正预留了清晰数据路径 |
+| **硬件需求** | 一根 SP1（或同级天线） | 两根天线，固定偏置（推荐基线 1.0–1.5 m） |
+| **启动时操作员看到的日志** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
+
+模式切换**完全自动** —— 没有独立的"双天线"启动参数。GLIM++ 启动时读取 TF YAML、计算副天线平移范数、自行选择。如要从双天线回退到单天线（例如现场副天线失效），把 `sensor_dome_tf.yaml` 里副天线平移清零即可，其它部分照常工作 —— 主天线一根就足以为 GLIM++ 的初始化门控（§6）和因子桥（§7）提供 RTK 位置。
+
 ## 2. 车辆无关主体坐标系
 
 [`glim/config/config_ros.json`](glim/config/config_ros.json) 中：

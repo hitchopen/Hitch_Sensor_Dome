@@ -36,6 +36,24 @@ Topic, frame, and field names throughout the configs are switched from the previ
 
 Files touched: `glim/config/config_sensors.json`, `glim/config/config_ros.json`.
 
+### 1.1 Single-antenna vs dual-antenna mode
+
+The Hitch Sensor Dome supports either one or two GNSS antennas (a second antenna at a known offset enables drift-free RTK heading). The mode is auto-detected from [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml): the secondary antenna's translation defaults to the sentinel `(0, 0, 0)` (single-antenna), and any non-zero translation (norm ≥ 0.05 m) flips GLIM++ into dual-antenna mode at launch time. The full root-README walkthrough for enabling dual-antenna is in the project's [main README](../README.md#-dual-gnss-antenna--strongly-recommended); the algorithmic differences GLIM++ makes between the two modes are summarized below.
+
+| Aspect | Single-antenna | Dual-antenna |
+|--------|----------------|--------------|
+| **Heading source** | IMU gyroscope integration (drifts with bias over time) | RTK-fixed dual-antenna baseline (drift-free, ≈ 0.1°–1° depending on baseline) |
+| **Init gate `ins_min_quat_dot`** | `0.999` (≈ 2.5° between consecutive samples) | auto-tightened to `0.9999` (≈ 0.8°) |
+| **Init gate `ins_min_pose_window_samples`** | `10` consecutive consistent samples | auto-shortened to `5` (orientation locks faster) |
+| **Init gate `ins_init_timeout_s`** | `60 s` | auto-shortened to `30 s` |
+| **Factor-bridge orientation covariance** | not populated (no usable orientation info from single antenna's PoseStamped) | tight yaw σ derived from baseline length, loose pitch/roll — see §7 |
+| **Session-long heading drift** | accumulates with IMU bias; mitigated only by LiDAR scan matching | bounded by RTK heading available throughout the session (data path in place; see "future work" note in `docs/moving_start_initialization.md` §"Future work — session-long heading-constraint factor") |
+| **Map quality on long / multi-lap trajectories** | depends on LiDAR feature richness for yaw stability; ground-truth z-anchor still good if RTK position is fixed | better orientation accuracy at init, with a clean data path for further session-long heading correction |
+| **Hardware needed** | one SP1 (or compatible) | two antennas at fixed offset (1.0–1.5 m baseline recommended) |
+| **Operator UX at launch** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
+
+The mode switch is **fully automatic** — there is no separate "dual-antenna" launch arg. GLIM++ reads the TF YAML at startup, computes the secondary translation norm, and chooses. To revert from dual to single (e.g., the second antenna failed in the field), edit `sensor_dome_tf.yaml` and zero out the secondary translation; everything else continues to work because the primary antenna alone provides RTK position, which is what GLIM++'s init gate (§6) and factor bridge (§7) actually require.
+
 ## 2. Vehicle-agnostic body frame
 
 In [`glim/config/config_ros.json`](glim/config/config_ros.json):

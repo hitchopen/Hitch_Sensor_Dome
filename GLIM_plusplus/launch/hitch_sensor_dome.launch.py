@@ -117,14 +117,68 @@ def _maybe_pre_flight(context, *args, **kwargs):
     return []
 
 
+def _detect_dual_antenna(tf_yaml_path: str) -> tuple:
+    """Read sensor_dome_tf.yaml and decide whether dual-antenna heading
+    is configured. Returns (enabled: bool, baseline_m: float).
+
+    Sentinel: the secondary antenna's translation is (0, 0, 0) by default
+    in the YAML; any norm >= DUAL_BASELINE_THRESH (5 cm) is treated as a
+    real installation."""
+    DUAL_BASELINE_THRESH = 0.05  # m
+    try:
+        with open(tf_yaml_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        primary = next(
+            (tf for tf in cfg.get("static_transforms", [])
+             if tf["child_frame_id"] == "gnss_antenna_primary_link"), None)
+        secondary = next(
+            (tf for tf in cfg.get("static_transforms", [])
+             if tf["child_frame_id"] == "gnss_antenna_secondary_link"), None)
+        if primary is None or secondary is None:
+            return (False, 0.0)
+        st = secondary["translation"]
+        sec_norm = (st["x"] ** 2 + st["y"] ** 2 + st["z"] ** 2) ** 0.5
+        if sec_norm < DUAL_BASELINE_THRESH:
+            return (False, 0.0)
+        pt = primary["translation"]
+        bv = (st["x"] - pt["x"], st["y"] - pt["y"], st["z"] - pt["z"])
+        bl = (sum(c * c for c in bv)) ** 0.5
+        return (True, bl)
+    except Exception as ex:
+        sys.stderr.write(
+            f"[launch] dual-antenna detection failed: {ex} — defaulting to single-antenna mode\n")
+        return (False, 0.0)
+
+
 def _build_glim_node(context, *args, **kwargs):
-    """Spawn glim_rosnode with the INS topic + RTK-gate parameters.
+    """Spawn glim_rosnode with the INS topic + RTK-gate parameters,
+    plus dual-antenna detection results.
 
     The C++ wrapper subscribes to ins_pose_topic / ins_odom_topic and
     consults ins_fix_topic (NavSatFix) as the RTK gate. Only after the
     gate passes (RTK fix + cm-grade covariance + N consecutive stable
-    poses) does it call set_init_state and unblock the optimizer."""
+    poses) does it call set_init_state and unblock the optimizer.
+
+    When dual_antenna_enabled is true, the wrapper auto-tightens the
+    init-gate stability threshold and shortens the timeout (orientation
+    converges much faster with RTK-fixed dual-antenna heading)."""
     cfg = lambda name: LaunchConfiguration(name).perform(context)
+    tf_yaml = cfg("tf_yaml")
+    dual_enabled, baseline = _detect_dual_antenna(tf_yaml)
+
+    if dual_enabled:
+        sys.stderr.write(
+            f"[launch] dual-antenna mode ENABLED (baseline = {baseline:.3f} m). "
+            f"GLIM++ init gates will auto-tighten.\n")
+        # Heading σ ≈ 1 cm RTK noise / baseline, in radians.
+        # We expose this so the C++ side can use it for the orientation
+        # covariance it stamps on the factor-bridge messages.
+        heading_sigma_rad = 0.01 / max(baseline, 0.05)
+    else:
+        sys.stderr.write(
+            "[launch] single-antenna mode (no dual-antenna baseline configured)\n")
+        heading_sigma_rad = 0.0
+
     return [
         Node(
             package="glim_ros",
@@ -148,6 +202,10 @@ def _build_glim_node(context, *args, **kwargs):
                 "gnss_factor_topic":               cfg("gnss_factor_topic"),
                 "gnss_factor_require_rtk_fixed":   cfg("gnss_factor_require_rtk_fixed").lower() == "true",
                 "gnss_factor_max_position_stddev": float(cfg("gnss_factor_max_position_stddev")),
+                # Dual-antenna mode (auto-detected from sensor_dome_tf.yaml)
+                "dual_antenna_enabled":            dual_enabled,
+                "dual_antenna_baseline_m":         baseline,
+                "dual_antenna_heading_sigma_rad":  heading_sigma_rad,
             }],
         )
     ]

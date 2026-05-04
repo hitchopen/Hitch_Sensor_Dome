@@ -44,4 +44,16 @@
     <child link="cam_rear_right_link"/>
     <origin xyz="-0.097533 -0.064933 0.153500" rpy="0.000000 -0.000000 -2.094394"/>
   </joint>
+  <link name="gnss_antenna_primary_link"/>
+  <joint name="imu_to_gnss_antenna_primary_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="gnss_antenna_primary_link"/>
+    <origin xyz="0.000000 0.000000 0.300000" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="gnss_antenna_secondary_link"/>
+  <joint name="imu_to_gnss_antenna_secondary_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="gnss_antenna_secondary_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
 </robot>

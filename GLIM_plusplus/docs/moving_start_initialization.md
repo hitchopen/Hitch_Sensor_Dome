@@ -129,6 +129,72 @@ A periodic log line every 10 s reports `N published, M rejected` so the operator
 
 This is the *only* GNSS-aware mechanism in GLIM that runs throughout the session. All other GLIM extensions (gravity_estimator, flat_earther, deskewing, imu_validator, imu_prediction, velocity_suppressor, orb_slam) consume IMU and/or LiDAR only — they have no built-in GNSS dependency, and consequently no RTK gating to consider.
 
+## Dual-antenna RTK heading (optional, automatic)
+
+The Hitch Sensor Dome supports a second GNSS antenna for dual-antenna RTK heading. With two RTK-fixed antennas, the Atlas Duo computes vehicle heading from the baseline vector between them — typically **0.1°–1°** accurate depending on baseline length, drift-free as long as RTK stays locked. This replaces the IMU-derived heading that drifts with gyroscope bias.
+
+### How GLIM++ detects dual-antenna mode
+
+Configuration lives in [`../../config/sensor_dome_tf.yaml`](../../config/sensor_dome_tf.yaml). Two new entries:
+
+```yaml
+- frame_id: "imu_link"
+  child_frame_id: "gnss_antenna_primary_link"
+  translation: { x: 0.0, y: 0.0, z: 0.300 }     # SP1 above the magnetic stand
+  rotation:    { x: 0, y: 0, z: 0, w: 1 }
+
+- frame_id: "imu_link"
+  child_frame_id: "gnss_antenna_secondary_link"
+  translation: { x: 0.0, y: 0.0, z: 0.0 }       # ← ZERO = single-antenna mode
+  rotation:    { x: 0, y: 0, z: 0, w: 1 }
+```
+
+The secondary antenna's translation is the sentinel. Defaults to `(0, 0, 0)`, which means *single-antenna* (the dual-antenna code paths stay disabled). Any actual installation will have the second antenna at a non-origin location — fill in the real coordinates (in metres, in the `imu_link` frame) to enable.
+
+Detection happens in two places:
+
+1. **`GLIM_plusplus/config/generate_sensor_dome_urdf.py`** — prints the mode (SINGLE or DUAL with baseline) when you regenerate the URDF.
+2. **`GLIM_plusplus/launch/hitch_sensor_dome.launch.py::_detect_dual_antenna`** — reads the YAML at launch time and forwards `dual_antenna_enabled`, `dual_antenna_baseline_m`, and `dual_antenna_heading_sigma_rad` as ROS parameters to `glim_rosnode`.
+
+### What changes when dual-antenna is enabled
+
+| Aspect | Single-antenna mode | Dual-antenna mode |
+|--------|---------------------|-------------------|
+| Init gate `ins_min_quat_dot` | `0.999` (≈ 2.5°) | auto-tightened to `0.9999` (≈ 0.8°) |
+| Init gate `ins_min_pose_window_samples` | `10` | auto-shortened to `5` (heading converges faster) |
+| Init gate `ins_init_timeout_s` | `60` s | auto-shortened to `30` s |
+| Factor-bridge orientation σ | not populated | `roll/pitch = 1 rad²` (loose), `yaw = (heading_sigma_rad)²` (tight, derived from baseline length) |
+| Heading source after init | IMU integration (drifts) | dual-antenna RTK (drift-free) — *currently surfaced via covariance only; see below* |
+
+The auto-tightened gates plus drift-free heading at init mean **the SLAM map starts with a more accurate world-frame orientation**, which compounds across multi-lap sessions: sub-degree heading at init translates to less yaw error in submap registration, fewer false loop closures, tighter z-anchor.
+
+### What the operator sees
+
+```
+[launch] dual-antenna mode ENABLED (baseline = 1.000 m). GLIM++ init gates will auto-tighten.
+[glim] Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°).
+       Init gates auto-tightened: min_quat_dot=0.9999, window=5 samples, timeout=30 s.
+[glim] Hitch fork: INS init pose ACCEPTED — fix=GBAS_FIX (RTK-class), pos σ=0.018 m, ...
+```
+
+Or, in single-antenna mode:
+
+```
+[launch] single-antenna mode (no dual-antenna baseline configured)
+[glim] Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).
+       Set the secondary antenna translation in config/sensor_dome_tf.yaml
+       to enable dual-antenna heading.
+```
+
+### Future work — session-long heading-constraint factor
+
+The factor bridge already stamps the right orientation covariance on every published `PoseWithCovarianceStamped`. The upstream `gnss_global` module ignores covariance entirely (per its own header comment) and only uses position, so the orientation information is currently wasted at the optimizer level. To actually use it for session-long heading correction would require either:
+
+- **Patching `gnss_global`** to add an orientation-with-covariance factor when the input has tight yaw σ. Invasive in the upstream module.
+- **A new ext module** (e.g., `libgnss_heading.so`) that subscribes to `/gnss/pose_rtk_only`, extracts yaw + yaw-σ, and adds a yaw-only `PriorFactor<Rot3>` (or a between-factor) to the global graph. Cleanly separated from upstream, opt-in via `extension_modules` in `config_ros.json`.
+
+The data path for either approach is already in place. The covariance is correctly populated, the topic is published, and downstream consumers can take it from there. We chose to land the data path in this round and defer the factor module to a future iteration so adopters can prototype against it.
+
 ## Operating without RTK
 
 If your setup has no RTK base station, you have two reasonable choices:

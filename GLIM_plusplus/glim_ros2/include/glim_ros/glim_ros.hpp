@@ -149,6 +149,19 @@ private:
   std::atomic<int> gnss_factors_published_{0};
   std::atomic<int> gnss_factors_rejected_{0};
   rclcpp::TimerBase::SharedPtr gnss_factor_log_timer_;
+
+  // Dual-antenna RTK heading (auto-detected from sensor_dome_tf.yaml at
+  // launch time, passed in as ROS parameters). When enabled, the
+  // wrapper:
+  //   1. tightens the init gate thresholds — orientation locks faster
+  //      and more precisely with dual-antenna heading;
+  //   2. populates the orientation covariance on every factor-bridge
+  //      message with a tight yaw σ derived from baseline length, so
+  //      any downstream heading-aware factor module can use the
+  //      RTK-derived heading directly to correct IMU yaw drift.
+  bool dual_antenna_enabled_ = false;
+  double dual_antenna_baseline_m_ = 0.0;
+  double dual_antenna_heading_sigma_rad_ = 0.0;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

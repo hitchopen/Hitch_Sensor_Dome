@@ -19,6 +19,19 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 >
 > Verify each candidate's LNA voltage / current spec against 3.3 V before connecting, and add a DC block if the antenna is already powered from another source. Do **not** repurpose the GNSS pigtail off a combo LTE + GNSS antenna (Peplink, etc.) — even the better combo antennas are a meaningful regression from the SP1 in band coverage and noise figure, and the resulting RTK fix quality drops accordingly.
 
+> ### ⭐ Dual GNSS antenna — strongly recommended
+>
+> A second SP1-class GNSS antenna mounted at a known offset from the first turns RTK-fixed into a **drift-free heading reference** (typically 0.1°–1° accurate, depending on baseline length). Without it, vehicle heading is integrated from the IMU gyroscope and drifts over time — the canonical multi-lap z-drift / yaw-drift failure modes that GLIM++ has to compensate for.
+>
+> **To enable dual-antenna in this project:**
+>
+> 1. Mount a second SP1 (or compatible multi-band antenna) at a fixed offset from the primary. **Recommended baseline 1.0–1.5 m** for vehicle-roof installations; minimum 0.5 m for usable accuracy.
+> 2. Wire it into the Atlas Duo's secondary GNSS RF input (with an antenna splitter or the second port if your Atlas Duo unit exposes it). Configure the Atlas Duo's web UI for dual-antenna heading mode.
+> 3. **Edit [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)** and replace the default `gnss_antenna_secondary_link` translation `(0, 0, 0)` with the actual second-antenna position in the `imu_link` frame, in metres. The translation `(0, 0, 0)` is a sentinel that explicitly disables dual-antenna mode — any real installation will have a non-zero offset.
+> 4. Regenerate the URDF: `cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`. The script prints `GNSS antenna mode: DUAL` along with the baseline length and the expected RTK-fixed heading σ.
+>
+> **Fallback if you have only one antenna:** leave `gnss_antenna_secondary_link` at its default `(0, 0, 0)`. GLIM++ detects the sentinel at launch time and runs in single-antenna mode — the system still works, the primary antenna alone provides RTK position for both GLIM++'s init pose and the session-long GNSS factor stream. The only loss is the dual-antenna heading benefit (init gates stay at single-antenna defaults and yaw drift remains an IMU concern). See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the side-by-side comparison of what changes between the two modes.
+
 ## Sensor Layout
 
 The diagrams below (generated from the v17c SCAD model) label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).

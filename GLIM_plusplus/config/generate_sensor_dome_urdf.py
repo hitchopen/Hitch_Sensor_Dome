@@ -154,6 +154,48 @@ def main() -> int:
     OUT_URDF.write_text(xml_str + "\n")
     print(f"Wrote {OUT_URDF}")
     print(f"  imu_link → {len(transforms)} child frames")
+
+    # Dual-antenna detection summary — informational. The GLIM++ wrapper
+    # does the same check at startup and auto-enables the dual-antenna
+    # code paths when the secondary translation norm exceeds the
+    # threshold (also DUAL_BASELINE_THRESH = 0.05 m).
+    DUAL_BASELINE_THRESH = 0.05  # m
+    primary = next(
+        (tf for tf in transforms
+         if tf["child_frame_id"] == "gnss_antenna_primary_link"),
+        None)
+    secondary = next(
+        (tf for tf in transforms
+         if tf["child_frame_id"] == "gnss_antenna_secondary_link"),
+        None)
+    if primary is not None and secondary is not None:
+        # Sentinel: secondary translation = (0, 0, 0) means "not
+        # configured". Any actual installation will have the second
+        # antenna at a non-origin location in the imu_link frame.
+        st = secondary["translation"]
+        sec_norm = (st["x"] ** 2 + st["y"] ** 2 + st["z"] ** 2) ** 0.5
+        if sec_norm < DUAL_BASELINE_THRESH:
+            print(f"  GNSS antenna mode: SINGLE  "
+                  f"(secondary translation norm {sec_norm:.3f} m "
+                  f"< {DUAL_BASELINE_THRESH:.2f} m threshold)")
+            print("  ⇒ GLIM++ will run in single-antenna mode. To enable "
+                  "dual-antenna heading, edit config/sensor_dome_tf.yaml "
+                  "and set the gnss_antenna_secondary_link translation.")
+        else:
+            # Baseline vector from primary to secondary, in imu_link frame.
+            pt = primary["translation"]
+            bv = (st["x"] - pt["x"], st["y"] - pt["y"], st["z"] - pt["z"])
+            bl = (sum(c * c for c in bv)) ** 0.5
+            heading_sigma_rad = 0.01 / max(bl, 0.05)   # 1 cm RTK / baseline
+            heading_sigma_deg = heading_sigma_rad * 180.0 / 3.141592653589793
+            print(f"  GNSS antenna mode: DUAL    "
+                  f"(baseline = {bl:.3f} m, "
+                  f"vec = ({bv[0]:+.3f}, {bv[1]:+.3f}, {bv[2]:+.3f}) m)")
+            print(f"  ⇒ GLIM++ will enable dual-antenna code paths. "
+                  f"Expected heading σ ≈ {heading_sigma_deg:.2f}° "
+                  "(at RTK-fixed, 1 cm position σ).")
+    elif primary is not None:
+        print("  GNSS antenna mode: PARTIAL — primary present, secondary missing.")
     return 0
 
 
