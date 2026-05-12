@@ -13,10 +13,11 @@ This document is a **complete change log** between GLIM++ and the upstream `koid
 5. [Initialization rewrite — INS-driven, gravity-from-accelerometer removed](#5-initialization-rewrite)
 6. [RTK-fixed gating for the initial pose](#6-rtk-fixed-gating-for-the-initial-pose)
 7. [RTK-gated GNSS factor bridge (post-init)](#7-rtk-gated-gnss-factor-bridge)
-8. [Project integration — URDF generator, launch helper, diagnostics](#8-project-integration)
-9. [Documentation added](#9-documentation-added)
-10. [What was NOT changed](#10-what-was-not-changed)
-11. [File-by-file diff summary](#11-file-by-file-diff-summary)
+8. [Optional GNSS yaw prior — dual-antenna only](#8-optional-gnss-yaw-prior)
+9. [Project integration — URDF generator, launch helper, diagnostics](#9-project-integration)
+10. [Documentation added](#10-documentation-added)
+11. [What was NOT changed](#11-what-was-not-changed)
+12. [File-by-file diff summary](#12-file-by-file-diff-summary)
 
 ## 1. Sensor adaptation for Hitch Sensor Dome
 
@@ -196,7 +197,35 @@ A periodic 10-second log line reports `N published, M rejected` so the operator 
 
 Files touched: [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp), [`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json), [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py).
 
-## 8. Project integration
+## 8. Optional GNSS yaw prior
+
+Upstream `gnss_global` adds **translation-only** prior factors (`PoseTranslationPrior`) — the GNSS quaternion is ignored even when the source publishes one. This is correct for single-antenna setups (where the quaternion is gyro-integrated and drifts) but throws away real information from dual-antenna RTK heading.
+
+GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp) so the module can also emit a `PoseRotationPrior` factor on each submap, pulling its yaw toward the heading carried in the incoming `PoseWithCovarianceStamped` / `Odometry` quaternion. The change is opt-in via two new JSON keys; default is **ON** because the Hitch Sensor Dome ships as a dual-antenna RTK platform.
+
+| Config key (`glim_ext/config/config_gnss_global.json`) | Default | Meaning |
+|---|---|---|
+| `enable_orientation_prior` | `true` | Emit a `PoseRotationPrior` factor each submap when the interpolated GNSS sample carries a valid quaternion. |
+| `orientation_prior_inf_scale` | `[1e-6, 1e-6, 1e2]` | Information matrix diagonal in `(roll, pitch, yaw)`. Only yaw is meaningfully constrained; roll/pitch get a tiny ε to keep the noise model strictly positive-definite. |
+
+**Algorithmic changes inside the module.**
+
+- The internal sample type changes from `Eigen::Vector4d (stamp, x, y, z)` to a `GNSSData` struct adding `orientation` (`Eigen::Quaterniond`) + `has_orientation` flag.
+- `gnss_callback` (both PoseWithCovarianceStamped and Odometry overloads) extracts the quaternion in addition to the position.
+- `push_gnss_data` validates the quaternion (norm in `[1e-3, 1.5]` → catches zero quaternions, NaNs, severely denormalized data) and normalizes before storing.
+- Submap-stamp association uses `Quaterniond::slerp` to interpolate orientation between bracketing samples. The SLERP only runs when **both** bracketing samples are valid; half-valid pairs produce a position-only association for that submap.
+- When `enable_orientation_prior && latest.has_orientation`, after the existing translation prior, the module composes `R_world_imu = R_world_utm · R_utm_imu` and inserts `gtsam::PoseRotationPrior<gtsam::Pose3>` with the configured information matrix.
+- `T_world_utm` is still initialized from position alone (SVD of the planar centered covariance) — orientation does not help us solve for the unknown UTM-to-world rotation; we use it only after the alignment is locked.
+
+**Dual-antenna gating end-to-end.** The factor is harmless on a single antenna only if the operator turns it off, because the wrapper's RTK-gated bridge happily forwards whatever quaternion the INS publishes. The Hitch Sensor Dome therefore enforces dual-antenna intent at three independent points (see `README.md` "Three-layered defense"): the Atlas firmware (operator setup), the launch-time consistency check (mismatch between `sensor_dome_tf.yaml` and `enable_orientation_prior`), and the runtime yaw-σ sanity check inside `try_publish_gnss_factor`. The third one is the only check that can catch a misconfigured Atlas firmware.
+
+**Relationship to augcog's patch.** augcog's `ucb-roar/GLIM` ships a similar `enable_orientation_prior` patch but defaults it OFF and pairs it with `urdf_gnss_frame` lever-arm compensation. GLIM++ adopts the orientation-prior half of augcog's design (defaulting ON because dual-antenna is our standard hardware) and intentionally **does not** adopt the lever-arm half — the Atlas Duo is a tightly-coupled GNSS+INS that publishes `/pose` at the IMU origin, so adding a second lever-arm correction would double-compensate. See [`docs/comparison_vs_augcog.md`](docs/comparison_vs_augcog.md) §3 for the full comparison.
+
+**Behavior on RTK loss.** Same as §7: the wrapper bridge drops samples that fail the RTK gate, so the orientation prior never sees them and never fires during outages. There is no fallback to IMU-derived yaw — when RTK heading isn't available, yaw stays under LiDAR scan-matching control, which is correct (substituting drifting INS yaw for missing GNSS yaw would defeat the purpose of the factor).
+
+Files touched: [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp), [`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json), [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) (runtime sanity check), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) (member fields), [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py) (launch-time consistency check).
+
+## 9. Project integration
 
 Three new top-level folders inside `GLIM_plusplus/` that hold integration-only code (no upstream GLIM source touched here):
 
@@ -206,14 +235,15 @@ Three new top-level folders inside `GLIM_plusplus/` that hold integration-only c
 | [`launch/`](launch/) | `hitch_sensor_dome.launch.py` — publishes static TFs from `sensor_dome_tf.yaml`, starts `glim_rosnode` against the project's tuned configs, spawns `foxglove_bridge` for visualization, runs the pre-flight stationarity check. |
 | [`scripts/`](scripts/) | `check_init_stationarity.py` — pre-flight diagnostic; reads first 3 s of `/imu/data` and prints a bold-RED warning if the bag is non-stationary. Now informational only (the C++ INS-init pathway handles moving starts), but useful for diagnosing slow Atlas Duo lock and for CI gating. |
 
-## 9. Documentation added
+## 10. Documentation added
 
 Inside [`docs/`](docs/):
 
 - [`moving_start_initialization.md`](docs/moving_start_initialization.md) — full design of §5 + §6 + §7. Covers the data flow, the RTK gate semantics, sample warning output, sample success output, and how to operate without RTK.
 - [`multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md) — root-cause analysis of the chicken-and-egg between odometry initialization and VGICP convergence basin, the three-layer fix, post-run verification checks (GNSS factor count, pose-graph edges, `T_world_utm.txt` stability, trajectory altitude vs GNSS altitude), and a five-step escalation if the default fix isn't sufficient.
+- [`comparison_vs_augcog.md`](docs/comparison_vs_augcog.md) — algorithm-level diff against the [`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus/tree/ucb-roar/GLIM) `ucb-roar` branch's GLIM fork. Establishes what each fork addresses that the other does not (notably: GLIM++ has the C++ init rewrite + RTK gating + orientation prior end-to-end pipeline; augcog has lever-arm compensation, which GLIM++ correctly omits given the tightly-coupled Atlas Duo).
 
-## 10. What was NOT changed
+## 11. What was NOT changed
 
 Important — so adopters know what stayed identical to upstream and can rely on existing GLIM literature:
 
@@ -228,7 +258,7 @@ Important — so adopters know what stayed identical to upstream and can rely on
 - License texts — every upstream LICENSE / NOTICE preserved verbatim.
 - Sub-package READMEs (`glim/README.md`, `glim_ext/README.md`, `glim_ros2/README.md`) — unchanged. They document the upstream packages on their own terms and modifying them would muddy the upstream provenance.
 
-## 11. File-by-file diff summary
+## 12. File-by-file diff summary
 
 | File | Status | Change category |
 |------|--------|-----------------|

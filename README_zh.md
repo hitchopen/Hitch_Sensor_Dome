@@ -23,14 +23,31 @@
 >
 > 在已知偏置位置加装第二根 SP1 类多频段 GNSS 天线，可以把 RTK-fixed 状态升级为**无漂移航向参考**（精度通常 0.1°–1°，取决于基线长度）。如果只装一根天线，车辆航向就只能从 IMU 陀螺仪积分得来，会随时间漂移 —— 这正是 GLIM++ 不得不去补偿的多圈 z-drift / yaw-drift 失败模式。
 >
+> > **⚠ 重要 —— 3D 参考设计中仅包含一根 GNSS 天线支架。** [`3D files/`](3D%20files/) 中的 SCAD 模型与 [`3D files/README.md`](3D%20files/README.md) 中的 BOM 只覆盖一根位于 Atlas Duo 导航中心正上方的磁吸式测量支架。**副天线支架的几何形状是部署级别的设计**，因为最佳基线取决于车辆 —— 轿车顶、赛车壳、测量车驾驶室所适合的安装位置各不相同。每个真实部署都应另外加装一根副天线 —— 本项目 3D 文件只是起点，不是最终的机械方案。副天线必须刚性固定（金属底板或 3D 打印延伸件螺接到穹顶上，**不要**用胶带或磁吸临时固定），否则行驶过程中基线会形变；测量 `imu_link → gnss_antenna_secondary_link` 偏置到厘米级精度，按下文步骤填入 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)。
+>
 > **在本项目中启用双天线的步骤：**
 >
 > 1. 把第二根 SP1（或同级多频段天线）安装到与主天线已知相对位置的位置上。**车辆顶置安装推荐基线为 1.0–1.5 m**；最低 0.5 m 才能获得可用精度。
 > 2. 接入 Atlas Duo 的副 GNSS RF 输入（用天线分配器或 Atlas Duo 单元自带的副端口，如果有的话）。在 Atlas Duo Web UI 中开启双天线航向模式。
-> 3. **编辑 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)**，把默认的 `gnss_antenna_secondary_link` 平移 `(0, 0, 0)` 替换为副天线相对 `imu_link` 的实际坐标（米）。`(0, 0, 0)` 是显式禁用双天线模式的哨兵值 —— 任何实际安装都会有非零偏置。
-> 4. 重新生成 URDF：`cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`。脚本会打印 `GNSS antenna mode: DUAL` 以及基线长度和预期的 RTK-fixed 航向 σ。
+> 3. **编辑 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)**，记录副天线的实际安装位置。对应字段如下：
 >
-> **若只装单根天线作为回退：** 保留 `gnss_antenna_secondary_link` 的默认 `(0, 0, 0)` 即可。GLIM++ 启动时识别该哨兵值并自动切换到单天线模式 —— 系统仍然可用，主天线一根就足以为 GLIM++ 的初始位姿和整段会话的 GNSS 因子流提供 RTK 位置。唯一损失的是双天线带来的航向收益（初始化门控保持单天线默认值，yaw 漂移仍然由 IMU 主导）。两种模式下的具体差异参见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) 中的对比表。
+>    ```yaml
+>    # 摘自 config/sensor_dome_tf.yaml —— 副天线条目。
+>    # 把平移 (0, 0, 0) 替换为从 imu_link（Atlas Duo CoN）到副天线相位中心
+>    # 的实测偏置，单位米。旋转保持单位四元数 —— 基线只是平移。
+>    - frame_id: imu_link
+>      child_frame_id: gnss_antenna_secondary_link
+>      translation:
+>        x: 0.0      # ← 前后偏置实测值，+X 向前，米
+>        y: 1.200    # ← 左右偏置实测值，+Y 向左，米（示例：左侧 1.2 m）
+>        z: 0.300    # ← 上下偏置实测值，+Z 向上，米（通常与主天线高度一致）
+>      rotation: { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+>    ```
+>
+>    文件中默认的 `(0, 0, 0)` 是显式禁用双天线模式的**哨兵值** —— 任何实际安装都会有非零偏置。用卷尺测量到 ±1 cm 即可；启动脚本会按 `σ ≈ atan2(0.01 m, baseline_m)` 把基线换算成预期 RTK-fixed 航向 σ，例如 1.2 m 基线对应 σ ≈ 0.48°（远低于下文运行期合理性检查的阈值）。此处填入的偏置**还必须**写入 Atlas Duo 固件的 `gnss_lever_arm_secondary`（见下文杆臂补偿说明）—— 两处必须一致。
+> 4. 重新生成 URDF：`cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`。脚本会打印 `GNSS antenna mode: DUAL` 以及基线长度和预期的 RTK-fixed 航向 σ。如果输出是 `GNSS antenna mode: SINGLE`，说明第 3 步的平移仍是哨兵值，URDF 生成器拒绝切换到双天线模式。
+>
+> **若只装单根天线作为回退：** 保留 `gnss_antenna_secondary_link` 的默认 `(0, 0, 0)` 即可。GLIM++ 启动时识别该哨兵值并自动切换到单天线模式 —— 系统仍然可用，主天线一根就足以为 GLIM++ 的初始位姿和整段会话的 GNSS 因子流提供 RTK 位置。唯一损失的是双天线带来的航向收益（初始化门控保持单天线默认值，yaw 漂移仍然由 IMU 主导）。同时你还需要把 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) 中的 `enable_orientation_prior` 翻成 `false` —— 详情见下文 GLIM++ GNSS 航向先验说明。两种模式下的具体差异参见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) 中的对比表。
 
 ## 传感器布局
 
@@ -119,7 +136,7 @@ sudo python3 recording/sensor_recorder.py
 
 ## 建图 (GLIM++)
 
-针对 SLAM 与 3D 建图，本项目搭载 **GLIM++**，一个对 **GLIM** 做了深度修改的 fork —— 上游 *Graph-based LiDAR-Inertial Mapping* 由 AIST 的 Kenji Koide 等人开发，仓库地址 <https://github.com/koide3/glim>。本 fork 位于 [`GLIM_plusplus/`](GLIM_plusplus/)（双加号意在提示这并非原版 GLIM）。在高层视角下，GLIM++ 与上游的差异分为七个类别：
+针对 SLAM 与 3D 建图，本项目搭载 **GLIM++**，一个对 **GLIM** 做了深度修改的 fork —— 上游 *Graph-based LiDAR-Inertial Mapping* 由 AIST 的 Kenji Koide 等人开发，仓库地址 <https://github.com/koide3/glim>。本 fork 位于 [`GLIM_plusplus/`](GLIM_plusplus/)（双加号意在提示这并非原版 GLIM）。在高层视角下，GLIM++ 与上游的差异分为八个类别：
 
 1. **传感器适配** —— 把 topic、frame、字段名从此前的 AV-24 / Luminar 部署切换到 Hitch Sensor Dome（3× Robin W + Atlas Duo + 4× RouteCAM）。
 2. **车辆无关主体坐标系** —— `base_frame_id = imu_link`，地图围绕 Atlas Duo 导航中心建立，可跨车辆平台复用。
@@ -128,6 +145,7 @@ sudo python3 recording/sensor_recorder.py
 5. **C++ 重写初始化** —— 移除"由加速度计估计重力"路径；优化器现在必须由外部 INS 位姿启动。这使得从运动状态开始的录制（中途重启、赛道重放、被截过的 bag）也能正常使用。
 6. **初始位姿的 RTK-fixed 准入门控** —— 三阶段门控（NavSatFix 状态、协方差、多采样稳定性），未通过时打印粗体红色 CLI 警告。
 7. **RTK 门控的 GNSS 因子桥** —— 整段会话期间向全局图持续注入 GNSS 软先验因子，但仅在 RTK 锁定时段；隧道期间静默暂停，重新锁定后自动恢复。
+8. **GNSS 航向先验（仅适用于双天线）** —— 当配置为双天线 RTK 时，使用 `PoseRotationPrior` 因子把每个 submap 的 yaw 拉向 RTK 测得的航向。出厂默认开启；若改用单天线则必须手动关闭。
 
 URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更日志、上游致谢、license 保留、引用方式与编译说明请见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md)。
 
@@ -141,6 +159,50 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 > - **NTRIP 校正必须畅通。** Atlas Duo 经蜂窝路由器接通 NTRIP caster 的链路（见 [`PTP_sync/README.md`](PTP_sync/README.md) §3.1）必须工作；否则无法达到 RTK-fixed。
 > - **会话进行中遇到隧道 / 城市峡谷不影响。** 后续每条消息的 RTK 门控只在失锁时段静默暂停因子发布，重新锁定后自动恢复，**不会重启会话** —— RTK 硬性要求只针对*初始位姿*。
 > - **完全没有 RTK** 的场景（既没有基站也没有 NTRIP），可通过 `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5` 放宽门控，允许 RTK-float / SBAS 初始化。地图依然可用，但世界坐标系锚点的精度从厘米级退化到米级。详见 [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) "Operating without RTK"一节。
+
+> ### ⚙ GLIM++ GNSS 天线杆臂补偿 —— 默认关闭（仅适用于 Atlas Duo）
+>
+> **GLIM++ 默认关闭 GNSS 天线相对 IMU 的杆臂（lever-arm）补偿。** Atlas Duo 是**紧耦合 GNSS+INS**，并不是裸 GNSS 接收机：其内部融合引擎已经把每根天线的 RTK 观测解算到设备 IMU 坐标系下，对外发布的 `/pose` 与 `/odom` 是**位于 IMU 原点**的位姿。若在 GLIM++ 中再做一次杆臂补偿，会重复修正并悄悄把地图偏置。
+>
+> **该选择只有在 Atlas Duo 内部的天线偏置参数与穹顶实际安装一致时才成立。** Atlas Duo 调试阶段，必须在单元配置（Atlas Duo Web UI → device configuration）中以设备 IMU 坐标系为基准、按米为单位写入天线偏置：
+>
+> - **`gnss_lever_arm_primary`** 必须等于 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中 `imu_link` 到 `gnss_antenna_primary_link` 的向量 —— 目前为 `(0, 0, 0.300)`。
+> - **`gnss_lever_arm_secondary`**（仅当接入副天线时）必须等于 `imu_link` 到 `gnss_antenna_secondary_link` 的向量。
+>
+> 如果 Atlas 固件中的这两个值填错，Atlas 自身的 RTK-fixed 解算就会被旋转后的杆臂偏置污染 —— **GLIM++ 这一侧再做任何外部补偿都无法挽回**，只能在 Atlas 内重新写入配置并重录会话。
+>
+> **若将 Atlas Duo 替换为非紧耦合的 GNSS**（例如 SwiftNav / u-blox / NovAtel 等无板载 INS 融合的裸 RTK 接收机，或任何把位置以**天线**参考点而非 IMU 原点发布的松耦合方案），则必须**在 GLIM++ 中开启杆臂补偿** —— 因为天线到 IMU 的修正不再由上游设备完成。该路径的参考实现（基于 URDF 的 `urdf_gnss_frame` 修正、注入到 GNSS 因子桥中）记录在 [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3b。
+
+> ### 🧭 GLIM++ GNSS 航向先验 —— 默认开启（双天线 RTK）
+>
+> **GLIM++ 在 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) 中默认启用 GNSS 航向先验（`PoseRotationPrior`）。** 每个 submap 的 yaw 都被约束到 RTK 测得的航向上，消除单靠 LiDAR + IMU 长时间会留下的 yaw 缓慢漂移。这是 Hitch Sensor Dome 的**默认配置**，因为本项目出厂即为双天线 RTK 平台。
+>
+> **工作原理。** 双天线 RTK 接收机直接从两根天线之间的基线测得航向 —— 无漂移，精度约 0.1°–4°，取决于基线长度。Atlas Duo 的 `/pose` topic 在四元数字段中携带该航向；wrapper 把它转发到 `/gnss/pose_rtk_only` 并附上紧的 yaw 协方差，`libgnss_global.so` 在每个 submap 上把它消费为一个 `PoseRotationPrior` 因子。出厂权重为 `[1e-6, 1e-6, 1e2]` —— 只约束 yaw，σ_yaw ≈ 0.1 rad（~5.7°），适用于 0.3–1 m 的基线。基线更长（例如 2 m）时，Atlas Duo 的航向协方差会变小，可以把权重提高（如 `5e2` 对应 ~2.6° σ）。roll 与 pitch 保持几乎为零的权重，因为 GNSS 不观测这两个轴 —— IMU + 重力已经处理。
+>
+> ### ⚠ GLIM++ GNSS 航向先验 —— 单天线安装必须关闭
+>
+> **如果只装一根 GNSS 天线，必须关闭该航向先验。** 单天线情况下，`/pose` 上的航向是由 INS 陀螺仪积分得来的 —— 会随会话时间漂移。把优化器绑定到一个本身就在漂移的参考上，比让 yaw 完全由 LiDAR + IMU 控制更糟糕，正是 GLIM++ 当初要解决的多圈 z-drift / yaw-drift 失败模式会再次出现。
+>
+> **切换到单天线模式需要两处改动，都必须在启动 GLIM++ 之前完成：**
+>
+> 1. **TF YAML。** 把 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中的 `gnss_antenna_secondary_link` 保留（或恢复）到哨兵值 `(0, 0, 0)`。启动 log 此时会打印 `single-antenna mode` 而不是 `dual-antenna mode ENABLED`。
+> 2. **GNSS 因子配置。** 打开 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json)，把下面这一行翻成 false：
+>
+>    ```jsonc
+>      "enable_orientation_prior": false,                    // 原为 true
+>    ```
+>
+> 第 2 步是承重部分：如果你只把 TF YAML 改成单天线，但忘了关闭航向先验，wrapper 仍会发布松协方差的四元数（陀螺积分出的 INS yaw），rotation prior 因子照样会触发，把优化器拉向那个漂移的航向。这个开关必须显式翻转。
+>
+> ### 🛡 航向先验配置错误的三层防御
+>
+> 航向先验是双天线下最有用的功能，但也是三处配置（物理安装、本仓库的配置文件、Atlas 固件）若有一处错配时最隐蔽的失败点。GLIM++ 设置了三道独立的检查：
+>
+> 1. **Atlas 固件前置条件（文档约定）。** Atlas Duo 内部的 `gnss_lever_arm_secondary` 与双天线航向模式必须在 Atlas Web UI 中按物理安装方式正确配置。这一项无法由本仓库的代码自动验证 —— 只能在 Atlas 调试期间手动确认。具体参数对应关系见上文的 GNSS 杆臂补偿说明。
+> 2. **启动期一致性检查（自动）。** `hitch_sensor_dome.launch.py` 启动时同时读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 和 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json)，若 TF YAML 中的天线数与 `enable_orientation_prior` 的取值不一致，打印粗体黄色警告。该检查只能发现本仓库自己的配置文件错配。
+> 3. **运行期 yaw σ 合理性检查（自动）。** GLIM++ 启动后，C++ wrapper 会读取每条 `/odom` 消息中 Atlas 自己上报的 yaw σ（pose 协方差中的对应项），与我们根据双天线基线长度估计出的预期 σ 做对比。前约 20 条样本采集完毕后，若 Atlas 持续上报远宽于预期的 σ，打印粗体黄色一次性警告，说明 Atlas 固件很可能**没有**真正进入双天线航向模式（即便本仓库的配置说它在）。该检查要求 `ins_odom_topic` 已经接入（Odometry 携带协方差，PoseStamped 不携带）。检查通过时会输出一行 info 级别的确认日志，确认双天线航向已生效。
+>
+> 算法背景与不同基线长度下推荐的信息权重表参见 [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3a。
 
 ```bash
 # (一次性) 从 sensor_dome_tf.yaml 生成 sensor_dome.urdf

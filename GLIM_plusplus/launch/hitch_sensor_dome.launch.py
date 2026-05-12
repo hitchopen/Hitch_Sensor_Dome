@@ -43,6 +43,8 @@
 #                            ins_pose_topic:=/atlas/pose
 # =============================================================================
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -61,7 +63,12 @@ GLIM_DIR = HERE.parent                          # GLIM_plusplus/
 REPO_ROOT = GLIM_DIR.parent                     # Hitch_Sensor_Dome/
 DEFAULT_TF_YAML = REPO_ROOT / "config" / "sensor_dome_tf.yaml"
 DEFAULT_GLIM_CONFIG = GLIM_DIR / "glim" / "config"
+DEFAULT_GNSS_CONFIG = GLIM_DIR / "glim_ext" / "config" / "config_gnss_global.json"
 SCRIPTS_DIR = GLIM_DIR / "scripts"
+
+# Bold-yellow ANSI escape — used for consistency-mismatch warnings.
+_YELLOW_BOLD = "\033[1;33m"
+_ANSI_RESET = "\033[0m"
 
 
 def _build_static_tfs(context, *args, **kwargs):
@@ -115,6 +122,102 @@ def _maybe_pre_flight(context, *args, **kwargs):
     except Exception as ex:
         sys.stderr.write(f"[launch] stationarity check failed to run: {ex}\n")
     return []
+
+
+def _read_orientation_prior_flag(gnss_config_path: Path):
+    """Parse GLIM_plusplus/glim_ext/config/config_gnss_global.json (JSONC
+    format — has `// …` comments) and return the value of
+    gnss.enable_orientation_prior. Returns None if the file cannot be
+    read or the key is absent, so callers can distinguish "not present"
+    from "present and false".
+
+    GLIM's config_gnss_global.json carries inline comments, so we strip
+    everything after `//` on each line before json.loads. Block /* */
+    comments are not used in this file but are stripped for safety."""
+    try:
+        raw = gnss_config_path.read_text(encoding="utf-8")
+        # Strip block comments first (rare in this file, but defensive).
+        no_block = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+        # Strip single-line comments — careful not to eat // inside strings.
+        # The config file does not contain // inside any string, so a
+        # simple line-wise strip is safe.
+        cleaned_lines = []
+        for line in no_block.splitlines():
+            # Find the first // not inside a string.
+            in_str = False
+            cut = None
+            i = 0
+            while i < len(line):
+                c = line[i]
+                if c == '"' and (i == 0 or line[i - 1] != "\\"):
+                    in_str = not in_str
+                elif not in_str and c == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                    cut = i
+                    break
+                i += 1
+            cleaned_lines.append(line if cut is None else line[:cut])
+        parsed = json.loads("\n".join(cleaned_lines))
+        gnss_block = parsed.get("gnss", {})
+        if "enable_orientation_prior" in gnss_block:
+            return bool(gnss_block["enable_orientation_prior"])
+        return None
+    except Exception as ex:
+        sys.stderr.write(
+            f"[launch] could not parse {gnss_config_path}: {ex} — skipping "
+            f"orientation-prior consistency check\n")
+        return None
+
+
+def _warn_orientation_prior_mismatch(dual_enabled: bool, prior_on,
+                                     gnss_config_path: Path) -> None:
+    """Print a bold-yellow warning when the operator-side configuration
+    of dual-antenna mode disagrees with config_gnss_global.json's
+    enable_orientation_prior. Two failure modes are flagged:
+
+      (A) Dual-antenna detected but enable_orientation_prior = false
+          — the operator is leaving an RTK-fixed yaw constraint on the
+          floor. The system still works (it just runs as if it were
+          single-antenna), but the dual-antenna heading is wasted.
+
+      (B) Single-antenna detected but enable_orientation_prior = true
+          — the bridge will publish a tight yaw covariance on a
+          gyro-integrated heading, and the optimizer will be pulled
+          toward a drifting reference. This is the failure mode the
+          gating exists to prevent.
+
+    This check cannot reach into the Atlas Duo firmware to verify that
+    dual-antenna mode is actually programmed there; the runtime yaw σ
+    sanity check in the C++ bridge catches that case post-launch."""
+    if prior_on is None:
+        return  # File missing / unparseable — already warned.
+    if dual_enabled and not prior_on:
+        sys.stderr.write(
+            f"{_YELLOW_BOLD}[launch] WARNING — orientation-prior config "
+            f"MISMATCH:\n"
+            f"  sensor_dome_tf.yaml says DUAL-antenna mode is enabled,\n"
+            f"  but {gnss_config_path.name} has "
+            f"enable_orientation_prior: false.\n"
+            f"  The dome will run as if single-antenna and waste the RTK "
+            f"heading.\n"
+            f"  Fix: flip enable_orientation_prior to true in\n"
+            f"       {gnss_config_path}\n"
+            f"{_ANSI_RESET}")
+    elif not dual_enabled and prior_on:
+        sys.stderr.write(
+            f"{_YELLOW_BOLD}[launch] WARNING — orientation-prior config "
+            f"MISMATCH:\n"
+            f"  sensor_dome_tf.yaml says SINGLE-antenna mode "
+            f"(secondary translation is sentinel),\n"
+            f"  but {gnss_config_path.name} has "
+            f"enable_orientation_prior: true.\n"
+            f"  GLIM++ will inject a yaw factor sourced from "
+            f"gyro-integrated INS heading,\n"
+            f"  which drifts over the session and degrades map quality.\n"
+            f"  Fix: either set the secondary antenna's translation in "
+            f"sensor_dome_tf.yaml,\n"
+            f"       or flip enable_orientation_prior to false in\n"
+            f"       {gnss_config_path}\n"
+            f"{_ANSI_RESET}")
 
 
 def _detect_dual_antenna(tf_yaml_path: str) -> tuple:
@@ -179,6 +282,15 @@ def _build_glim_node(context, *args, **kwargs):
             "[launch] single-antenna mode (no dual-antenna baseline configured)\n")
         heading_sigma_rad = 0.0
 
+    # Consistency check between sensor_dome_tf.yaml (antenna geometry)
+    # and config_gnss_global.json (enable_orientation_prior). Warns
+    # loudly on mismatch in either direction; cannot detect Atlas-
+    # firmware-side misconfiguration (covered by the runtime yaw σ
+    # check in the C++ bridge).
+    gnss_config_path = Path(cfg("gnss_config_path"))
+    prior_on = _read_orientation_prior_flag(gnss_config_path)
+    _warn_orientation_prior_mismatch(dual_enabled, prior_on, gnss_config_path)
+
     return [
         Node(
             package="glim_ros",
@@ -235,6 +347,14 @@ def generate_launch_description() -> LaunchDescription:
             "config_path",
             default_value=str(DEFAULT_GLIM_CONFIG),
             description="Path to GLIM_plusplus/glim/config (folder containing config_*.json).",
+        ),
+        DeclareLaunchArgument(
+            "gnss_config_path",
+            default_value=str(DEFAULT_GNSS_CONFIG),
+            description="Path to config_gnss_global.json. Read at launch "
+                        "time only to run the orientation-prior consistency "
+                        "check against sensor_dome_tf.yaml; the C++ side "
+                        "reads this file itself via GlobalConfigExt.",
         ),
         DeclareLaunchArgument(
             "ins_pose_topic",

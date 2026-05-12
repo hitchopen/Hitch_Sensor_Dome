@@ -162,6 +162,21 @@ private:
   bool dual_antenna_enabled_ = false;
   double dual_antenna_baseline_m_ = 0.0;
   double dual_antenna_heading_sigma_rad_ = 0.0;
+
+  // Runtime yaw σ sanity check — see try_publish_gnss_factor in
+  // glim_ros.cpp for the rationale. We compare the Atlas-reported yaw
+  // covariance against dual_antenna_heading_sigma_rad_ and warn once
+  // per session if the operator believes we're dual-antenna but the
+  // Atlas firmware appears not to have dual-antenna heading active.
+  // Defaults are the threshold multiplier (5×), the number of samples
+  // required before we evaluate (20), and the violation fraction
+  // required (≥75 % of samples must exceed the threshold).
+  double yaw_sigma_warn_threshold_mult_ = 5.0;
+  int yaw_sigma_check_window_samples_ = 20;
+  double yaw_sigma_violation_fraction_ = 0.75;
+  std::atomic<int> yaw_sigma_samples_{0};
+  std::atomic<int> yaw_sigma_violations_{0};
+  std::atomic_bool yaw_sigma_warned_{false};
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

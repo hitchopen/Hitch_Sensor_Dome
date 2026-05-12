@@ -23,14 +23,32 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 >
 > A second SP1-class GNSS antenna mounted at a known offset from the first turns RTK-fixed into a **drift-free heading reference** (typically 0.1°–1° accurate, depending on baseline length). Without it, vehicle heading is integrated from the IMU gyroscope and drifts over time — the canonical multi-lap z-drift / yaw-drift failure modes that GLIM++ has to compensate for.
 >
+> > **⚠ IMPORTANT — the 3D reference design ships with only ONE GNSS antenna mount.** The SCAD model in [`3D files/`](3D%20files/) and the BOM in [`3D files/README.md`](3D%20files/README.md) cover a single magnetic survey stand centered above the Atlas Duo's CoN. The geometry of a second antenna stand is **deployment-specific** because the optimal baseline depends on the vehicle (a sedan roof, a race-car shell, and a survey truck cab all want different placements). Every real deployment is expected to add a secondary GNSS antenna — the 3D files are a starting point, not the final mechanical design. Mount the second antenna rigidly enough that the baseline does not flex during driving (rigid metal plate or 3D-printed extension bolted to the dome, not adhesive-mounted), measure the resulting `imu_link → gnss_antenna_secondary_link` offset to the nearest centimetre, and enter that offset in [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) per the steps below.
+>
 > **To enable dual-antenna in this project:**
 >
 > 1. Mount a second SP1 (or compatible multi-band antenna) at a fixed offset from the primary. **Recommended baseline 1.0–1.5 m** for vehicle-roof installations; minimum 0.5 m for usable accuracy.
 > 2. Wire it into the Atlas Duo's secondary GNSS RF input (with an antenna splitter or the second port if your Atlas Duo unit exposes it). Configure the Atlas Duo's web UI for dual-antenna heading mode.
-> 3. **Edit [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)** and replace the default `gnss_antenna_secondary_link` translation `(0, 0, 0)` with the actual second-antenna position in the `imu_link` frame, in metres. The translation `(0, 0, 0)` is a sentinel that explicitly disables dual-antenna mode — any real installation will have a non-zero offset.
-> 4. Regenerate the URDF: `cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`. The script prints `GNSS antenna mode: DUAL` along with the baseline length and the expected RTK-fixed heading σ.
+> 3. **Edit [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)** to record the secondary antenna's actual mounting position. The relevant block looks like this:
 >
-> **Fallback if you have only one antenna:** leave `gnss_antenna_secondary_link` at its default `(0, 0, 0)`. GLIM++ detects the sentinel at launch time and runs in single-antenna mode — the system still works, the primary antenna alone provides RTK position for both GLIM++'s init pose and the session-long GNSS factor stream. The only loss is the dual-antenna heading benefit (init gates stay at single-antenna defaults and yaw drift remains an IMU concern). See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the side-by-side comparison of what changes between the two modes.
+>    ```yaml
+>    # Excerpted from config/sensor_dome_tf.yaml — secondary antenna entry.
+>    # Replace translation (0, 0, 0) with the measured offset, in metres,
+>    # from imu_link (Atlas Duo CoN) to the secondary antenna phase center.
+>    # Rotation stays identity — the antenna baseline is a translation.
+>    - frame_id: imu_link
+>      child_frame_id: gnss_antenna_secondary_link
+>      translation:
+>        x: 0.0      # ← measured fore/aft offset, +X forward, metres
+>        y: 1.200    # ← measured left/right offset, +Y left, metres (example: 1.2 m laterally to the left)
+>        z: 0.300    # ← measured up offset, +Z up, metres (typically matches the primary antenna's height)
+>      rotation: { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+>    ```
+>
+>    The translation `(0, 0, 0)` that ships in the file is a **sentinel** that explicitly disables dual-antenna mode — any real installation will have a non-zero offset. Measure with a tape to ±1 cm; the launch file converts your offset into the expected RTK-fixed heading σ via `σ ≈ atan2(0.01 m, baseline_m)`, so a 1.2 m baseline yields σ ≈ 0.48° (well below the runtime sanity-check threshold described later in the orientation-prior section). Whatever offset you enter here must **also** be programmed into the Atlas Duo firmware as `gnss_lever_arm_secondary` (see the lever-arm callout below) — the two representations must agree.
+> 4. Regenerate the URDF: `cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`. The script prints `GNSS antenna mode: DUAL` along with the baseline length and the expected RTK-fixed heading σ. If you see `GNSS antenna mode: SINGLE`, the translation in step 3 is still at the sentinel and step 4 will refuse to enable dual-antenna mode.
+>
+> **Fallback if you have only one antenna:** leave `gnss_antenna_secondary_link` at its default `(0, 0, 0)`. GLIM++ detects the sentinel at launch time and runs in single-antenna mode — the system still works, the primary antenna alone provides RTK position for both GLIM++'s init pose and the session-long GNSS factor stream. The only loss is the dual-antenna heading benefit (init gates stay at single-antenna defaults and yaw drift remains an IMU concern). You will also need to flip `enable_orientation_prior` to `false` in [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) — see the GLIM++ GNSS yaw prior callout below. See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the side-by-side comparison of what changes between the two modes.
 
 ## Sensor Layout
 
@@ -119,7 +137,7 @@ See [`recording/README.md`](recording/README.md) for the architecture diagram an
 
 ## Mapping (GLIM++)
 
-For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of **GLIM** — *Graph-based LiDAR-Inertial Mapping* by Kenji Koide et al. (AIST), upstream at <https://github.com/koide3/glim>. The fork lives at [`GLIM_plusplus/`](GLIM_plusplus/) (the double-plus signals it is *not* stock GLIM). At a high level, GLIM++ differs from upstream in seven categories:
+For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of **GLIM** — *Graph-based LiDAR-Inertial Mapping* by Kenji Koide et al. (AIST), upstream at <https://github.com/koide3/glim>. The fork lives at [`GLIM_plusplus/`](GLIM_plusplus/) (the double-plus signals it is *not* stock GLIM). At a high level, GLIM++ differs from upstream in eight categories:
 
 1. **Sensor adaptation** — topics, frames, and field names switched from the previous AV-24 / Luminar deployment to the Hitch Sensor Dome (3× Robin W + Atlas Duo + 4× RouteCAM).
 2. **Vehicle-agnostic body frame** — `base_frame_id = imu_link`, so maps anchor to the Atlas Duo Center of Navigation and are portable across vehicles.
@@ -128,6 +146,7 @@ For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of
 5. **Initialization rewrite (C++)** — gravity-from-accelerometer is removed; the optimizer now requires an external INS pose to start. Allows recordings that begin in motion (mid-session restarts, race-track replays, bag trims).
 6. **RTK-fixed gating for the initial pose** — three-stage gate on NavSatFix status, covariance, and multi-sample stability, with a bold-RED CLI warning if the gate is not met within the timeout.
 7. **RTK-gated GNSS factor bridge** — soft GNSS prior factors are added to the global graph throughout the session, but only when RTK is fixed. Suspends silently in tunnels and resumes on re-fix.
+8. **Optional GNSS yaw prior (dual-antenna only)** — when a dual-antenna RTK heading is available, an optional `PoseRotationPrior` factor pulls each submap's yaw toward the RTK heading. OFF by default; must be turned on manually for dual-antenna installations.
 
 A URDF generator and a `ros2 launch` helper round out the integration. See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the full file-by-file change log, upstream credits, license preservation, citation, and build instructions.
 
@@ -141,6 +160,50 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 > - **NTRIP corrections must be flowing.** The Atlas Duo's Ethernet path to the cellular router (see [`PTP_sync/README.md`](PTP_sync/README.md) §3.1) must reach an NTRIP caster. RTK-fixed without NTRIP is not achievable.
 > - **Tunnels and urban canyons during the session are fine** — the per-message RTK gate suspends factor publishing during outages and resumes on re-fix. The session is *not* re-started; only the *initial* pose requires RTK-fixed.
 > - **Without RTK** (no base station, no NTRIP) — the gate can be relaxed via `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5`, accepting RTK-float or SBAS for init. The map is still useful but the world-frame anchor is loose at the metre scale rather than the centimetre scale. See [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) §"Operating without RTK".
+
+> ### ⚙ GLIM++ GNSS antenna lever-arm compensation — OFF by default (Atlas Duo only)
+>
+> **GLIM++ ships with GNSS antenna-to-IMU lever-arm compensation disabled.** The Atlas Duo is a **tightly-coupled GNSS+INS**, not a raw GNSS receiver: its onboard fusion engine already resolves each antenna's RTK observation into the device IMU frame and publishes `/pose` and `/odom` **at the IMU origin**. Adding a second lever-arm correction inside GLIM++ would double-compensate and silently bias the map.
+>
+> **This is only correct if the Atlas Duo's antenna offsets are configured to match the physical dome geometry.** During Atlas Duo commissioning, the antenna offsets must be entered into the unit's config (Atlas Duo web UI → device configuration), expressed in the device IMU frame in metres:
+>
+> - **`gnss_lever_arm_primary`** must match the vector from `imu_link` to `gnss_antenna_primary_link` in [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) — currently `(0, 0, 0.300)`.
+> - **`gnss_lever_arm_secondary`** (only if a secondary antenna is wired in) must match the vector from `imu_link` to `gnss_antenna_secondary_link`.
+>
+> If those values are wrong inside the Atlas firmware, the Atlas's own RTK-fixed pose solution will be biased by the rotated lever arm — and **no external compensation in GLIM++ can recover it**. The fix has to be re-flashed into the Atlas config and the session re-recorded.
+>
+> **If the Atlas Duo is replaced by a non-tightly-coupled GNSS** (a raw RTK receiver such as SwiftNav / u-blox / NovAtel without onboard INS fusion, or any loosely-coupled stack that publishes positions at the **antenna** reference rather than the IMU origin), then lever-arm compensation must be **turned ON inside GLIM++** — the antenna-to-IMU correction is no longer being applied upstream. The reference design for that path (URDF-driven `urdf_gnss_frame` correction inside the GNSS factor bridge) is documented in [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3b.
+
+> ### 🧭 GLIM++ GNSS yaw prior — ON by default (dual-antenna RTK)
+>
+> **GLIM++ ships with a GNSS yaw prior (`PoseRotationPrior`) enabled in [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json).** Each submap is constrained toward the RTK-derived heading, eliminating the slow yaw drift that LiDAR + IMU alone leave open over a long session. This is the **default configuration** for the Hitch Sensor Dome because the dome ships as a dual-antenna RTK platform.
+>
+> **How it works.** A dual-antenna RTK receiver measures heading directly from the baseline between the two antennas — drift-free, accurate to roughly 0.1°–4° depending on baseline length. The Atlas Duo's `/pose` topic carries that heading as the quaternion field; the wrapper republishes it on `/gnss/pose_rtk_only` with a tight yaw covariance, and `libgnss_global.so` consumes it as a `PoseRotationPrior` factor on every submap. The shipped weighting is `[1e-6, 1e-6, 1e2]` — yaw only, σ_yaw ≈ 0.1 rad (~5.7°), appropriate for a 0.3–1 m baseline. With a longer baseline (e.g. 2 m) the Atlas Duo's heading covariance shrinks and the weight can be raised (try `5e2` for ~2.6° σ). Roll and pitch are kept at near-zero weight because GNSS does not observe them — the IMU + gravity already does.
+>
+> ### ⚠ GLIM++ GNSS yaw prior — MUST be turned OFF for single-antenna installations
+>
+> **If the dome runs with only one GNSS antenna, the yaw prior must be disabled.** With a single antenna, the heading on `/pose` is gyro-integrated from the INS — drifting over the session. Tying the optimizer to a drifting reference is worse than leaving yaw under LiDAR + IMU control alone, and the multi-lap z-drift / yaw-drift failure modes that GLIM++ was forked to fix re-appear.
+>
+> **To switch to single-antenna mode, two changes are required, both before launching GLIM++:**
+>
+> 1. **TF YAML.** Leave (or set back) `gnss_antenna_secondary_link` to its sentinel `(0, 0, 0)` in [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml). The launch file will then print `single-antenna mode` instead of `dual-antenna mode ENABLED`.
+> 2. **GNSS factor config.** Open [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) and flip:
+>
+>    ```jsonc
+>      "enable_orientation_prior": false,                    // was true
+>    ```
+>
+> Step 2 is the load-bearing one: if you change the TF YAML to single-antenna but leave the orientation prior on, the wrapper publishes a loose-covariance quaternion (gyro-integrated INS yaw) and the rotation prior factor will still fire and drag the optimizer toward that drifting heading. The flag must be flipped explicitly.
+>
+> ### 🛡 Three-layered defense against orientation-prior misconfiguration
+>
+> The yaw prior is the most consequential dual-antenna feature and the most subtly wrong if any of the three configurations involved (physical mounting, our config files, Atlas firmware) drifts out of sync. GLIM++ runs three independent checks:
+>
+> 1. **Atlas firmware prerequisite (documented).** The Atlas Duo's `gnss_lever_arm_secondary` and dual-antenna heading mode must be configured in the Atlas web UI to match the physical mounting. This cannot be verified from our code — it has to be set up correctly during Atlas commissioning. See the GNSS antenna lever-arm callout above for the matching parameters.
+> 2. **Launch-time consistency check (automatic).** `hitch_sensor_dome.launch.py` reads [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) and [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) at startup, and emits a bold-yellow warning if the TF YAML's antenna count disagrees with `enable_orientation_prior`. This catches operator-side mistakes in our own config files.
+> 3. **Runtime yaw σ sanity check (automatic).** Once GLIM++ is running, the C++ wrapper compares the Atlas-reported yaw σ on each `/odom` message (the value the Atlas itself publishes in its pose covariance) against the σ we expect from the dual-antenna baseline. After the first ~20 samples, if the Atlas is consistently reporting a much wider σ than expected, a bold-yellow one-shot warning fires explaining that the Atlas firmware is probably *not* in dual-antenna heading mode despite our config saying so. The check requires `ins_odom_topic` to be wired (Odometry carries covariance; PoseStamped does not). A healthy check prints a single info-level confirmation that the dual-antenna heading is live.
+>
+> See [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3a for the algorithmic background and recommended baseline-vs-information-weight table.
 
 ```bash
 # (one-time) generate sensor_dome.urdf from sensor_dome_tf.yaml

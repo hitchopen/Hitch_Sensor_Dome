@@ -53,6 +53,40 @@
   //   delivers ~1 cm vertical, so giving GNSS extra authority on z is
   //   justified. Drop z back to 1e4 if you relax the bridge gate to
   //   accept RTK-float (i.e., set gnss_factor_require_rtk_fixed=false).
+  //
+  // enable_orientation_prior  (Hitch Sensor Dome fork)
+  //   When TRUE the module emits an additional PoseRotationPrior factor
+  //   on each submap, pulling its yaw toward the heading carried in the
+  //   incoming PoseWithCovarianceStamped / Odometry quaternion.
+  //
+  //   Default is TRUE because the Hitch Sensor Dome ships as a
+  //   dual-antenna RTK platform — the Atlas Duo's two-antenna baseline
+  //   gives a drift-free heading, and the rotation prior is what feeds
+  //   that heading into GLIM's factor graph. The launch log prints
+  //   `dual-antenna mode ENABLED` once sensor_dome_tf.yaml's
+  //   gnss_antenna_secondary_link translation is non-zero.
+  //
+  //   ⚠ SET TO FALSE for single-antenna installations. With only one
+  //   antenna, the heading on /pose is gyro-integrated and drifting
+  //   over the session. Enabling this factor in single-antenna mode
+  //   would tie the optimizer to a reference that is itself drifting —
+  //   worse than leaving yaw under LiDAR + IMU control alone. The
+  //   single-antenna fallback path requires this flag to be flipped
+  //   off; see README "GLIM++ GNSS yaw prior" callout.
+  //
+  // orientation_prior_inf_scale  (Hitch Sensor Dome fork)
+  //   Information matrix diagonal in (roll, pitch, yaw) for the
+  //   rotation prior. The recommended weighting is essentially
+  //   yaw-only: [1e-6, 1e-6, 1e2]. Reasoning:
+  //     - Roll and pitch are well-observed from IMU + gravity; GNSS
+  //       adds nothing to those axes.
+  //     - Yaw is the drift-prone axis that dual-antenna RTK heading
+  //       constrains directly via baseline measurement.
+  //   The tiny 1e-6 on roll/pitch keeps the information matrix
+  //   strictly positive-definite for GTSAM without effectively
+  //   constraining those axes.
+  //   Order: (roll, pitch, yaw), interpreted in the local Lie algebra
+  //   of Pose3's rotation block.
   "gnss": {
     "gnss_topic": "/gnss/pose_rtk_only",
     "gnss_msg_type": "geometry_msgs/msg/PoseWithCovarianceStamped",
@@ -61,6 +95,12 @@
       1e4,
       1e4,
       5e4
+    ],
+    "enable_orientation_prior": true,
+    "orientation_prior_inf_scale": [
+      1e-6,
+      1e-6,
+      1e2
     ]
   }
 }

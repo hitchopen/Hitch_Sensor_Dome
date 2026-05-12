@@ -766,6 +766,107 @@ void GlimROS::try_publish_gnss_factor(
       for (int j = 0; j < 3; ++j)
         out.pose.covariance[i * 6 + j] = last_fix_->position_covariance[i * 3 + j];
   }
+
+  // Hitch Sensor Dome fork — runtime Atlas-yaw-σ sanity check.
+  //
+  // When the operator believes we're in dual-antenna mode (TF YAML +
+  // config_gnss_global.json both say so), we expect the Atlas Duo's
+  // own reported yaw σ — pose_cov[35], from the Odometry covariance —
+  // to be tight: within yaw_sigma_warn_threshold_mult_ (default 5×)
+  // of the dual_antenna_heading_sigma_rad_ we computed from the
+  // baseline length. If the Atlas firmware was NOT configured for
+  // dual-antenna heading (or the secondary antenna isn't tracking
+  // satellites), it falls back to gyro-integrated yaw and the
+  // reported σ is several × wider.
+  //
+  // This is the only check that can catch a misconfigured Atlas
+  // firmware — the launch-time check only verifies our own config
+  // files. Messages with zero yaw covariance (PoseStamped-only path,
+  // since geometry_msgs/PoseStamped has no covariance field) carry no
+  // information and are skipped; the check is then effectively
+  // disabled until ins_odom_topic is wired up.
+  //
+  // Sampling: the first yaw_sigma_check_window_samples_ valid samples
+  // are tallied; if ≥ yaw_sigma_violation_fraction_ of them exceeded
+  // the threshold, a bold-yellow one-shot warning fires. A passing
+  // window emits a single info-level confirmation. Either outcome
+  // latches via yaw_sigma_warned_, so the check costs O(1) for the
+  // remainder of the session.
+  if (dual_antenna_enabled_ &&
+      dual_antenna_heading_sigma_rad_ > 0.0 &&
+      pose_cov[35] > 1e-9 &&
+      !yaw_sigma_warned_.load()) {
+    const double atlas_yaw_sigma = std::sqrt(pose_cov[35]);
+    const double threshold =
+      yaw_sigma_warn_threshold_mult_ * dual_antenna_heading_sigma_rad_;
+    yaw_sigma_samples_.fetch_add(1);
+    if (atlas_yaw_sigma > threshold) {
+      yaw_sigma_violations_.fetch_add(1);
+    }
+    const int n = yaw_sigma_samples_.load();
+    if (n >= yaw_sigma_check_window_samples_) {
+      const int v = yaw_sigma_violations_.load();
+      const double frac =
+        static_cast<double>(v) / static_cast<double>(n);
+      const std::string YELLOW = "\033[1;33m";
+      const std::string RESET  = "\033[0m";
+      if (frac >= yaw_sigma_violation_fraction_) {
+        bool expected_false = false;
+        if (yaw_sigma_warned_.compare_exchange_strong(expected_false, true)) {
+          spdlog::warn("");
+          spdlog::warn("{}Hitch fork: Atlas yaw σ SANITY CHECK FAILED{}",
+                       YELLOW, RESET);
+          spdlog::warn(
+            "{}  - Operator config: dual-antenna mode (expected yaw σ ≤ "
+            "{:.3f} rad ≈ {:.2f}°){}",
+            YELLOW,
+            dual_antenna_heading_sigma_rad_,
+            dual_antenna_heading_sigma_rad_ * 180.0 / M_PI,
+            RESET);
+          spdlog::warn(
+            "{}  - Atlas reported:  yaw σ ≈ {:.3f} rad ≈ {:.2f}° in "
+            "{}/{} samples (threshold {:.3f} rad){}",
+            YELLOW,
+            atlas_yaw_sigma, atlas_yaw_sigma * 180.0 / M_PI,
+            v, n, threshold,
+            RESET);
+          spdlog::warn(
+            "{}  - Likely cause: the Atlas Duo firmware is NOT in "
+            "dual-antenna heading mode.{}",
+            YELLOW, RESET);
+          spdlog::warn(
+            "{}  - Verify in the Atlas web UI: gnss_lever_arm_secondary "
+            "populated; secondary antenna tracking; dual-antenna heading "
+            "enabled.{}",
+            YELLOW, RESET);
+          spdlog::warn(
+            "{}  - Until then the rotation prior factor will fire using "
+            "the Atlas's gyro-integrated yaw, which drifts and degrades "
+            "map quality.{}",
+            YELLOW, RESET);
+          spdlog::warn(
+            "{}  - Mitigation: relaunch with enable_orientation_prior: "
+            "false in config_gnss_global.json until the Atlas firmware "
+            "is producing real dual-antenna heading.{}",
+            YELLOW, RESET);
+          spdlog::warn("");
+        }
+      } else {
+        // Healthy state — emit a single info-level confirmation so
+        // the operator can see the check ran and passed.
+        bool expected_false = false;
+        if (yaw_sigma_warned_.compare_exchange_strong(expected_false, true)) {
+          spdlog::info(
+            "Hitch fork: Atlas yaw σ sanity check PASSED — measured σ ≈ "
+            "{:.3f} rad ({:.2f}°) over {}/{} samples within threshold "
+            "{:.3f} rad. Dual-antenna heading is live.",
+            atlas_yaw_sigma, atlas_yaw_sigma * 180.0 / M_PI,
+            n - v, n, threshold);
+        }
+      }
+    }
+  }
+
   if (dual_antenna_enabled_ && dual_antenna_heading_sigma_rad_ > 0.0) {
     // Indices in a 6×6 row-major covariance: [3,3]=roll, [4,4]=pitch,
     // [5,5]=yaw — i.e., 3*6+3=21, 4*6+4=28, 5*6+5=35.
