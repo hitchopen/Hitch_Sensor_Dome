@@ -171,7 +171,7 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 >
 > 如果 Atlas 固件中的这两个值填错，Atlas 自身的 RTK-fixed 解算就会被旋转后的杆臂偏置污染 —— **GLIM++ 这一侧再做任何外部补偿都无法挽回**，只能在 Atlas 内重新写入配置并重录会话。
 >
-> **若将 Atlas Duo 替换为非紧耦合的 GNSS**（例如 SwiftNav / u-blox / NovAtel 等无板载 INS 融合的裸 RTK 接收机，或任何把位置以**天线**参考点而非 IMU 原点发布的松耦合方案），则必须**在 GLIM++ 中开启杆臂补偿** —— 因为天线到 IMU 的修正不再由上游设备完成。该路径的参考实现（基于 URDF 的 `urdf_gnss_frame` 修正、注入到 GNSS 因子桥中）记录在 [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3b。
+> **若将 Atlas Duo 替换为非紧耦合的 GNSS**（例如 SwiftNav / u-blox / NovAtel 等无板载 INS 融合的裸 RTK 接收机，或任何把位置以**天线**参考点而非 IMU 原点发布的松耦合方案），则必须**在 GLIM++ 中开启杆臂补偿** —— 因为天线到 IMU 的修正不再由上游设备完成。建议的实现方式：在 wrapper 的 GNSS 因子桥（`glim_ros.cpp` 的 `try_publish_gnss_factor`）中读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 的 `imu_link → gnss_antenna_primary_link`，在消息进入 `libgnss_global.so` 之前做 `p_imu_utm = p_antenna_utm − R_world_imu · t_imu_gnss` 修正。
 
 > ### 🧭 GLIM++ GNSS 航向先验 —— 默认开启（双天线 RTK）
 >
@@ -201,8 +201,6 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 > 1. **Atlas 固件前置条件（文档约定）。** Atlas Duo 内部的 `gnss_lever_arm_secondary` 与双天线航向模式必须在 Atlas Web UI 中按物理安装方式正确配置。这一项无法由本仓库的代码自动验证 —— 只能在 Atlas 调试期间手动确认。具体参数对应关系见上文的 GNSS 杆臂补偿说明。
 > 2. **启动期一致性检查（自动）。** `hitch_sensor_dome.launch.py` 启动时同时读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 和 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json)，若 TF YAML 中的天线数与 `enable_orientation_prior` 的取值不一致，打印粗体黄色警告。该检查只能发现本仓库自己的配置文件错配。
 > 3. **运行期 yaw σ 合理性检查（自动）。** GLIM++ 启动后，C++ wrapper 会读取每条 `/odom` 消息中 Atlas 自己上报的 yaw σ（pose 协方差中的对应项），与我们根据双天线基线长度估计出的预期 σ 做对比。前约 20 条样本采集完毕后，若 Atlas 持续上报远宽于预期的 σ，打印粗体黄色一次性警告，说明 Atlas 固件很可能**没有**真正进入双天线航向模式（即便本仓库的配置说它在）。该检查要求 `ins_odom_topic` 已经接入（Odometry 携带协方差，PoseStamped 不携带）。检查通过时会输出一行 info 级别的确认日志，确认双天线航向已生效。
->
-> 算法背景与不同基线长度下推荐的信息权重表参见 [`GLIM_plusplus/docs/comparison_vs_augcog.md`](GLIM_plusplus/docs/comparison_vs_augcog.md) §3a。
 
 ```bash
 # (一次性) 从 sensor_dome_tf.yaml 生成 sensor_dome.urdf
