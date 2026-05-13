@@ -28,6 +28,8 @@ Three scripts automate the entire installation. Run them in order on a fresh Ubu
 ./setup_robin_w_sync.sh
 ```
 
+> **One-time per LiDAR — multi-unit provisioning.** All three Robin Ws ship from Seyond at the same factory IP (`192.168.1.10`) and the same UDP destination port. Running three units on one network requires each one to have (a) a unique IP and (b) a unique UDP destination port; otherwise the host receives three streams on the same port and can't tell them apart. Run [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) **once for each new LiDAR** (or once for the dome when all three are first assembled) to walk every unit from factory state to the per-position assignments documented in [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md). The script is idempotent — re-running it against already-provisioned LiDARs simply prints `[SKIP]` and exits. The provisioning files (`innovusion_lidar_util`, `automotive-master.cfg`, the three per-serial `PCS_ENV` files) are all in this folder; the host UDP receiver IP inside the `PCS_ENV` files is the project host IP `192.168.1.40` from `network_config.yaml`. `setup_robin_w_sync.sh` (Step 2) presumes provisioning has already happened — if it can't reach the LiDARs at `.10`/`.11`/`.12`, run the provisioning script first.
+
 **Step 3** installs the Aravis GigE Vision library, enables IEEE 1588 PTP on each RouteCAM camera, and installs ROS 2 camera packages. Run when cameras are powered via PoE.
 
 ```bash

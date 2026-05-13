@@ -28,6 +28,8 @@
 ./setup_robin_w_sync.sh
 ```
 
+> **每台 LiDAR 一次性的多机配置。** 三台 Robin W 出厂时拥有相同的工厂 IP（`192.168.1.10`）和相同的 UDP 目的端口。要把三台一起接入同一网络，必须为每台分配 (a) 独立 IP 与 (b) 独立 UDP 目的端口；否则主机会在同一端口上收到三路数据流而无法区分。每台新 LiDAR（或整套穹顶首次组装时）只需运行一次 [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh)，脚本会按 [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md) 中的对应表把每台从工厂状态过渡到位置专属配置。脚本是幂等的 —— 对已配置好的 LiDAR 再次运行只会打印 `[SKIP]` 然后退出。配置所需的文件（`innovusion_lidar_util`、`automotive-master.cfg`、三个按序列号命名的 `PCS_ENV` 文件）都在本目录下；`PCS_ENV` 文件中的主机 UDP 接收 IP 已经设为 `network_config.yaml` 中的项目主机 IP `192.168.1.40`。第 2 步 `setup_robin_w_sync.sh` 假定配置脚本已经跑过 —— 如果它无法在 `.10`/`.11`/`.12` ping 到 LiDAR，先运行配置脚本。
+
 **第 3 步**安装 Aravis GigE Vision 库、在每个 RouteCAM 摄像机上启用 IEEE 1588 PTP，以及安装 ROS 2 摄像机软件包。当摄像机通过 PoE 供电时运行。
 
 ```bash
