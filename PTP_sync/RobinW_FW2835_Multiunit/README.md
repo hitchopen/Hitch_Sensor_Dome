@@ -2,6 +2,8 @@
 
 This folder holds the per-LiDAR `PCS_ENV` files Seyond ships for running three Robin W units on the same Ethernet segment. Each file assigns the receiving host's IP and a unit-specific UDP destination port so the three point-cloud streams don't collide when they arrive at the host PC.
 
+> **Seyond factory default → must be reset.** Per Seyond's official [*Robin W1G LiDAR User Manual* V2.2 (2025-01-03)](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1, every Robin W ships with the default IP **`172.168.1.10`** (netmask `255.255.255.0`, gateway `172.168.1.1`). The Hitch Sensor Dome network runs on `192.168.1.0/24`, so **each Seyond LiDAR must be reset to the `192.168.1.x` subnet** — `192.168.1.10` / `.11` / `.12` per the mapping table below. This reset is the first step the provisioning script performs.
+
 Upload one file to each LiDAR with [`provision_robin_w_multiunit.sh`](../provision_robin_w_multiunit.sh) (one-time per LiDAR). The script picks the right file based on the serial→position mapping below.
 
 ## Files in this folder
@@ -14,13 +16,36 @@ Upload one file to each LiDAR with [`provision_robin_w_multiunit.sh`](../provisi
 
 Position assignments follow the natural ordering of the UDP ports Seyond pre-assigned in the files (8010 / 8020 / 8030 → front / rear-left / rear-right). The IP last octet matches the position pattern set in [`../../config/network_config.yaml`](../../config/network_config.yaml) (`.10` / `.11` / `.12`).
 
-The receiving host's IP is set to **`192.168.1.40`** in every file — that is the project host PC's static IP per [`../../config/network_config.yaml`](../../config/network_config.yaml). Seyond's reference example used `172.168.1.100`; we replaced it because (a) the dome network uses `192.168.1.0/24`, and (b) `172.168.x.x` is publicly-routable address space, not an RFC 1918 private block.
+The receiving host's IP is set to **`192.168.1.40`** in every file — that is the project host PC's static IP per [`../../config/network_config.yaml`](../../config/network_config.yaml). Seyond's reference example used `172.168.1.100`; we replaced it because the dome network runs on `192.168.1.0/24`.
+
+## Note on the Seyond factory default IP
+
+A brand-new Robin W1G ships with **`172.168.1.10`** as its factory IP, per Seyond's official [*Robin W1G LiDAR User Manual* V2.2 (2025-01-03)](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1:
+
+> *"The initial IP address of the LiDAR is 172.168.1.10. The initial subnet mask is 255.255.255.0. The initial gateway is 172.168.1.1."*
+
+That subnet is publicly-routable IPv4 space (it is **not** inside RFC 1918's `172.16.0.0/12` private block, which ends at `172.31.x.x` — `172.168.x.x` is an entirely different range). For our purposes this is fine because the dome NIC is air-gapped from the public internet, but it does mean the host PC cannot ping a factory-state LiDAR from its normal `192.168.1.40` address — the two subnets don't share an L3 path.
+
+`provision_robin_w_multiunit.sh` handles this automatically by adding a **temporary** `172.168.1.100/24` IP alias to the sensor NIC at the start of provisioning, then removing it on exit. The alias coexists with the regular `192.168.1.40/24` address (both work simultaneously at L2), so the post-provisioning ping at the new `192.168.1.X` address also succeeds inside the same script run. If you ever need to reach a factory LiDAR by hand:
+
+```bash
+# Add (run once at the start of a manual provisioning session):
+sudo ip addr add 172.168.1.100/24 dev <your-sensor-nic>
+# Verify reachability:
+ping 172.168.1.10
+# Remove when finished:
+sudo ip addr del 172.168.1.100/24 dev <your-sensor-nic>
+```
 
 ## Verifying the serial→position mapping on a new dome
 
-Before the first multi-unit provisioning run, confirm that the serials in the table above match the physical units you actually have. Read the serial off each LiDAR's web UI (`http://192.168.1.10` while still at the factory IP, then again after each one is renumbered):
+Before the first multi-unit provisioning run, confirm that the serials in the table above match the physical units you actually have. Read the serial off each LiDAR's web UI (`http://172.168.1.10` while still at the factory IP — you'll need the temporary IP alias described below to reach it — and `http://192.168.1.X` after each unit is renumbered):
 
 ```bash
+# At factory state (with the 172.168.1.100/24 alias up):
+curl -s http://172.168.1.10/api/v1/static_info | python3 -m json.tool | grep -i serial
+
+# After provisioning (host's normal 192.168.1.40 address suffices):
 curl -s http://192.168.1.10/api/v1/static_info | python3 -m json.tool | grep -i serial
 ```
 

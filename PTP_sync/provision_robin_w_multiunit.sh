@@ -4,14 +4,18 @@
 #
 # Walks each Seyond Robin W from factory state to project state:
 #
-#   factory IP (192.168.1.10)  ─┐
+#   factory IP (172.168.1.10)  ─┐
 #                               ├─→ set_network → reboot → upload
 #                               │   PCS_ENV with unit-specific UDP
 #                               │   port → verify
-#   final IP per network_config.yaml
+#   final IPs per network_config.yaml (192.168.1.0/24)
 #       robin_w_front       .10
 #       robin_w_rear_left   .11
 #       robin_w_rear_right  .12
+#
+# The script auto-adds a temporary 172.168.1.100/24 IP alias to the
+# sensor NIC so the host (on 192.168.1.40) can reach factory-state
+# LiDARs. Alias is removed on exit.
 #
 # This is the same procedure Seyond publishes for running three
 # Robin Ws on the same Ethernet segment (multi-unit unicast).
@@ -49,8 +53,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../config/load_network_config.sh"
 
 # ─── Defaults ────────────────────────────────────────────────
-FACTORY_IP="${FACTORY_IP:-192.168.1.10}"   # Seyond default — override if
-                                           # the unit shipped with a custom IP
+# Per Seyond's official "Robin W1G LiDAR User Manual" V2.2 (2025-01-03), §3.1:
+#     The initial IP address of the LiDAR is 172.168.1.10.
+#     The initial subnet mask is 255.255.255.0.
+#     The initial gateway is 172.168.1.1.
+# Note that 172.168.1.0/24 is publicly-routable IP space (it is NOT
+# inside RFC 1918's 172.16.0.0/12 private block — that ends at 172.31.x.x).
+# The dome network runs on 192.168.1.0/24 (per network_config.yaml), so
+# this script's job is to move each LiDAR FROM the Seyond factory IP TO
+# its assigned 192.168.1.x address.
+FACTORY_IP="${FACTORY_IP:-172.168.1.10}"
 NETMASK="${NETMASK:-255.255.255.0}"
 ONLY=""                                    # filter: front / rear_left / rear_right
 SLEEP_AFTER_REBOOT="${SLEEP_AFTER_REBOOT:-25}"   # seconds — Robin W needs ~20 s
@@ -86,6 +98,68 @@ warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 skip()  { echo -e "\033[1;36m[SKIP]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
+
+# ─── Reachability fix: temporary IP alias on the sensor NIC ──
+#
+# Brand-new LiDARs are at Seyond's factory IP 172.168.1.10 (per the
+# Robin W1G User Manual §3.1). The dome host PC lives on the
+# 192.168.1.0/24 subnet (per network_config.yaml). The two subnets do
+# not overlap, so the host cannot reach a factory-state LiDAR without
+# an IP in 172.168.1.0/24.
+#
+# We add a temporary alias 172.168.1.100/24 to the sensor NIC at the
+# start of provisioning, and remove it on exit. The alias coexists
+# with the host's 192.168.1.40/24 address (both are reachable at L2),
+# so post-provisioning pings to the new 192.168.1.X address also work
+# from the same script run.
+#
+# The alias is skipped if the host already has an address in
+# 172.168.1.0/24 (rare; only happens if you've manually pre-configured
+# this).
+ALIAS_ADDED=0
+ALIAS_IP="${FACTORY_IP%.*}.100/24"   # e.g. 172.168.1.100/24
+TARGET_IFACE="${NETCFG_ETH:-}"
+maybe_add_alias() {
+    [ -z "$TARGET_IFACE" ] && { warn "host.interface unset in network_config.yaml — skipping alias"; return; }
+    if ip -4 -o addr show dev "$TARGET_IFACE" 2>/dev/null | grep -q "${FACTORY_IP%.*}\."; then
+        ok "Host already has an address in ${FACTORY_IP%.*}.0/24 on $TARGET_IFACE — no alias needed"
+        return
+    fi
+    info "Adding temporary IP alias $ALIAS_IP on $TARGET_IFACE (sudo)"
+    if sudo ip addr add "$ALIAS_IP" dev "$TARGET_IFACE" 2>/dev/null; then
+        ALIAS_ADDED=1
+        ok "Alias up — host reachable on both 192.168.1.40 and ${ALIAS_IP%/*}"
+    else
+        warn "Could not add IP alias. You may need to run:"
+        warn "  sudo ip addr add $ALIAS_IP dev $TARGET_IFACE"
+        warn "and re-run this script."
+        fail "Aborting because factory-IP LiDARs would be unreachable."
+    fi
+}
+cleanup_alias() {
+    if [ "$ALIAS_ADDED" -eq 1 ] && [ -n "$TARGET_IFACE" ]; then
+        info "Removing temporary IP alias $ALIAS_IP from $TARGET_IFACE"
+        sudo ip addr del "$ALIAS_IP" dev "$TARGET_IFACE" 2>/dev/null || \
+            warn "Could not remove alias — clean up manually: sudo ip addr del $ALIAS_IP dev $TARGET_IFACE"
+    fi
+}
+trap cleanup_alias EXIT
+
+# Add the alias only if at least one LiDAR is expected to still be at
+# the factory IP. If all three are already provisioned (per the table
+# below), this is a no-op re-run and we skip the alias.
+NEED_ALIAS=0
+for row in "${UNIT_TABLE[@]}"; do
+    IFS='|' read -r _ _ target_ip _ _ <<< "$row"
+    if [ -n "$ONLY" ]; then
+        IFS='|' read -r position _ _ _ _ <<< "$row"
+        [ "$ONLY" != "$position" ] && continue
+    fi
+    # If the target IP doesn't respond, the LiDAR is either off or
+    # still at the factory IP — alias is needed in case it's the latter.
+    if ! ping -c1 -W1 "$target_ip" &>/dev/null; then NEED_ALIAS=1; fi
+done
+if [ "$NEED_ALIAS" -eq 1 ]; then maybe_add_alias; fi
 
 # ─── Locate the Seyond utility ───────────────────────────────
 UTIL=""
