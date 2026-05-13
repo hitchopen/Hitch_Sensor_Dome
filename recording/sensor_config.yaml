@@ -31,19 +31,25 @@ point_one_nav:
 # Seyond Robin W LiDARs (3× directional)
 # -------------------------------------------------------------
 lidars:
+  # Per-LiDAR UDP/TCP ports are set during multi-unit provisioning (see
+  # PTP_sync/provision_robin_w_multiunit.sh). 8337/8338/8339 picked to
+  # avoid Hadoop defaults (8020 NameNode / 8030 YARN) and the busy
+  # 8000-8099 dev-server range. Match values to the PCS_ENV files in
+  # PTP_sync/RobinW_FW2835_Multiunit/ — if you re-run provisioning with
+  # different ports, update both here.
   - name: "robin_w_front"
     ip: "192.168.1.10"
-    port: 8010
+    port: 8337
     frame_id: "lidar_front_link"
     topic: "/robin_w_front/points"     # sensor_msgs/PointCloud2 @ 10 Hz
   - name: "robin_w_rear_left"
     ip: "192.168.1.11"
-    port: 8010
+    port: 8338
     frame_id: "lidar_rear_left_link"
     topic: "/robin_w_rear_left/points"
   - name: "robin_w_rear_right"
     ip: "192.168.1.12"
-    port: 8010
+    port: 8339
     frame_id: "lidar_rear_right_link"
     topic: "/robin_w_rear_right/points"
 

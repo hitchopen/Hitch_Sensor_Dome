@@ -361,13 +361,13 @@ point_one_nav:
 lidars:
   - name: "robin_w_front"
     ip: "192.168.1.10"
-    port: 8010
+    port: 8337
   - name: "robin_w_rear_left"
     ip: "192.168.1.11"
-    port: 8010
+    port: 8338
   - name: "robin_w_rear_right"
     ip: "192.168.1.12"
-    port: 8010
+    port: 8339
 
 recording:
   output_dir: "~/recordings"
@@ -473,15 +473,15 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 
 ### A. Seyond Robin W Default Parameters
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| IP Address | 192.168.1.10 | Change via web UI or `innovusion_lidar_util` |
-| Data Port | 8010 | TCP and UDP |
-| Coordinate Mode | 3 (forward/left/up) | Matches ROS REP-103 |
-| PTP | Supported | Enabled by `setup_robin_w_sync.sh` |
-| FOV | 120° × 70° | |
-| Points/sec | 1.28M | 192 scan lines |
-| Range | 0.1–150 m | 70 m at 10% reflectivity |
+| Parameter | Factory default | Hitch dome (post-provisioning) | Notes |
+|-----------|-----------------|--------------------------------|-------|
+| IP Address | `172.168.1.10` | `192.168.1.10` / `.11` / `.12` | Factory IP per Seyond *Robin W1G User Manual* V2.2 §3.1. `provision_robin_w_multiunit.sh` renumbers each unit. |
+| Data Port (UDP + TCP) | `8010` | `8337` / `8338` / `8339` | One port per unit. Rebased off Seyond's 8010/8020/8030 example to avoid Hadoop's 8020/8030 and the busy 8000-8099 dev-server range. |
+| Coordinate Mode | `3` (forward/left/up) | same | Matches ROS REP-103 |
+| PTP | Supported | Enabled (standard L3 IEEE 1588) | Enabled by `setup_robin_w_sync.sh` |
+| FOV | 120° × 70° | same | |
+| Points/sec | 1.28M | same | 192 scan lines |
+| Range | 0.1–150 m | same | 70 m at 10% reflectivity |
 
 ### B. RouteCAM_P_CU25_CXLC_IP67 Key Specs
 

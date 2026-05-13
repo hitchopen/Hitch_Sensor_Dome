@@ -8,13 +8,29 @@ Upload one file to each LiDAR with [`provision_robin_w_multiunit.sh`](../provisi
 
 ## Files in this folder
 
-| File | Serial number | Target position | Target IP | UDP ports (data/msg/status) |
+| File | Serial number | Target position | Target IP | UDP/TCP port (data + control) |
 |---|---|---|---|---|
-| `RW_FW2835_Allen_533192400101_unicast.env` | `533192400101` | `robin_w_front` | `192.168.1.10` | 8010 |
-| `RW_FW2835_Allen_533262400110_unicast.env` | `533262400110` | `robin_w_rear_left` | `192.168.1.11` | 8020 |
-| `RW_FW2835_Allen_533192400103_unicast.env` | `533192400103` | `robin_w_rear_right` | `192.168.1.12` | 8030 |
+| `RW_FW2835_Allen_533192400101_unicast.env` | `533192400101` | `robin_w_front` | `192.168.1.10` | 8337 |
+| `RW_FW2835_Allen_533262400110_unicast.env` | `533262400110` | `robin_w_rear_left` | `192.168.1.11` | 8338 |
+| `RW_FW2835_Allen_533192400103_unicast.env` | `533192400103` | `robin_w_rear_right` | `192.168.1.12` | 8339 |
 
-Position assignments follow the natural ordering of the UDP ports Seyond pre-assigned in the files (8010 / 8020 / 8030 → front / rear-left / rear-right). The IP last octet matches the position pattern set in [`../../config/network_config.yaml`](../../config/network_config.yaml) (`.10` / `.11` / `.12`).
+Position assignments preserve the natural ordering of Seyond's original 8010/8020/8030 triplet — we just rebased the range to 8337-8339 to dodge common conflicts (see "Port choice" below). The IP last octet matches the position pattern set in [`../../config/network_config.yaml`](../../config/network_config.yaml) (`.10` / `.11` / `.12`).
+
+## Port choice — why 8337/8338/8339
+
+Seyond's stock multi-unit example uses 8010/8020/8030. The Hitch dome rebases to **8337/8338/8339** to avoid two real conflict surfaces:
+
+- **Apache Hadoop:** `8020` is the default HDFS NameNode IPC port, `8030` is the default YARN ResourceManager scheduler port. Any host that ever ran Cloudera / Hortonworks / vanilla Hadoop would have those ports squatted.
+- **8000–8099 is dev-server territory:** Python `http.server` defaults to 8000, Django to 8000, Jupyter to 8888, Cypress to 8080, and so on. Even if those are TCP-only, the Seyond driver opens TCP + UDP on the same port (`TCP_SERVICE_PORT` and `UDP_PORT_*` are equal inside each PCS_ENV), so a TCP squatter blocks the LiDAR handshake.
+
+`8337` and `8338` are IANA-registered to Konica Minolta PowerJet (printer-management services — vanishingly unlikely on a perception PC). `8339` is unassigned in IANA's registry. The triplet sits in a quiet stretch of the registered-port range and is contiguous, which keeps firewall and switch QoS rules simple.
+
+If you change the ports, three files have to move together:
+1. The three `RW_FW2835_Allen_*_unicast.env` files in this folder.
+2. The `UNIT_TABLE` in [`../provision_robin_w_multiunit.sh`](../provision_robin_w_multiunit.sh).
+3. The `lidars[*].port` entries in [`../../recording/sensor_config.yaml`](../../recording/sensor_config.yaml).
+
+The provisioning script's `--help` output and the PCS_ENV files are the canonical source — keep the sensor_config.yaml in sync.
 
 The receiving host's IP is set to **`192.168.1.40`** in every file — that is the project host PC's static IP per [`../../config/network_config.yaml`](../../config/network_config.yaml). Seyond's reference example used `172.168.1.100`; we replaced it because the dome network runs on `192.168.1.0/24`.
 
@@ -54,11 +70,11 @@ If a serial does not appear in the table above, the provisioning script will ref
 ## File schema
 
 ```
-TCP_SERVICE_PORT=80X0       # TCP control port (matches UDP_PORT_*)
+TCP_SERVICE_PORT=833X       # TCP control port (matches UDP_PORT_*)
 UDP_IP=192.168.1.40         # host PC destination
-UDP_PORT_DATA=80X0          # point cloud frames
-UDP_PORT_MESSAGE=80X0       # status messages
-UDP_PORT_STATUS=80X0        # health status
+UDP_PORT_DATA=833X          # point cloud frames
+UDP_PORT_MESSAGE=833X       # status messages
+UDP_PORT_STATUS=833X        # health status
 STATUS_INTERVAL_MS=50       # 20 Hz status reports
 LOG_OPTION="..."            # /tmp/inno_pc_server.txt rotation rules
 MIN_RUN_TIME=5              # min seconds before restart on failure
@@ -66,7 +82,7 @@ MIN_RUN_TIME_SLEEP=5        # sleep before restart
 MAX_PACKET_SIZE=1450        # UDP MTU (Ethernet jumbo NOT required)
 ```
 
-`80X0` is `8010`, `8020`, or `8030` depending on which file. The same number is used for TCP control and all three UDP ports inside one file because the recipient demultiplexes on the *port*, not the *purpose* — different LiDARs send to different ports, while a single LiDAR may reuse the same port for data/message/status streams.
+`833X` is `8337`, `8338`, or `8339` depending on which file. The same number is used for TCP control and all three UDP ports inside one file because the recipient demultiplexes on the *port*, not the *purpose* — different LiDARs send to different ports, while a single LiDAR may reuse the same port for data/message/status streams.
 
 ## Note on the `unicast` suffix
 

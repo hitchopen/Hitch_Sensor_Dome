@@ -361,13 +361,13 @@ point_one_nav:
 lidars:
   - name: "robin_w_front"
     ip: "192.168.1.10"
-    port: 8010
+    port: 8337
   - name: "robin_w_rear_left"
     ip: "192.168.1.11"
-    port: 8010
+    port: 8338
   - name: "robin_w_rear_right"
     ip: "192.168.1.12"
-    port: 8010
+    port: 8339
 
 recording:
   output_dir: "~/recordings"
@@ -473,15 +473,15 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 
 ### A. Seyond Robin W 默认参数
 
-| 参数 | 默认值 | 说明 |
-|-----------|---------|-------|
-| IP Address | 192.168.1.10 | 通过网页 UI 或 `innovision_lidar_util` 更改 |
-| Data Port | 8010 | TCP and UDP |
-| Coordinate Mode | 3 (forward/left/up) | 匹配 ROS REP-103 |
-| PTP | Supported | 由 `setup_robin_w_sync.sh` 启用 |
-| FOV | 120° × 70° | |
-| Points/sec | 1.28M | 192 scan lines |
-| Range | 0.1–150 m | 在 10% 反射率下 70 m |
+| 参数 | 出厂默认 | Hitch 穹顶（重新配置后） | 说明 |
+|------|----------|---------------------------|------|
+| IP Address | `172.168.1.10` | `192.168.1.10` / `.11` / `.12` | 出厂 IP 见 Seyond *Robin W1G User Manual* V2.2 §3.1。由 `provision_robin_w_multiunit.sh` 重新分配。 |
+| Data Port (UDP + TCP) | `8010` | `8337` / `8338` / `8339` | 每台 LiDAR 一个独立端口。在 Seyond 8010/8020/8030 示例的基础上整体平移，避开 Hadoop 默认的 8020/8030 以及繁忙的 8000-8099 开发端口区。 |
+| Coordinate Mode | `3`（forward/left/up） | same | 匹配 ROS REP-103 |
+| PTP | Supported | 启用（标准 L3 IEEE 1588） | 由 `setup_robin_w_sync.sh` 启用 |
+| FOV | 120° × 70° | same | |
+| Points/sec | 1.28M | same | 192 scan lines |
+| Range | 0.1–150 m | same | 在 10% 反射率下 70 m |
 
 ### B. RouteCAM_P_CU25_CXLC_IP67 关键规格
 

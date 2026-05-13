@@ -71,10 +71,20 @@ SLEEP_AFTER_REBOOT="${SLEEP_AFTER_REBOOT:-25}"   # seconds — Robin W needs ~20
 # ─── Static unit table — keep in sync with
 # ─── RobinW_FW2835_Multiunit/README.md
 # Format: position|serial|target_ip|udp_port|pcs_env_filename
+#
+# UDP/TCP ports 8337-8339 chosen to avoid:
+#   - Apache Hadoop defaults: 8020 (HDFS NameNode IPC) and 8030 (YARN
+#     ResourceManager scheduler) would collide on any host doing data
+#     engineering double duty.
+#   - The heavily-trafficked 8000-8099 dev-server / HTTP-alt range
+#     (Python http.server, Django, Cypress, Jupyter, etc.).
+# 8337/8338 are IANA-registered to Konica Minolta PowerJet (printer
+# management — vanishingly unlikely to be running on a perception PC).
+# 8339 is unassigned.
 UNIT_TABLE=(
-  "front|533192400101|192.168.1.10|8010|RW_FW2835_Allen_533192400101_unicast.env"
-  "rear_left|533262400110|192.168.1.11|8020|RW_FW2835_Allen_533262400110_unicast.env"
-  "rear_right|533192400103|192.168.1.12|8030|RW_FW2835_Allen_533192400103_unicast.env"
+  "front|533192400101|192.168.1.10|8337|RW_FW2835_Allen_533192400101_unicast.env"
+  "rear_left|533262400110|192.168.1.11|8338|RW_FW2835_Allen_533262400110_unicast.env"
+  "rear_right|533192400103|192.168.1.12|8339|RW_FW2835_Allen_533192400103_unicast.env"
 )
 
 # ─── Parse args ──────────────────────────────────────────────
