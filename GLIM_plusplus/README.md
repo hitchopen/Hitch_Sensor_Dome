@@ -81,7 +81,7 @@ Twenty-four parameter changes across the seven JSON configs, each annotated inli
 | **GNSS prior** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]` (was silently disabled upstream). `min_baseline: 1.0 → 0.5`. |
 | **Deskewing** | `config_sensors.json` | `global_shutter_lidar: true → false`. Re-enables motion deskewing (the upstream multi-LiDAR timestamp rebasing bug it was working around has since been fixed). |
 | **Per-point time** | `config_sensors.json` | `autoconf_perpoint_times: false → true`, `perpoint_relative_time: false → true`. Robin W driver emits relative-to-frame timestamps. |
-| **Downsampling** | `config_preprocess.json` | `random_downsample_target: 10000 → 20000`, `k_correspondences: 10 → 20`. Higher density required for the 360° stitched cloud from 3 sensors. |
+| **Downsampling** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`, `k_correspondences: 10 → 20`. Higher density required for the 360° stitched cloud from 3 sensors; the 3× upstream factor is safe because the dome pipeline runs GLIM **offline** against recorded MCAP bags, so there is no real-time per-scan budget. Lower to 15-20K if switching to live mapping. |
 | **VGICP voxels** | `config_odometry_gpu.json`, `config_sub_mapping_gpu.json` | Base resolutions raised for outdoor scale: `voxel_resolution 0.25 → 0.5`, `voxel_resolution_max 0.5 → 1.0`. Submap-internal `keyframe_voxel_resolution 0.25 → 0.15` for tighter local alignment. |
 | **Smoother window** | `config_odometry_gpu.json` | `full_connection_window_size: 2 → 4`. Aggressive vehicle motion. |
 | **Sub-mapping** | `config_sub_mapping_gpu.json` | `max_num_keyframes: 15 → 20`. Better submap coverage. |

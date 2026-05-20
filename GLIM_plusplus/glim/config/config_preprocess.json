@@ -21,12 +21,21 @@
     "distance_far_thresh": 100.0,
     "use_random_grid_downsampling": true,
     "downsample_resolution": 1.0,
-    // random_downsample_target raised from 10000 → 20000. The original
-    // value was tuned for a single-sensor 120° FOV; the Robin W stitched
-    // cloud spans 360° (3 × 120° sectors), so 10K starves global mapping
-    // of points and produces sparse voxel maps. 20K stays well inside
-    // the GPU VGICP budget while restoring map density.
-    "random_downsample_target": 20000,
+    // random_downsample_target raised from 10000 → 30000. Two reasons:
+    //   (a) The Robin W stitched cloud spans 360° (3 × 120° sectors),
+    //       so the upstream 10K (tuned for a single-sensor 120° FOV)
+    //       starves global mapping of points and produces sparse voxel
+    //       maps.
+    //   (b) The Hitch dome pipeline runs GLIM *offline* against
+    //       recorded MCAP bags — there is no real-time per-scan budget
+    //       to honor. The conservative 20K we used earlier was a
+    //       hedge against online operation. With offline-only runs,
+    //       we can pay 3× the VGICP work per scan in exchange for
+    //       denser sub-maps and better convergence in feature-sparse
+    //       stretches (long straights, tunnels, open lots).
+    // If you ever switch to live mapping, lower this back to 15-20K
+    // and re-check `odometry took … ms` in the GLIM logs.
+    "random_downsample_target": 30000,
     "random_downsample_rate": 0.1,
     "enable_outlier_removal": false,
     "outlier_removal_k": 10,

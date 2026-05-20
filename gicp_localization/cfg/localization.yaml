@@ -1,0 +1,236 @@
+/**:
+  ros__parameters:
+
+    use_sim_time: true
+
+    # ==========================================================================
+    # gicp_localization for Hitch Sensor Dome
+    #
+    # Pure scan-to-map localizer against a pre-built PCD produced by
+    # GLIM_plusplus offline mapping. Runs the IMU integrator + geometric
+    # observer between scans and falls back to IMU dead-reckoning on
+    # GICP rejections, with RTK-snap recovery from the Atlas Duo INS
+    # odometry when GICP fails for too many consecutive scans.
+    # ==========================================================================
+
+    # --- Map ---
+    # Path to the PCD map produced by GLIM_plusplus offline mapping.
+    # See GLIM_plusplus/scripts/ for the dump → PCD merge step.
+    localization/map_path: "maps/session_latest/map.pcd"
+
+    # UTM output: path to GLIM's T_world_utm.txt for the map being used.
+    # Leave empty to disable UTM-frame publishing.
+    localization/utm_transform_path: ""
+    localization/utm_frame: "utm"
+
+    # --- Frame IDs (match sensor_dome_tf.yaml / sensor_dome.urdf) ---
+    localization/map_frame: "map"
+    localization/base_frame: "imu_link"           # Atlas Duo CoN
+    localization/imu_frame: "imu_link"            # IMU link in URDF
+    localization/lidar_frame: "lidar_front_link"  # Primary Robin W (front)
+
+    # Map downsampling for GICP (smaller = more accurate but slower).
+    localization/voxel_leaf_size: 0.25
+
+    # Optional map rotation (degrees) to correct sideways/up-axis issues
+    # from source map files. The GLIM_plusplus map is already in REP-103
+    # (X-forward / Y-left / Z-up), so leave at zero unless you imported
+    # a map from a different SLAM stack.
+    localization/map_rotation/roll_deg: 0.0
+    localization/map_rotation/pitch_deg: 0.0
+    localization/map_rotation/yaw_deg: 0.0
+
+    # Map visualization
+    localization/visualize_map: true
+    localization/map_voxel_size_vis: 1.5  # Downsample for RViz (increase for faster rendering)
+
+    # TF publishing
+    localization/publish_tf: false
+    # If true, disable GICP scan matching and propagate pose using IMU /
+    # geometric observer only. Debug / sanity check mode.
+    localization/imu_only: false
+
+    # Logging verbosity. true = INFO + raw stderr debug prints.
+    # false = silence INFO/DEBUG; WARN/ERROR still pass through.
+    localization/verbose: false
+
+    # Use odometry for pose initialization. If true, waits for the first
+    # odometry message; if false, waits for RViz "2D Pose Estimate".
+    localization/use_odom_init: true
+
+    # --- Atlas Duo INS cross-check + recovery ---
+    # When enabled, the node subscribes to the `gt_odom` remap (default
+    # /odom_rtk_only — the RTK-gated Atlas Duo INS odometry; see the
+    # nav_sat_gated_odom helper) and reports gt_err=[trans, rot, dt] in
+    # every SCAN DEBUG line and publishes the deltas on
+    # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg.
+    # Diagnostic only — never feeds back into accept/reject.
+    localization/gt_odom/enable: true
+    localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
+    localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
+
+    # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
+    # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
+    # time-matched RTK-gated Atlas Duo sample so GICP can re-acquire from
+    # a known-good state. The GT pose+twist is transformed from
+    # msg->child_frame_id into base_frame via TF (cached on first GT
+    # message). IMU biases are preserved. Setting enable=true forces
+    # gt_odom/enable=true.
+    #
+    # IMPORTANT — the source of `gt_odom` must already be RTK-gated.
+    # We do this by running nav_sat_gated_odom (see scripts/), which
+    # republishes /odom only when /gps/fix has STATUS_GBAS_FIX and
+    # cm-grade covariance. The localizer treats any message arriving on
+    # gt_odom as RTK-fixed, so any quality filtering must happen
+    # upstream of this topic.
+    localization/gt_recovery/enable: true
+    localization/gt_recovery/min_consecutive_failures: 1
+
+    # --- Initial pose ---
+    # If `localization/initial_pose/use` is true, seed the node with the
+    # numeric pose below. The Atlas Duo INS bootstrap (use_odom_init=true)
+    # is the recommended path; this static-pose path is for replays where
+    # the operator has the GLIM trajectory's first-row pose in hand.
+    # `frame: "lidar"` post-multiplies inv(T_base_lidar) automatically so
+    # values can be pasted from GLIM's traj_lidar.txt directly. Use
+    # `frame: "base_link"` if you already computed T_world_baselink yourself.
+    localization/initial_pose/use: false
+    localization/initial_pose/frame: "lidar"
+    localization/initial_pose/x: 0.0
+    localization/initial_pose/y: 0.0
+    localization/initial_pose/z: 0.0
+    localization/initial_pose/roll: 0.0
+    localization/initial_pose/pitch: 0.0
+    localization/initial_pose/yaw: 0.0
+
+    # --- Preprocessing ---
+    # Crop box keeps points within ±size m of sensor origin (sensor frame).
+    # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in
+    # world frame, so the box acts on world-frame coords. Set very large
+    # or disable if using deskew.
+    dlio/preprocessing/cropBoxFilter/size: 70.0   # Robin W max range is ~150 m; 70 m matches the 90% POD ring
+    dlio/preprocessing/voxelFilter/use: true      # Recommended for full-map localization
+    dlio/preprocessing/voxelFilter/res: 0.5       # 0.5 m voxel — matches GLIM_plusplus map resolution
+
+    # Flip Y axis of incoming point cloud. Robin W in coordinate_mode:=3
+    # already publishes REP-103 axes (X-forward / Y-left / Z-up), so leave
+    # this at false. When lidar_concat is enabled this runs AFTER merge.
+    localization/flip_y: false
+
+    # --- Multi-LiDAR concatenation ---
+    # Subscribes to each aux topic, buffers the latest scans, and on every
+    # primary scan finds the nearest aux scan in time, transforms its XYZ
+    # into the primary sensor frame via TF (URDF), rebases per-point
+    # timestamps onto the primary clock, and appends the bytes to the
+    # primary PointCloud2. Downstream sees a single cloud in primary
+    # frame with one coherent timebase.
+    #
+    # Mirror of GLIM_plusplus's lidar_concat module — the two pipelines
+    # consume the same three Robin W streams and produce equivalent
+    # stitched clouds.
+    localization/lidar_concat/enabled: true
+    localization/lidar_concat/aux_topics: ["/robin_w_rear_left/points", "/robin_w_rear_right/points"]
+    localization/lidar_concat/aux_frames: ["lidar_rear_left_link", "lidar_rear_right_link"]
+    localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans farther than this from primary are dropped
+    localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
+
+    # LiDAR sensor type for per-point timestamp handling during deskewing.
+    # Options: ouster, velodyne, hesai, livox.
+    # Seyond Robin W in coordinate_mode:=3 publishes per-point time as
+    # float32 seconds relative to scan start, which is identical to the
+    # Velodyne convention. We set "velodyne" here on purpose — the
+    # deskewer's VELODYNE branch reads `time` in float32 seconds and is
+    # the correct path for Robin W. Keeping the upstream enum unchanged
+    # (no Seyond-specific code) keeps the divergence from upstream minimal.
+    localization/sensor_type: "velodyne"
+
+    # --- IMU and deskewing ---
+    # Deskewing uses per-point timestamps to motion-compensate each scan
+    # at IMU rate. Robin W keeps real per-point timestamps (unlike some
+    # vendors that collapse them at the driver), so deskewing helps.
+    dlio/deskew: true
+    dlio/gravity: 9.81
+    dlio/imu/bufferSize: 2000
+    dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity
+                             # calibration. Used ONLY when RTK init is unavailable;
+                             # the rtk_init path below is preferred.
+
+    # Motion-variance gate on the stationary calibration window.
+    # If σ_||a|| over the calibTime window exceeds this (m/s²), the
+    # stationary calibration is REFUSED — accumulating "stationary"
+    # bias while the vehicle is actually moving produces a tilted
+    # gravity vector and degraded scan matching for the first ~100
+    # scans. On refusal, the window resets and re-accumulates; the
+    # operator either brings the vehicle to rest or relies on the
+    # rtk_init path above. 0.10 m/s² ≈ 10 mg jitter, generous for a
+    # still Hitch dome. Set ≤ 0 to disable.
+    localization/calib/motion_sigma_max: 0.10
+
+    # --- RTK-driven IMU calibration ---
+    # Uses the Atlas Duo INS topic (gt_odom remap → /odom_rtk_only) as the
+    # truth source for bias estimation. Lets the vehicle calibrate while
+    # moving and seeds pose+velocity from the first RTK-fixed sample
+    # rather than assuming stationary. Presence of a message on the GT
+    # topic is taken to mean "RTK is fixed" — the nav_sat_gated_odom
+    # helper stops publishing when not RTK-fixed, so this assumption
+    # holds. If no GT message arrives within rtk_init/fallback_timeout
+    # seconds of the first IMU sample, the node falls back to the
+    # stationary `dlio/imu/calibTime` path above.
+    localization/rtk_init/enable: true
+    localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
+    localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback
+
+    # --- Geometric observer gains (proportional correction) ---
+    odom/geo/Kp: 4.5      # Position correction gain
+    odom/geo/Kv: 11.25    # Velocity correction gain
+    odom/geo/Kq: 4.0      # Orientation correction gain
+    odom/geo/Kab: 2.25    # Accelerometer bias correction gain
+    odom/geo/Kgb: 1.0     # Gyroscope bias correction gain
+    odom/geo/Kz_damping: 0.0
+    odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
+    odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
+
+    # --- Debug / visualization helpers ---
+    localization/debug/enable_pub: false
+    localization/debug/enable_jump_log: false
+    localization/debug/verbose_scan_log: false
+    localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
+    localization/debug/jump_trans_m: 30.0      # Log/reject if pose jumps > this (meters); 10Hz @ 30m/s = 3m/scan
+    localization/debug/jump_rot_deg: 30.0      # Log/reject if pose jumps > this (degrees)
+
+    # --- GICP registration ---
+    gicp/maxIterations: 128
+    gicp/correspondenceRandomness: 20
+    gicp/maxCorrespondenceDistance: 4.0
+    gicp/transformationEpsilon: 0.004
+    gicp/rotationEpsilon: 0.004
+
+    # GICP result gating: reject poor registrations and fall back to IMU
+    # dead-reckoning. The thresholds below are tuned conservatively; tighten
+    # once you have a Hitch-dome run with ground-truth-fixed accepts.
+    #
+    # Keep fitnessRejectThreshold at 1.0, not tighter: during the first ~4
+    # scans the initial pose is still settling, so fitness spikes legitimately;
+    # an over-tight threshold rejects those and the node gets stuck.
+    gicp/fitnessRejectThreshold: 1.0
+    gicp/rejectLargeJumps: true
+    # Combined geometric-degeneracy gate. The hessian condition proxy alone
+    # over-rejects: feature-poor corners legitimately spike condition
+    # number while GICP still finds a clean low-fitness solution anchored
+    # by the IMU prior. So we only reject when BOTH signals fire: high
+    # condition number AND elevated fitness (or large correction) — the
+    # signature of the optimizer landing in a wrong local minimum that
+    # an unconstrained axis let it slide into.
+    #
+    # Set hessianCondMax <= 0 to disable; set hessianFitnessWarnThreshold
+    # <= 0 to restore the old "hessian alone" behavior.
+    gicp/hessianCondMax: 5.0e9
+    gicp/hessianFitnessWarnThreshold: 0.15
+    # Slide signature in degenerate geometry: GICP applies an unusually
+    # large correction to the IMU prior. Healthy GICP scans need
+    # <0.5 m / <0.5° of correction because the IMU prior is already good.
+    # A 1.3 m or 2.8° GICP correction at hessian 1e10 is the optimizer
+    # sliding along an unconstrained axis even when fitness looks low.
+    # Set <=0 to disable that OR branch.
+    gicp/hessianTransWarnM: 1.0
+    gicp/hessianRotWarnDeg: 1.5

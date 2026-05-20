@@ -80,7 +80,7 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 | **GNSS 先验** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]`（上游默认值相当于禁用 GNSS）。`min_baseline: 1.0 → 0.5`。 |
 | **运动畸变补偿** | `config_sensors.json` | `global_shutter_lidar: true → false`。重新启用畸变补偿（上游多 LiDAR 时间戳重基 bug 已被修复，无需再绕开）。 |
 | **每点时间戳** | `config_sensors.json` | `autoconf_perpoint_times: false → true`、`perpoint_relative_time: false → true`。Robin W 驱动输出相对帧时间戳。 |
-| **下采样** | `config_preprocess.json` | `random_downsample_target: 10000 → 20000`、`k_correspondences: 10 → 20`。3 路传感器拼成的 360° 点云需更高密度。 |
+| **下采样** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`、`k_correspondences: 10 → 20`。3 路传感器拼成的 360° 点云需更高密度；3× 上游值之所以可接受，是因为穹顶数据流程是**离线**针对录制 MCAP 包跑 GLIM —— 没有实时单帧时间预算。如果改为在线建图，建议降回 15-20K。 |
 | **VGICP voxel** | `config_odometry_gpu.json`、`config_sub_mapping_gpu.json` | 户外尺度提高基础分辨率：`voxel_resolution 0.25 → 0.5`、`voxel_resolution_max 0.5 → 1.0`。submap 内 `keyframe_voxel_resolution 0.25 → 0.15` 更紧。 |
 | **smoother 窗口** | `config_odometry_gpu.json` | `full_connection_window_size: 2 → 4`。适应车辆剧烈机动。 |
 | **submap 管理** | `config_sub_mapping_gpu.json` | `max_num_keyframes: 15 → 20`。submap 覆盖更全。 |
