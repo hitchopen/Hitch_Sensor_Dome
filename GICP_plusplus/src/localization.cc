@@ -16,6 +16,7 @@
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
 #include <pcl/filters/crop_box.h>
+#include <pcl/filters/random_sample.h>   // Hitch Sensor Dome: GICP warm-start
 #include <pcl/common/transforms.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -375,11 +376,48 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->gicp.setRotationEpsilon(this->gicp_rotation_epsilon_);
   this->gicp.setDebugPrint(this->debug_lm_print_);
 
-  // Set target (map)
+  // Set target (map). setInputTarget() builds the nanoflann kd-tree
+  // synchronously; calculateTargetCovariances() then iterates it once
+  // to pre-compute per-target covariances. By the time the first scan
+  // arrives, the heavyweight target-side work is already done.
   this->gicp.setInputTarget(this->map_cloud);
   if (!this->gicp.calculateTargetCovariances()) {
     RCLCPP_ERROR(this->get_logger(), "Failed to calculate map covariances! GICP will not work correctly.");
     throw std::runtime_error("Failed to calculate target covariances");
+  }
+
+  // ---- Hitch Sensor Dome — GICP warm-start ----
+  // Even with target side prebuilt, the FIRST real align call still
+  // pays first-touch overhead: OpenMP thread-pool spin-up, Eigen
+  // kernel JIT warm-up, source-side kd-tree allocation, page-faults
+  // through map memory loaded from disk. Run one dummy align here to
+  // burn those costs at startup instead of on the first real scan.
+  // The dummy source is ~200 points sampled randomly from the map;
+  // enough to exercise the parallel-for and NN paths without taking
+  // measurable time. Log the wall time so operators can see the
+  // warm-up landed cleanly before scans start arriving.
+  {
+    auto dummy_src = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::RandomSample<PointType> rs;
+    rs.setInputCloud(this->map_cloud);
+    rs.setSample(std::min<unsigned int>(200, this->map_cloud->size()));
+    rs.filter(*dummy_src);
+
+    if (!dummy_src->empty()) {
+      this->gicp.setInputSource(dummy_src);
+      pcl::PointCloud<PointType> aligned_scratch;
+      const auto t0 = std::chrono::steady_clock::now();
+      this->gicp.align(aligned_scratch, Eigen::Matrix4f::Identity());
+      const auto t1 = std::chrono::steady_clock::now();
+      const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      RCLCPP_INFO(this->get_logger(),
+                  "GICP warm-start: dummy align done in %.1f ms over %zu pts "
+                  "— first real scan will run at steady-state speed.",
+                  ms, dummy_src->size());
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "GICP warm-start: map is empty; skipping warm-up align.");
+    }
   }
 
   // Setup subscribers
@@ -931,6 +969,30 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("odom/geo/Kz_damping", this->geo_Kz_damping_);
   this->get_parameter("odom/geo/abias_max", this->geo_abias_max_);
   this->get_parameter("odom/geo/gbias_max", this->geo_gbias_max_);
+
+  // Hitch Sensor Dome — yaw-rate-adaptive observer-gain attenuation.
+  // See updateState() for the math; see the YAML for tuning guidance.
+  // Defaults assume a race / track vehicle: full Kp/Kq below 0.5 rad/s
+  // (~29°/s), gains scaled down to 25% at 1.5 rad/s (~86°/s) and above.
+  this->declare_parameter<bool>(  "odom/geo/yawrate_attenuation/enable",          true);
+  this->declare_parameter<double>("odom/geo/yawrate_attenuation/threshold_rad_s", 0.5);
+  this->declare_parameter<double>("odom/geo/yawrate_attenuation/saturation_rad_s", 1.5);
+  this->declare_parameter<double>("odom/geo/yawrate_attenuation/min_gain_scale",  0.25);
+  this->get_parameter("odom/geo/yawrate_attenuation/enable",
+                      this->yawrate_attenuation_enabled_);
+  this->get_parameter("odom/geo/yawrate_attenuation/threshold_rad_s",
+                      this->yawrate_attenuation_threshold_);
+  this->get_parameter("odom/geo/yawrate_attenuation/saturation_rad_s",
+                      this->yawrate_attenuation_saturation_);
+  this->get_parameter("odom/geo/yawrate_attenuation/min_gain_scale",
+                      this->yawrate_attenuation_min_scale_);
+  RCLCPP_INFO(this->get_logger(),
+              "Yaw-rate gain attenuation: %s "
+              "(threshold=%.2f rad/s, saturation=%.2f rad/s, min_scale=%.2f)",
+              this->yawrate_attenuation_enabled_ ? "ENABLED" : "disabled",
+              this->yawrate_attenuation_threshold_,
+              this->yawrate_attenuation_saturation_,
+              this->yawrate_attenuation_min_scale_);
 
   // Debug parameters
   this->declare_parameter<bool>("localization/debug/enable_pub", true);
@@ -3626,9 +3688,45 @@ void gicp_localization::LocalizationNode::updateState() {
   this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
   this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
 
+  // Hitch Sensor Dome — yaw-rate-adaptive gain attenuation.
+  // At high yaw rate (corner entries) GICP is most likely to slide along
+  // an unconstrained axis; meanwhile the IMU integration is at its most
+  // informative (gyro doing real work). Scale Kp and Kq down so the
+  // IMU prediction takes precedence during the transient. Kv and bias
+  // gains are intentionally untouched — the bias estimator still
+  // benefits from the (smaller) corrections.
+  //
+  // Scale shape:
+  //   |ω_z| ≤ threshold       → scale = 1.0  (no attenuation)
+  //   |ω_z| ≥ saturation      → scale = min_scale
+  //   threshold < |ω_z| < sat → linear interpolation
+  float gain_scale = 1.0f;
+  if (this->yawrate_attenuation_enabled_) {
+    const float yaw_rate = std::abs(this->state.v.ang.b[2]);
+    const float lo = static_cast<float>(this->yawrate_attenuation_threshold_);
+    const float hi = static_cast<float>(this->yawrate_attenuation_saturation_);
+    const float min_s = static_cast<float>(this->yawrate_attenuation_min_scale_);
+    if (yaw_rate <= lo) {
+      gain_scale = 1.0f;
+    } else if (yaw_rate >= hi) {
+      gain_scale = min_s;
+    } else {
+      const float t = (yaw_rate - lo) / std::max(hi - lo, 1e-6f);
+      gain_scale = 1.0f - t * (1.0f - min_s);
+    }
+    if (gain_scale < 0.99f) {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "Observer: yaw-rate attenuation active — |ω_z|=%.2f rad/s, "
+        "Kp/Kq scale=%.2f",
+        yaw_rate, gain_scale);
+    }
+  }
+  const float Kp_eff = static_cast<float>(this->geo_Kp_) * gain_scale;
+  const float Kq_eff = static_cast<float>(this->geo_Kq_) * gain_scale;
+
   // Proportional observer correction (matching upstream DLIO design)
-  // Position correction
-  this->state.p += dt * this->geo_Kp_ * err;
+  // Position correction (gain-attenuated at high yaw rate)
+  this->state.p += dt * Kp_eff * err;
 
   // Velocity correction
   this->state.v.lin.w += dt * this->geo_Kv_ * err;
@@ -3638,9 +3736,9 @@ void gicp_localization::LocalizationNode::updateState() {
   // causes vel_z to drift. Apply exponential decay each update.
   this->state.v.lin.w[2] *= (1.0f - dt * this->geo_Kz_damping_);
 
-  // Orientation correction
-  this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
-  this->state.q.vec() += dt * this->geo_Kq_ * qcorr.vec();
+  // Orientation correction (gain-attenuated at high yaw rate)
+  this->state.q.w() += dt * Kq_eff * qcorr.w();
+  this->state.q.vec() += dt * Kq_eff * qcorr.vec();
   this->state.q.normalize();
 
   // Validate updated state

@@ -398,6 +398,18 @@ private:
   double geo_Kq_;
   double geo_Kab_;
   double geo_Kgb_;
+
+  // Hitch Sensor Dome — yaw-rate-adaptive observer gains.
+  // At high yaw rate (corner entries) GICP is most likely to slide
+  // along an unconstrained axis, while the IMU integration is at its
+  // most informative (gyro is doing real work). Attenuate Kp and Kq
+  // so the IMU prediction takes precedence during the transient.
+  // Velocity / bias gains are left alone — the bias estimator still
+  // needs to consume the (smaller) corrections.
+  bool   yawrate_attenuation_enabled_;
+  double yawrate_attenuation_threshold_;   // rad/s — below this, no attenuation
+  double yawrate_attenuation_saturation_;  // rad/s — above this, gains hit min_gain_scale
+  double yawrate_attenuation_min_scale_;   // floor on the multiplicative scale
   double geo_Kz_damping_;
   double geo_abias_max_;
   double geo_gbias_max_;

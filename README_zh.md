@@ -105,6 +105,13 @@ GLIM_plusplus/                LiDAR-Inertial 建图 (koide3/glim 的 fork)
   glim_ext/               上游扩展模块 (GNSS 先验已重新启用)
   glim_ros2/              上游 ROS 2 封装 (未改动)
   README.md               Fork 声明、集成说明、多圈修复
+
+GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
+  cfg/                    localization.yaml (race) + localization_safe.yaml
+  launch/                 localization_with_tf.launch.py + systemd 单元
+  scripts/                merge_glim_submaps.py + 诊断工具
+  include/, src/          nano_gicp + 定位器 + nav_sat_gated_odom
+  README.md               Fork 声明、双模式设计、race vs safe
 ```
 
 ## 快速开始
@@ -216,6 +223,44 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
 ```
+
+## 定位 (GICP++)
+
+针对在线 scan-to-map 定位（对预建 PCD 地图），本项目搭载 **GICP++**，一个对 **DLIO**（*Direct LiDAR-Inertial Odometry*，UCLA VECTR Lab 的 Kenny J. Chen / Ryan Nemiroff / Brett T. Lopez，上游 <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>）做了深度修改的 fork。本 fork 位于 [`GICP_plusplus/`](GICP_plusplus/)（双加号意在提示这并非原版 DLIO）。GICP++ 在启动时可选 **两种运行模式**：
+
+- **🏁 赛车模式（默认）** —— 只用前置 Robin W、40 m 裁剪、32 次 GICP 迭代、yaw-rate 自适应 Kp/Kq 衰减、所有 debug topic 关闭。目标是预建赛道地图上为 200 Hz 控制环提供 ~3–5 ms IMU 到位姿延迟。
+- **🛡 安全模式** —— 三台 Robin W 全部拼接、100 m 裁剪、上游严格的 128 次 GICP 迭代、更紧的收敛阈值、所有 debug topic 开启。目标是 CPU 富余、延迟非瓶颈时获得最大传感器覆盖与诊断可见性。
+
+相对上游 VECTR DLIO 的项目改进：
+
+1. **针对 Robin W + Atlas Duo 重定向** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶；删除了 AV-24 / Luminar 相关代码。
+2. **RTK 门控的 INS 里程计转发器**（[`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc)）—— 仅在 `/gps/fix` 处于 STATUS_GBAS_FIX 且协方差为厘米级时才把 `/odom` 转发到 `/odom_rtk_only`，弥补上游"无条件信任 gt_odom"的安全缺口。
+3. **双模式设计** —— `cfg/localization.yaml`（race 基线）+ `cfg/localization_safe.yaml`（覆盖）通过 launch 文件的 `mode:=race|safe|custom` 参数分层，配套两个互斥的 systemd 单元用于生产部署。
+4. **GLIM++ 地图桥接** —— `scripts/merge_glim_submaps.py` 遍历 `<dump_path>/NNNNNN/` 子地图目录，应用每个 `T_world_origin`，拼接成一个 PCD 并应用赛车模式滤波（Z-clip、中心线遮罩、离群点剔除、voxel 降采样）。消除 offline_viewer GUI 步骤。
+5. **GICP 预热** —— 启动时即急切构建 kd-tree + 一次 dummy align，把 OpenMP 线程池启动、Eigen JIT、source 端 kd-tree 分配等首次接触开销在第一次真实扫描之前烧掉。
+6. **Yaw-rate 自适应观测器** —— 几何观测器中的 `Kp` 与 `Kq` 在车体系 yaw rate 较高时自动衰减，让 IMU 预测在转弯入弯（此时 GICP 最易滑动）瞬间占主导。
+7. **IMU 标定运动方差门** —— 若车辆运动（σ‖a‖ > 0.10 m/s²），拒绝静止偏置标定窗口；回退到 gt_odom 路径的 RTK 驱动标定。
+8. **操作员侧健康检查** —— 若 10 秒后仍未收到 `gt_odom`，发出粗体黄色一次性警告；dead-reckoning 阶段输出节流诊断日志。
+9. **base_link / imu_link 拆分** —— 即使 GLIM++ 把地图锚定在 `imu_link`，定位器仍把位姿报告在 `base_link`（可通过 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 按车辆配置）。同一份地图可跨多个车辆框架使用。
+
+```bash
+# 1. 先用 GLIM++ 离线建图（见上面"建图"一节），再把 submap 合并成单一 PCD：
+python3 GICP_plusplus/scripts/merge_glim_submaps.py \
+    /tmp/dump  /tmp/race_map.pcd \
+    --voxel-res 0.4 --outlier-k 12 --outlier-std 2.0 \
+    --z-min -2.0 --z-max 5.0 --copy-utm
+
+# 2. 在赛车模式（默认）下启动定位器：
+ros2 launch gicp_localization localization_with_tf.launch.py \
+    map_path:=/tmp/race_map.pcd
+
+# 或安全模式（3× LiDAR、全覆盖、全 debug）：
+ros2 launch gicp_localization localization_with_tf.launch.py \
+    mode:=safe \
+    map_path:=/tmp/race_map.pcd
+```
+
+完整的逐文件变更日志、race vs safe 双模式参数对比表、systemd 单元安装、延迟预算分解参见 [`GICP_plusplus/README.md`](GICP_plusplus/README.md)。
 
 ## 坐标系 (ROS REP 103)
 

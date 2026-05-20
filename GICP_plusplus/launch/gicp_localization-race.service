@@ -1,0 +1,98 @@
+# =============================================================================
+# gicp_localization-race.service
+#
+# systemd template for running gicp_localization with RT priority and
+# pinned CPU cores, intended for race-mode deployment on a perception PC.
+#
+# What it does
+# ------------
+#   - Pins the localizer to CPUs 4-7 (CPUAffinity=4-7). Adjust if your
+#     perception PC has a different core layout; the rule of thumb is:
+#     leave cores 0-1 for kernel + IRQ handlers, 2-3 for the sensor
+#     drivers (Robin W, Atlas Duo, cameras), and dedicate 4-7 to the
+#     localizer + IMU integration.
+#   - Runs with SCHED_FIFO at priority 50 (CPUSchedulingPolicy=fifo +
+#     CPUSchedulingPriority=50). 50 sits below the kernel's IRQ
+#     threads (~80) and above the ROS-typical default (~0), which is
+#     what you want.
+#   - Disables OOM killing (OOMScoreAdjust=-1000).
+#
+# What it does NOT do
+# -------------------
+#   - It does NOT run the ROS 2 stack as systemd would for a generic
+#     daemon. ROS 2 nodes typically need an interactive shell with
+#     /opt/ros/<distro>/setup.bash sourced. The unit therefore launches
+#     a wrapper that sources the setup and then exec's ros2 launch.
+#   - It does NOT enforce PREEMPT_RT kernel use. RT priority on a
+#     stock kernel still helps with jitter; PREEMPT_RT is a further
+#     improvement that's worth installing but not required by this
+#     unit.
+#
+# How to install
+# --------------
+#   1. Edit User= below to match your account.
+#   2. Edit the WorkingDirectory + ExecStart to point at your colcon
+#      workspace and (optionally) the race-mode params overlay.
+#   3. Copy the file:
+#        sudo cp gicp_localization-race.service \
+#                /etc/systemd/system/
+#   4. Reload + enable + start:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable gicp_localization-race.service
+#        sudo systemctl start  gicp_localization-race.service
+#   5. Watch the log:
+#        sudo journalctl -fu gicp_localization-race.service
+#
+# Required kernel permissions for SCHED_FIFO
+# ------------------------------------------
+# Non-root processes need CAP_SYS_NICE or RLIMIT_RTPRIO. Either:
+#   - Run the unit as root (User=root above; not recommended), OR
+#   - Grant the user's processes RLIMIT_RTPRIO via /etc/security/limits.d:
+#        <user> hard rtprio 99
+#        <user> soft rtprio 50
+#     and re-login (or set AmbientCapabilities=CAP_SYS_NICE in the unit).
+# =============================================================================
+
+[Unit]
+Description=GICP localization (RACE mode — RT priority, front-only, low latency)
+Wants=network-online.target
+After=network-online.target
+
+# Mutual exclusion with the safe-mode unit: never both at once.
+Conflicts=gicp_localization-safe.service
+
+[Service]
+Type=simple
+User=hitch
+Group=hitch
+WorkingDirectory=/home/hitch/ros2_ws
+
+# Source ROS 2 + the colcon workspace, then launch with mode:=race
+# (the default — explicit here for clarity). The launch file uses the
+# base cfg/localization.yaml with no overlay.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && \
+                       source /home/hitch/ros2_ws/install/setup.bash && \
+                       exec ros2 launch gicp_localization \
+                            localization_with_tf.launch.py \
+                            mode:=race \
+                            rviz:=false \
+                            run_rtk_gate:=true'
+
+# --- Performance knobs ---
+CPUAffinity=4 5 6 7
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+Nice=-15
+
+# Prevent the kernel from killing this under memory pressure.
+OOMScoreAdjust=-1000
+
+# Optional ambient capability so non-root user can SCHED_FIFO.
+# Comment out if you set RLIMIT_RTPRIO via /etc/security/limits.d/
+AmbientCapabilities=CAP_SYS_NICE
+
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

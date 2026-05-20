@@ -106,6 +106,13 @@ GLIM_plusplus/                LiDAR-Inertial mapping (fork of koide3/glim)
   glim_ext/               Upstream extensions (GNSS prior re-enabled)
   glim_ros2/              Upstream ROS 2 wrapper (unmodified)
   README.md               Fork notice, integration, multi-lap fix
+
+GICP_plusplus/                LiDAR-only localization (fork of vectr-ucla/DLIO)
+  cfg/                    localization.yaml (race) + localization_safe.yaml
+  launch/                 localization_with_tf.launch.py + systemd units
+  scripts/                merge_glim_submaps.py + diagnostic tooling
+  include/, src/          nano_gicp + localizer + nav_sat_gated_odom
+  README.md               Fork notice, two-mode design, race vs safe
 ```
 
 ## Quick Start
@@ -217,6 +224,45 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
 ```
+
+## Localization (GICP++)
+
+For online scan-to-map localization against a pre-built PCD, the project ships **GICP++**, a heavily modified fork of **DLIO** (*Direct LiDAR-Inertial Odometry* by Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez at UCLA's VECTR Lab, upstream at <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>). The fork lives at [`GICP_plusplus/`](GICP_plusplus/) (the double-plus signals it is *not* stock DLIO). GICP++ ships in **two operating modes** selectable at launch time:
+
+- **🏁 Race mode (default)** — front Robin W only, 40 m crop, 32 GICP iterations, yaw-rate-adaptive Kp/Kq attenuation, all debug topics off. Targets ~3–5 ms IMU-to-pose latency for a downstream 200 Hz controller on a pre-built race-track map.
+- **🛡 Safe mode** — all three Robin W LiDARs concatenated, 100 m crop, upstream-strict 128 GICP iterations, tighter convergence epsilons, all debug topics on. Targets maximum sensor coverage + diagnostic visibility when CPU headroom is plentiful and latency isn't the bottleneck.
+
+Key project upgrades vs. the upstream VECTR DLIO:
+
+1. **Robin W + Atlas Duo retargeting** — topic / frame / URDF defaults match the Hitch dome out of the box; AV-24 / Luminar specifics removed.
+2. **RTK-gated INS odometry republisher** ([`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc)) — exposes `/odom_rtk_only` only when `/gps/fix` shows STATUS_GBAS_FIX with cm-grade covariance, closing the "trust whatever arrives on gt_odom" gap that upstream leaves to the operator.
+3. **Two-mode design** — `cfg/localization.yaml` (race base) + `cfg/localization_safe.yaml` (overlay) layered by the launch file's `mode:=race|safe|custom` arg, with paired mutually-exclusive systemd units for production deployment.
+4. **GLIM++ map bridge** — `scripts/merge_glim_submaps.py` walks `<dump_path>/NNNNNN/` submap directories, applies each `T_world_origin`, concatenates and writes a single PCD with race-mode filters (Z-clip, centerline mask, outlier removal, voxel downsample). Eliminates the offline_viewer GUI step.
+5. **GICP warm-start** — eager kd-tree build at init + one dummy align to burn OpenMP thread-pool spin-up, Eigen JIT, and source-side kd-tree allocation before the first real scan.
+6. **Yaw-rate adaptive observer** — `Kp` and `Kq` in the geometric observer auto-attenuate at high body-frame yaw rate so the IMU prediction takes precedence through corner entries where GICP is most likely to slide.
+7. **Motion-variance gate on IMU calibration** — refuses the stationary-bias calibration window if the vehicle is moving (σ‖a‖ > 0.10 m/s²); falls back to RTK-driven calibration via the gt_odom path.
+8. **Operator-side health checks** — one-shot bold-yellow warning at 10 s if `gt_odom` never arrives; throttled diagnostic logs during dead-reckoning streaks.
+9. **base_link / imu_link split** — localizer reports pose in `base_link` (configurable per vehicle via [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)) even though GLIM++ builds the map in `imu_link`. Same map works across vehicles with different body frames.
+
+```bash
+# 1. Build a map offline with GLIM++ (see Mapping section above), then
+#    merge per-submap dumps into a single PCD:
+python3 GICP_plusplus/scripts/merge_glim_submaps.py \
+    /tmp/dump  /tmp/race_map.pcd \
+    --voxel-res 0.4 --outlier-k 12 --outlier-std 2.0 \
+    --z-min -2.0 --z-max 5.0 --copy-utm
+
+# 2. Run the localizer in race mode (default):
+ros2 launch gicp_localization localization_with_tf.launch.py \
+    map_path:=/tmp/race_map.pcd
+
+# Or safe mode (3× LiDARs, full coverage, all debug on):
+ros2 launch gicp_localization localization_with_tf.launch.py \
+    mode:=safe \
+    map_path:=/tmp/race_map.pcd
+```
+
+See [`GICP_plusplus/README.md`](GICP_plusplus/README.md) for the complete file-by-file changelog vs. upstream, side-by-side race vs. safe knob table, systemd unit installation, and latency budget breakdown.
 
 ## Coordinate System (ROS REP 103)
 

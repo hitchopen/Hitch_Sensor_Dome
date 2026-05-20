@@ -32,10 +32,10 @@ def generate_launch_description():
     imu_topic = LaunchConfiguration('imu_topic', default='/imu/data')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     # gt_odom is the RTK-quality-gated INS odometry. The nav_sat_gated_odom
-    # helper (under gicp_localization/scripts/) subscribes to the Atlas Duo's
-    # /odom and /gps/fix and republishes here only when RTK is fixed and
-    # covariance is cm-grade. Localizer treats any arriving message as
-    # RTK-fixed (matches the upstream module's contract).
+    # helper (built from GICP_plusplus/src/nav_sat_gated_odom.cc) subscribes
+    # to the Atlas Duo's /odom and /gps/fix and republishes here only when
+    # RTK is fixed and covariance is cm-grade. Localizer treats any
+    # arriving message as RTK-fixed (matches the upstream module's contract).
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/odom_rtk_only')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
@@ -84,6 +84,24 @@ def generate_launch_description():
         description='Path to PCD map file for localization (overrides '
                     'localization.yaml when non-empty). Use the PCD produced '
                     'by GLIM_plusplus offline mapping.')
+
+    # Hitch Sensor Dome — two-mode selector.
+    # race (default): front-only LiDAR, tight crop, fewer GICP iters,
+    #   yaw-rate Kp/Kq attenuation, debug publishers off. Tuned for
+    #   lowest latency on a pre-built race-track map.
+    # safe: 3× LiDAR concat, full 100 m crop, upstream GICP iter count,
+    #   tighter convergence, all debug topics on, no yaw-rate attenuation.
+    #   Tuned for maximum sensor coverage and robustness.
+    # custom: skips the mode overlay entirely; the base localization.yaml
+    #   plus any operator-supplied --params-file is what loads.
+    # The selected overlay file is layered AFTER cfg/localization.yaml in
+    # the parameter chain, so its entries override the race-mode defaults
+    # without touching the base file.
+    declare_mode_arg = DeclareLaunchArgument(
+        'mode', default_value='race',
+        description='Localization mode: "race" (front-only, low-latency), '
+                    '"safe" (3× LiDARs, max coverage, all debug on), or '
+                    '"custom" (no overlay; base YAML only). Default: race.')
 
     # Hitch Sensor Dome: RTK-gating republisher controls.
     declare_run_rtk_gate_arg = DeclareLaunchArgument(
@@ -157,11 +175,29 @@ def generate_launch_description():
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
-        params = [
-            localization_yaml_path,
-            {'localization/lidar_frame': child_frame_value},
-            {'localization/imu_only': LaunchConfiguration('imu_only')},
-        ]
+        mode_value = LaunchConfiguration('mode').perform(context).strip().lower()
+
+        params = [localization_yaml_path]
+
+        # Mode overlay: ros2's --params-file chain applies later files'
+        # values on top of earlier ones, so loading the overlay AFTER the
+        # base yaml lets the overlay's keys override.
+        if mode_value == 'safe':
+            overlay = PathJoinSubstitution(
+                [current_pkg, 'cfg', 'localization_safe.yaml']).perform(context)
+            params.append(overlay)
+            print(f"[gicp_localization launch] mode = SAFE — layering overlay: {overlay}")
+        elif mode_value == 'race':
+            print("[gicp_localization launch] mode = RACE — base localization.yaml (no overlay)")
+        elif mode_value == 'custom':
+            print("[gicp_localization launch] mode = CUSTOM — no overlay applied; "
+                  "pass your own --params-file with --ros-args")
+        else:
+            print(f"[gicp_localization launch] WARN: unknown mode '{mode_value}' "
+                  f"— falling back to RACE defaults")
+
+        params.append({'localization/lidar_frame': child_frame_value})
+        params.append({'localization/imu_only': LaunchConfiguration('imu_only')})
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
 
@@ -249,6 +285,7 @@ def generate_launch_description():
         declare_parent_frame_arg,
         declare_child_frame_arg,
         declare_map_path_arg,
+        declare_mode_arg,
         declare_run_rtk_gate_arg,
         declare_ins_odom_topic_arg,
         declare_ins_fix_topic_arg,

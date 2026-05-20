@@ -1,0 +1,75 @@
+# =============================================================================
+# gicp_localization-safe.service
+#
+# systemd unit for running gicp_localization in SAFE mode — 3× LiDAR
+# concatenation, full ~100 m sensing range, upstream-strict GICP
+# convergence, all debug topics on, no yaw-rate gain attenuation.
+#
+# Unlike the race-mode counterpart, safe mode imposes NO CPU affinity
+# and NO RT priority. The localizer is expected to use whatever cores
+# are available and run at default nice level. Safe mode trades
+# latency for coverage and diagnostic visibility.
+#
+# Pair with: cfg/localization.yaml + cfg/localization_safe.yaml
+# (the launch file layers the overlay automatically when mode:=safe).
+#
+# How to install
+# --------------
+#   1. Edit User= below to match your account.
+#   2. Edit WorkingDirectory + ExecStart to your colcon workspace.
+#   3. Install:
+#        sudo cp gicp_localization-safe.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now gicp_localization-safe.service
+#   4. Watch:
+#        sudo journalctl -fu gicp_localization-safe.service
+#
+# Switching between race and safe modes
+# -------------------------------------
+# These two units are mutually exclusive — start one OR the other, not
+# both. Switching is:
+#   sudo systemctl stop  gicp_localization-race.service
+#   sudo systemctl start gicp_localization-safe.service
+# (or vice versa).
+# =============================================================================
+
+[Unit]
+Description=GICP localization (SAFE mode — full sensor coverage, all debug on)
+Wants=network-online.target
+After=network-online.target
+
+# Mutual exclusion with the race-mode unit: never both at once.
+Conflicts=gicp_localization-race.service
+
+[Service]
+Type=simple
+User=hitch
+Group=hitch
+WorkingDirectory=/home/hitch/ros2_ws
+
+# Source ROS 2 + the colcon workspace, then launch with mode:=safe.
+# The launch file picks up cfg/localization_safe.yaml automatically.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && \
+                       source /home/hitch/ros2_ws/install/setup.bash && \
+                       exec ros2 launch gicp_localization \
+                            localization_with_tf.launch.py \
+                            mode:=safe \
+                            rviz:=false \
+                            run_rtk_gate:=true'
+
+# --- Performance: deliberately unrestricted ---
+# Safe mode is the diagnostic / robustness configuration; no CPU
+# affinity, no SCHED_FIFO. The kernel scheduler does its normal job.
+# No Nice= adjustment — the localizer competes with everything else
+# at default priority. If you find the host PC underpowered for safe
+# mode, the right answer is to either reduce GICP iterations (edit
+# cfg/localization_safe.yaml) or switch back to race mode.
+
+# Prevent the kernel from killing this under memory pressure.
+OOMScoreAdjust=-500
+
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

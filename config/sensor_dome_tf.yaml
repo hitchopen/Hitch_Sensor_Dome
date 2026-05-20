@@ -73,7 +73,7 @@ static_transforms:
   #   - GLIM_plusplus builds the map in the imu_link frame (origin
   #     at the Atlas Duo CoN at session start). That's the natural
   #     mapping frame because the IMU drives the integration.
-  #   - gicp_localization reports pose in base_link (ROS standard
+  #   - GICP_plusplus reports pose in base_link (ROS standard
   #     "robot body" frame). Most downstream consumers — controllers,
   #     planners, rviz robot models — expect pose in base_link.
   #   - The static imu_link → base_link transform here is the

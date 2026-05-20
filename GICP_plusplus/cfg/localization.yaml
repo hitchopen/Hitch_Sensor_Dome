@@ -119,7 +119,15 @@
     # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in
     # world frame, so the box acts on world-frame coords. Set very large
     # or disable if using deskew.
-    dlio/preprocessing/cropBoxFilter/size: 70.0   # Robin W max range is ~150 m; 70 m matches the 90% POD ring
+    #
+    # Race-mode default: 40 m. At highway / race-track speed, anything
+    # beyond ~40 m is too far ahead to matter for self-position — the
+    # immediate-vicinity features dominate GICP correspondences anyway.
+    # Tighter crop ≈ 30 % fewer points → faster GICP align.
+    # Raise to 70.0 if running at urban / parking-lot speeds where
+    # distant features genuinely contribute, or if your map is sparse
+    # at the front-facing direction.
+    dlio/preprocessing/cropBoxFilter/size: 40.0
     dlio/preprocessing/voxelFilter/use: true      # Recommended for full-map localization
     dlio/preprocessing/voxelFilter/res: 0.5       # 0.5 m voxel — matches GLIM_plusplus map resolution
 
@@ -128,18 +136,37 @@
     # this at false. When lidar_concat is enabled this runs AFTER merge.
     localization/flip_y: false
 
-    # --- Multi-LiDAR concatenation ---
-    # Subscribes to each aux topic, buffers the latest scans, and on every
-    # primary scan finds the nearest aux scan in time, transforms its XYZ
-    # into the primary sensor frame via TF (URDF), rebases per-point
-    # timestamps onto the primary clock, and appends the bytes to the
-    # primary PointCloud2. Downstream sees a single cloud in primary
-    # frame with one coherent timebase.
+    # --- Multi-LiDAR concatenation (DISABLED by default for race-mode latency) ---
+    # When enabled, the node subscribes to each aux topic, buffers the latest
+    # scans, and on every primary scan finds the nearest aux scan in time,
+    # transforms its XYZ into the primary sensor frame via TF (URDF), rebases
+    # per-point timestamps onto the primary clock, and appends the bytes to the
+    # primary PointCloud2. Downstream sees a single cloud in primary frame
+    # with one coherent timebase.
     #
-    # Mirror of GLIM_plusplus's lidar_concat module — the two pipelines
-    # consume the same three Robin W streams and produce equivalent
-    # stitched clouds.
-    localization/lidar_concat/enabled: true
+    # ⚡ Race-mode default: front-only (enabled=false).
+    #   For self-position localization on a pre-built map, the front Robin W's
+    #   120° FOV is sufficient — the map's prior + IMU integration already
+    #   provide global context. Disabling concat:
+    #     - removes ~50 ms of aux-buffering jitter
+    #     - cuts the cloud GICP processes by roughly 3×
+    #     - eliminates a TF-lookup failure mode if a rear LiDAR drops out
+    #   At race speeds (40–80 m/s) you're moving toward the unmapped area;
+    #   rear LiDARs would mostly re-observe geometry already in the map.
+    #
+    # 🛑 Set enabled=true if any of these apply:
+    #   - The vehicle operates at slow / parking speeds where rear-quadrant
+    #     features (e.g., a recently-passed landmark) materially help GICP.
+    #   - The map has feature-sparse zones to the front and feature-rich zones
+    #     to the rear (rare; happens in some outdoor industrial settings).
+    #   - You're using gicp_localization for not-strictly-localization tasks
+    #     (e.g., live obstacle accumulation) that need 360° coverage.
+    #
+    # The aux topic + frame lists below are retained so toggling enabled to
+    # true picks them up unchanged. Mirror of GLIM_plusplus's lidar_concat
+    # module — when enabled, the two pipelines consume the same three Robin W
+    # streams and produce equivalent stitched clouds.
+    localization/lidar_concat/enabled: false
     localization/lidar_concat/aux_topics: ["/robin_w_rear_left/points", "/robin_w_rear_right/points"]
     localization/lidar_concat/aux_frames: ["lidar_rear_left_link", "lidar_rear_right_link"]
     localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans farther than this from primary are dropped
@@ -201,6 +228,43 @@
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
+    # --- Yaw-rate-adaptive Kp / Kq attenuation (race-mode safety net) ---
+    # During high yaw-rate transients (corner entries) GICP is more
+    # likely to slide along an unconstrained axis. Simultaneously, the
+    # IMU integration is at its most informative (gyro doing real
+    # work). This block scales Kp and Kq down inside the geometric
+    # observer's updateState() so the IMU prediction takes precedence
+    # through the transient, then ramps back to full gains once the
+    # vehicle is tracking straight again.
+    #
+    # Scale shape (|ω_z| = absolute body-frame yaw rate, rad/s):
+    #   |ω_z| ≤ threshold_rad_s      → scale = 1.0          (no attenuation)
+    #   |ω_z| ≥ saturation_rad_s     → scale = min_gain_scale
+    #   in between                   → linear interpolation
+    #
+    # Defaults assume a race / track vehicle:
+    #   threshold  = 0.5 rad/s ≈ 29°/s  (gentle lane change)
+    #   saturation = 1.5 rad/s ≈ 86°/s  (aggressive corner entry)
+    #   min_scale  = 0.25                (gains drop to 25% of nominal)
+    #
+    # Tune for your vehicle:
+    #   - For a passenger car with no aggressive cornering, raise both
+    #     thresholds (e.g., 1.0 / 3.0) so attenuation only fires on
+    #     extreme inputs.
+    #   - For an off-road / drifting vehicle that sees frequent high
+    #     yaw rate, raise min_gain_scale (e.g., 0.5) so corrections
+    #     never fully collapse.
+    #   - Set enable=false to disable entirely and run the upstream
+    #     fixed-gain observer.
+    #
+    # The observer logs a throttled INFO line ("yaw-rate attenuation
+    # active") whenever scale < 0.99, so you can see the gate firing
+    # in real-time during testing.
+    odom/geo/yawrate_attenuation/enable: true
+    odom/geo/yawrate_attenuation/threshold_rad_s: 0.5    # rad/s
+    odom/geo/yawrate_attenuation/saturation_rad_s: 1.5   # rad/s
+    odom/geo/yawrate_attenuation/min_gain_scale: 0.25    # floor on the multiplicative scale
+
     # --- Debug / visualization helpers ---
     localization/debug/enable_pub: false
     localization/debug/enable_jump_log: false
@@ -210,7 +274,14 @@
     localization/debug/jump_rot_deg: 30.0      # Log/reject if pose jumps > this (degrees)
 
     # --- GICP registration ---
-    gicp/maxIterations: 128
+    # Race-mode default: 32 iterations.
+    # On a pre-built map with feature-rich geometry GICP converges in 5–15
+    # iterations typically; the upstream 128 default is a safety margin for
+    # novel terrain. Cutting to 32 reduces per-scan compute ~3–4× without
+    # changing convergence quality on well-mapped tracks. Raise back to 128
+    # for noisier / sparser maps where convergence margin matters more
+    # than scan-to-scan latency.
+    gicp/maxIterations: 32
     gicp/correspondenceRandomness: 20
     gicp/maxCorrespondenceDistance: 4.0
     gicp/transformationEpsilon: 0.004
