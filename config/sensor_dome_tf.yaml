@@ -60,6 +60,50 @@
 
 static_transforms:
 
+  # =============================================================
+  # Vehicle body frame: imu_link → base_link
+  #
+  # By default this is IDENTITY — base_link physically coincides
+  # with imu_link (Atlas Duo Center of Navigation). All sensor
+  # extrinsics below remain anchored to imu_link, so changing
+  # the imu→base_link offset does NOT invalidate any other
+  # transform or any previously built map.
+  #
+  # Why a separate base_link at all:
+  #   - GLIM_plusplus builds the map in the imu_link frame (origin
+  #     at the Atlas Duo CoN at session start). That's the natural
+  #     mapping frame because the IMU drives the integration.
+  #   - gicp_localization reports pose in base_link (ROS standard
+  #     "robot body" frame). Most downstream consumers — controllers,
+  #     planners, rviz robot models — expect pose in base_link.
+  #   - The static imu_link → base_link transform here is the
+  #     bridge between the two. Override the translation/rotation
+  #     to put base_link wherever your vehicle convention says
+  #     (chassis center, rear axle, etc) WITHOUT re-running
+  #     mapping — the map stays valid because it's still
+  #     anchored at imu_link.
+  #
+  # Examples for non-trivial vehicles:
+  #   - base_link at vehicle's rear axle, 1.2 m behind the dome:
+  #       translation: { x: -1.200, y: 0.000, z: -0.400 }
+  #   - base_link at vehicle's geometric center, 0.6 m below dome:
+  #       translation: { x: -0.400, y: 0.000, z: -0.600 }
+  #
+  # If the vehicle's body axis differs from the dome's axis (e.g.,
+  # the dome is mounted yaw-rotated to fit the roof), include a
+  # rotation here. Default identity assumes dome axes == body axes.
+  - frame_id: "imu_link"
+    child_frame_id: "base_link"
+    translation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+    rotation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+      w:  1.000000
+
   # --- LiDAR: Front (Side 1, 0°) ---
   # Faces +X (forward). No rotation relative to IMU frame.
   - frame_id: "imu_link"
@@ -272,6 +316,7 @@ static_transforms:
 #
 # Sensor                       X (m)     Y (m)     Z (m)    Yaw (°)
 # -------------------------  --------  --------  --------  --------
+# base_link                   0.0000    0.0000    0.0000      0   (identity — override per vehicle)
 # lidar_front                 0.0900    0.0000    0.1415      0
 # lidar_rear_left            -0.0450    0.0779    0.1415    120
 # lidar_rear_right           -0.0450   -0.0779    0.1415    240

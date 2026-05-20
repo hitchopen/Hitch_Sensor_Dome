@@ -105,12 +105,31 @@ All parameters live in [`cfg/localization.yaml`](cfg/localization.yaml). The YAM
 
 ```yaml
 localization/map_frame:   "map"
-localization/base_frame:  "imu_link"          # Atlas Duo CoN
-localization/imu_frame:   "imu_link"          # IMU link in URDF
+localization/base_frame:  "base_link"         # Vehicle body frame (overridable)
+localization/imu_frame:   "imu_link"          # Atlas Duo CoN — fixed by hardware
 localization/lidar_frame: "lidar_front_link"  # Primary Robin W (front)
 ```
 
-These all reference links in `sensor_dome.urdf`, which is in turn generated from `config/sensor_dome_tf.yaml`. If you ever rename frames there, mirror the changes here.
+These all reference links in `sensor_dome.urdf`, which is in turn generated from `config/sensor_dome_tf.yaml`.
+
+**Mapping vs. localization frames.** The map produced by GLIM_plusplus is anchored at `imu_link` (the Atlas Duo Center of Navigation at session start). This localization node reports pose in `base_link` — the ROS standard "robot body" frame that downstream consumers (controllers, planners, RViz robot models) expect. The two are bridged by a static `imu_link → base_link` transform in `config/sensor_dome_tf.yaml`. By default it's identity (`base_link` physically coincident with `imu_link`), so a fresh Hitch dome install can ignore the distinction.
+
+**Configuring base_link for a non-trivial vehicle.** Edit the `imu_link → base_link` entry in `config/sensor_dome_tf.yaml` and regenerate the URDF:
+
+```yaml
+# Example: vehicle body frame at rear axle, 1.2 m behind the dome,
+# 0.4 m below the dome's mounting plane.
+- frame_id: "imu_link"
+  child_frame_id: "base_link"
+  translation: { x: -1.200, y: 0.000, z: -0.400 }
+  rotation:    { x: 0.000, y: 0.000, z: 0.000, w: 1.000 }
+```
+
+```bash
+cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
+```
+
+After regenerating, the localizer's `localized_pose` / `localized_odom` outputs land in the new `base_link` frame on the next launch. **The map itself does not need to be rebuilt** — it stays anchored at `imu_link`, and the localizer applies the new `T_base_imu` at publish time. This is the whole point of routing the body-frame translation through TF rather than baking it into the map.
 
 ### GICP rejection gates
 

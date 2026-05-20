@@ -139,7 +139,7 @@ sudo python3 recording/sensor_recorder.py
 针对 SLAM 与 3D 建图，本项目搭载 **GLIM++**，一个对 **GLIM** 做了深度修改的 fork —— 上游 *Graph-based LiDAR-Inertial Mapping* 由 AIST 的 Kenji Koide 等人开发，仓库地址 <https://github.com/koide3/glim>。本 fork 位于 [`GLIM_plusplus/`](GLIM_plusplus/)（双加号意在提示这并非原版 GLIM）。在高层视角下，GLIM++ 与上游的差异分为八个类别：
 
 1. **传感器适配** —— 把 topic、frame、字段名从此前的 AV-24 / Luminar 部署切换到 Hitch Sensor Dome（3× Robin W + Atlas Duo + 4× RouteCAM）。
-2. **车辆无关主体坐标系** —— `base_frame_id = imu_link`，地图围绕 Atlas Duo 导航中心建立，可跨车辆平台复用。
+2. **车辆无关主体坐标系** —— GLIM++ 的地图锚定在 `imu_link`（Atlas Duo 导航中心），可跨车辆平台复用。下游定位节点把位姿报告在 `base_link`（ROS 标准车体坐标系）下，由 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中的 `imu_link → base_link` 静态变换桥接 —— 默认 identity，按车辆需要重写（后轴、底盘几何中心等），无需重新建图。
 3. **户外 / 车辆尺度调参** —— 24 项参数变更（放宽 IMU 噪声、增大 voxel、加长初始化窗口、提高 sub-mapping 密度），针对高速公路 / 赛道 / 车辆机动场景。
 4. **多圈回环修复** —— 拓宽 VGICP 收敛域、放宽隐式回环阈值、提升 GNSS z 先验权重，防止经典的"第二圈轨迹翘向天空"现象。
 5. **C++ 重写初始化** —— 移除"由加速度计估计重力"路径；优化器现在必须由外部 INS 位姿启动。这使得从运动状态开始的录制（中途重启、赛道重放、被截过的 bag）也能正常使用。

@@ -2,6 +2,12 @@
 <robot name="sensor_dome">
   <!-- Auto-generated from config/sensor_dome_tf.yaml — DO NOT EDIT BY HAND. Re-run GLIM/config/generate_sensor_dome_urdf.py to regenerate.-->
   <link name="imu_link"/>
+  <link name="base_link"/>
+  <joint name="imu_to_base_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="base_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
   <link name="lidar_front_link"/>
   <joint name="imu_to_lidar_front_link" type="fixed">
     <parent link="imu_link"/>

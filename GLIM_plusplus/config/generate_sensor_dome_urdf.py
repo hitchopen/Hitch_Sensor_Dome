@@ -13,13 +13,23 @@
 # sensor frame in the YAML:
 #
 #     imu_link
+#       ├── base_link               (identity by default; vehicle body
+#       │                            frame for downstream consumers)
 #       ├── lidar_front_link        (yaw   0°)
 #       ├── lidar_rear_left_link    (yaw 120°)
 #       ├── lidar_rear_right_link   (yaw 240°)
 #       ├── cam_front_right_link
 #       ├── cam_front_left_link
 #       ├── cam_rear_left_link
-#       └── cam_rear_right_link
+#       ├── cam_rear_right_link
+#       ├── gnss_antenna_primary_link
+#       └── gnss_antenna_secondary_link (optional)
+#
+# Note that base_link is a CHILD of imu_link here (not the URDF root
+# convention). This is intentional: the map is anchored at imu_link
+# at session start (GLIM_plusplus), and base_link is positioned
+# relative to imu_link via the YAML so the operator can override
+# the vehicle body frame without invalidating the map.
 #
 # GLIM consumes this file via the urdf_path entries in config_sensors.json
 # (T_lidar_imu) and the lidar_concat block (multi-LiDAR primary + aux).

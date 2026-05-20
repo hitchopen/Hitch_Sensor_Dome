@@ -24,9 +24,20 @@
     localization/utm_frame: "utm"
 
     # --- Frame IDs (match sensor_dome_tf.yaml / sensor_dome.urdf) ---
+    #
+    # The map (built by GLIM_plusplus) is anchored at imu_link — the
+    # Atlas Duo Center of Navigation. Localization output is reported
+    # in base_link — the standard ROS body frame for downstream
+    # consumers (controllers, planners, rviz). The static
+    # imu_link → base_link transform in sensor_dome_tf.yaml is what
+    # bridges the two; by default it's identity (base_link physically
+    # coincident with imu_link). Override the YAML entry to put
+    # base_link wherever vehicle convention says (rear axle, chassis
+    # center, etc.) — the map stays valid because it's still
+    # anchored at imu_link.
     localization/map_frame: "map"
-    localization/base_frame: "imu_link"           # Atlas Duo CoN
-    localization/imu_frame: "imu_link"            # IMU link in URDF
+    localization/base_frame: "base_link"          # Vehicle body frame (overridable)
+    localization/imu_frame: "imu_link"            # Atlas Duo CoN — fixed by hardware
     localization/lidar_frame: "lidar_front_link"  # Primary Robin W (front)
 
     # Map downsampling for GICP (smaller = more accurate but slower).
