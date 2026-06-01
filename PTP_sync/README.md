@@ -238,6 +238,50 @@ Check your NIC's capability with `ethtool -T <interface>` — script 2 does this
 
 Most Intel NICs (I210, I225, X550, X710) support hardware timestamping. USB Ethernet adapters typically do not.
 
+### 2.7 One-time per-LiDAR network provisioning
+
+Every brand-new Robin W ships from Seyond with the same factory IP `172.168.1.10` (per [*Robin W1G User Manual* V2.2 §3.1](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf)) and the same UDP port. Running three units on the same Ethernet segment needs a unique IP **and** a unique UDP destination port per unit — the dome assigns `.10` / `.11` / `.12` and ports `8337` / `8338` / `8339`. This is purely network configuration (IPs + ports), so it lives here in Section 2; PTP enable comes later in Section 4.
+
+The provisioning is **one Robin W at a time**, by physical position. Because all three factory-state units share the same IP `172.168.1.10`, only one can be on the wire at a time during the renumber step.
+
+**Decide which physical unit is which position before you start.** The dome SCAD model defines three positions:
+
+| Position | Dome angle | Target IP | UDP port |
+|----------|------------|-----------|----------|
+| `front` | 0° (faces +X / forward) | `192.168.1.10` | `8337` |
+| `rear_left` | 120° (faces rear-left) | `192.168.1.11` | `8338` |
+| `rear_right` | 240° (faces rear-right) | `192.168.1.12` | `8339` |
+
+Easiest: **label the three units with masking tape (FRONT / REAR-LEFT / REAR-RIGHT) before you start**, then provision them in that order. If you'd rather choose based on physical condition (cleaner enclosure to the visible front, etc.), connect one at a time and read each unit's serial from `http://172.168.1.10/api/v1/static_info` before deciding.
+
+**Walk-through:**
+
+```bash
+# Attach Robin W #1 to the host's sensor NIC via Ethernet. The unit
+# will come up at the factory IP 172.168.1.10. Then:
+chmod +x provision_robin_w_multiunit.sh
+./provision_robin_w_multiunit.sh --position front
+
+# Power off / disconnect Robin W #1, attach Robin W #2:
+./provision_robin_w_multiunit.sh --position rear_left
+
+# And finally Robin W #3:
+./provision_robin_w_multiunit.sh --position rear_right
+```
+
+What the script does on each invocation:
+
+1. Adds a temporary `172.168.1.100/24` alias to the sensor NIC so the host can reach the factory-IP LiDAR (removed on exit).
+2. Discovers the attached unit (either at the factory IP `172.168.1.10` for a brand-new unit, or at the position's target IP for a re-run).
+3. Reads the LiDAR's serial number via `innovusion_lidar_util get_static_info`.
+4. Calls `set_network` to move the unit from `172.168.1.10` → `192.168.1.10` / `.11` / `.12`, reboots, waits ~25 s.
+5. Uploads the position-specific `PCS_ENV` (`RobinW_FW2835_Multiunit/RW_FW2835_robin_w_<position>_unicast.env`), reboots again.
+6. Appends or updates the unit's serial in [`RobinW_FW2835_Multiunit/serial_inventory.yaml`](RobinW_FW2835_Multiunit/serial_inventory.yaml) so the SN ↔ position map is preserved for spares / RMA tracking.
+
+The script is idempotent — re-running it against an already-provisioned LiDAR detects matching state and prints `[SKIP]`. It also refuses to overwrite a position whose inventory entry shows a different serial than the unit currently attached, catching the "I plugged in the wrong unit" mistake. If a Robin W has to be swapped (RMA, failure), delete that position's block in `serial_inventory.yaml` and re-run the script with the appropriate `--position`.
+
+After all three positions show up in `serial_inventory.yaml`, the network is fully configured and you're ready for Section 3 (INS-to-PC time sync) and Section 4 (LiDAR PTP enable + ROS 2 driver).
+
 ---
 
 ## Section 3: PTP Sync from INS to PC
@@ -339,18 +383,9 @@ sudo systemctl status gpsd chrony ptp4l-grandmaster phc2sys-grandmaster
 
 ## Section 4: PTP Sync from PC to LiDARs
 
-Configures the 3× Seyond Robin W LiDARs as PTP slaves of the grandmaster from Section 3, and installs the Seyond ROS 2 driver.
+Configures the 3× Seyond Robin W LiDARs as PTP slaves of the grandmaster from Section 3, and installs the Seyond ROS 2 driver. Assumes the **one-time network provisioning** in [§2.7](#27-one-time-per-lidar-network-provisioning) has already moved each Robin W from its factory IP `172.168.1.10` to its dome IP `192.168.1.10` / `.11` / `.12`. If `4_setup_lidar_ptp.sh` cannot ping the LiDARs at those addresses, run §2.7 first.
 
-### 4.1 One-time per-LiDAR provisioning (skip if already done)
-
-> **One-time per LiDAR — multi-unit provisioning.** Per Seyond's official [*Robin W1G LiDAR User Manual* V2.2 (2025-01-03)](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1, every Robin W ships from the factory with the same default IP **`172.168.1.10`** (netmask `255.255.255.0`, gateway `172.168.1.1`) and the same UDP destination port. The dome network runs on `192.168.1.0/24`, so **each LiDAR must be reset to a unique address inside `192.168.1.0/24`** — `192.168.1.10` / `.11` / `.12` per [`../config/network_config.yaml`](../config/network_config.yaml). Running three units on one network also requires a unique UDP destination port per unit, otherwise the host receives three streams on the same port and cannot tell them apart. Both changes (IP renumbering + per-unit UDP port) are handled by [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) — run it **once for each new LiDAR** (or once for the dome when all three are first assembled) to walk every unit from factory state to the per-position assignments documented in [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md). The script is idempotent — re-running it against already-provisioned LiDARs simply prints `[SKIP]` and exits. The provisioning files (`innovusion_lidar_util`, `automotive-master.cfg`, the three per-serial `PCS_ENV` files) are all in this folder; the host UDP receiver IP inside the `PCS_ENV` files is the project host IP `192.168.1.5` from `network_config.yaml`. Because the factory `172.168.1.0/24` subnet does not overlap with the project's `192.168.1.0/24`, the script auto-adds a temporary `172.168.1.100/24` IP alias to the sensor NIC for the duration of provisioning and removes it on exit. Script 4 below presumes provisioning has already happened — if it cannot reach the LiDARs at `192.168.1.10`/`.11`/`.12`, run the provisioning script first.
-
-```bash
-chmod +x provision_robin_w_multiunit.sh
-./provision_robin_w_multiunit.sh
-```
-
-### 4.2 Run the LiDAR PTP-sync script
+### 4.1 Run the LiDAR PTP-sync script
 
 ```bash
 chmod +x 4_setup_lidar_ptp.sh

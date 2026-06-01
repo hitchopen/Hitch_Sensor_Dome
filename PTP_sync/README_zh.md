@@ -238,6 +238,50 @@ ip link show
 
 大多数 Intel 网卡（I210、I225、X550、X710）支持硬件时间戳。USB 以太网适配器通常不支持。
 
+### 2.7 每台 LiDAR 的一次性网络配置
+
+每台全新出厂的 Robin W 都使用同一个出厂 IP `172.168.1.10`（见 [*Robin W1G User Manual* V2.2 §3.1](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf)）和同一个 UDP 端口。让三台跑在同一以太网段上需要为每台分配独立的 IP **以及** 独立的 UDP 目的端口 —— 穹顶分配为 `.10` / `.11` / `.12` 和端口 `8337` / `8338` / `8339`。这纯粹是网络配置（IP + 端口），所以归在第 2 节；PTP 启用要到第 4 节才做。
+
+配置过程**一次只接一台 Robin W**，按物理位置配。因为三台出厂态都共用 IP `172.168.1.10`，重新编号过程中线上同一时刻只能有一台。
+
+**先决定哪台物理单元对应哪个位置。** 穹顶 SCAD 模型定义三个位置：
+
+| 位置 | 穹顶角度 | 目标 IP | UDP 端口 |
+|------|--------|--------|---------|
+| `front` | 0°（朝 +X / 前） | `192.168.1.10` | `8337` |
+| `rear_left` | 120°（朝后左） | `192.168.1.11` | `8338` |
+| `rear_right` | 240°（朝后右） | `192.168.1.12` | `8339` |
+
+最简单的做法：**开始前用美纹胶带在三台 LiDAR 上贴 FRONT / REAR-LEFT / REAR-RIGHT**，然后按这个顺序逐一连接主机。如果你想根据物理状况选择（外壳更整洁的放在最显眼的前向位置等），那就先接一台、浏览 `http://172.168.1.10/api/v1/static_info` 读出序列号再决定。
+
+**操作流程：**
+
+```bash
+# 把 Robin W #1 通过以太网接到主机的传感器网卡。设备会以出厂 IP
+# 172.168.1.10 上线。然后：
+chmod +x provision_robin_w_multiunit.sh
+./provision_robin_w_multiunit.sh --position front
+
+# 给 Robin W #1 断电 / 拔线，接 Robin W #2：
+./provision_robin_w_multiunit.sh --position rear_left
+
+# 最后是 Robin W #3：
+./provision_robin_w_multiunit.sh --position rear_right
+```
+
+每次调用脚本会做：
+
+1. 在传感器网卡上临时加一个 `172.168.1.100/24` 别名，让主机能联系出厂 IP 的 LiDAR（退出时自动移除）。
+2. 发现已接入的设备（出厂态的全新单元在 `172.168.1.10`，已配置过的单元会在该位置的目标 IP）。
+3. 通过 `innovusion_lidar_util get_static_info` 读出 LiDAR 的序列号。
+4. 调用 `set_network` 把单元从 `172.168.1.10` 移到 `192.168.1.10` / `.11` / `.12`，重启，等待约 25 秒。
+5. 上传位置专用的 `PCS_ENV`（`RobinW_FW2835_Multiunit/RW_FW2835_robin_w_<位置>_unicast.env`），再次重启。
+6. 把这个单元的序列号写入或更新到 [`RobinW_FW2835_Multiunit/serial_inventory.yaml`](RobinW_FW2835_Multiunit/serial_inventory.yaml)，保留 SN ↔ 位置的对应关系以便维护与备件管理。
+
+脚本是幂等的 —— 对已经配置好的 LiDAR 再次运行会识别状态匹配并打印 `[SKIP]`。脚本还会拒绝覆盖：若 inventory 中记录的某个位置的序列号与当前接入的单元不同，脚本会停止并提示你确认 —— 这能在错误传播之前抓出「插错单元」的失误。如果某台 Robin W 需要更换（RMA、故障），删除 `serial_inventory.yaml` 中该位置的整段记录，然后用相应的 `--position` 重新运行脚本即可。
+
+当三个位置都在 `serial_inventory.yaml` 中有记录之后，网络配置就完整了，可以进入第 3 节（INS-to-PC 时间同步）和第 4 节（LiDAR PTP 启用 + ROS 2 驱动）。
+
 ---
 
 ## 第 3 节：INS 到 PC 的 PTP 同步
@@ -339,18 +383,9 @@ sudo systemctl status gpsd chrony ptp4l-grandmaster phc2sys-grandmaster
 
 ## 第 4 节：PC 到 LiDAR 的 PTP 同步
 
-把 3 台 Seyond Robin W 配置为第 3 节中 grandmaster 的 PTP slave，并安装 Seyond ROS 2 驱动。
+把 3 台 Seyond Robin W 配置为第 3 节中 grandmaster 的 PTP slave，并安装 Seyond ROS 2 驱动。假定 [§2.7](#27-每台-lidar-的一次性网络配置) 的一次性网络配置已经完成，把每台 Robin W 从工厂 IP `172.168.1.10` 改成穹顶 IP `192.168.1.10` / `.11` / `.12`。如果 `4_setup_lidar_ptp.sh` 在这些地址上 ping 不到 LiDAR，请先回到 §2.7 跑配置脚本。
 
-### 4.1 每台 LiDAR 一次性的配置（如已完成可跳过）
-
-> **每台 LiDAR 一次性的多机配置。** 根据 Seyond 官方 [*Robin W1G LiDAR User Manual* V2.2（2025-01-03）](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1，每台 Robin W 出厂时都使用同一个默认 IP **`172.168.1.10`**（子网掩码 `255.255.255.0`，网关 `172.168.1.1`）以及相同的 UDP 目的端口。本项目穹顶网络运行在 `192.168.1.0/24` 子网上，**因此每台 Seyond LiDAR 都必须被重置到 `192.168.1.0/24` 子网下的唯一地址** —— 按 [`../config/network_config.yaml`](../config/network_config.yaml) 分配为 `192.168.1.10` / `.11` / `.12`。要让三台一起跑在同一网络上，还必须为每台分配独立的 UDP 目的端口，否则主机会在同一端口上收到三路数据流而无法区分。两件事（IP 重新分配 + 每台独立 UDP 端口）都由 [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) 负责 —— 每台新 LiDAR（或整套穹顶首次组装时）运行一次即可，脚本会按 [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md) 的对应表把每台从工厂状态过渡到位置专属配置。脚本是幂等的 —— 对已配置好的 LiDAR 再次运行只会打印 `[SKIP]` 然后退出。配置所需的文件（`innovusion_lidar_util`、`automotive-master.cfg`、三个按序列号命名的 `PCS_ENV` 文件）都在本目录下；`PCS_ENV` 文件中的主机 UDP 接收 IP 已经设为 `network_config.yaml` 中的项目主机 IP `192.168.1.5`。由于出厂 `172.168.1.0/24` 与项目使用的 `192.168.1.0/24` 不在同一段，脚本会在配置期间为传感器网卡临时加一个 `172.168.1.100/24` 的 IP 别名，结束时自动移除。下面的第 4 节脚本假定配置脚本已经跑过 —— 如果它无法在 `192.168.1.10`/`.11`/`.12` ping 到 LiDAR，先运行配置脚本。
-
-```bash
-chmod +x provision_robin_w_multiunit.sh
-./provision_robin_w_multiunit.sh
-```
-
-### 4.2 运行 LiDAR PTP 同步脚本
+### 4.1 运行 LiDAR PTP 同步脚本
 
 ```bash
 chmod +x 4_setup_lidar_ptp.sh

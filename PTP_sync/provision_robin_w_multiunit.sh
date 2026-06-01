@@ -1,49 +1,70 @@
 #!/usr/bin/env bash
 # =============================================================
-# Robin W Multi-Unit Provisioning (run ONCE per LiDAR)
+# Robin W Per-Position Provisioning
+# (run ONCE per LiDAR, attaching one unit at a time)
 #
-# Walks each Seyond Robin W from factory state to project state:
+# WORKFLOW
+# --------
+# This script provisions ONE Robin W per invocation. You tell it
+# which dome position the currently-attached LiDAR should become,
+# and it walks that unit from factory state to the project's
+# per-position IP + UDP port.
 #
-#   factory IP (172.168.1.10)  ─┐
-#                               ├─→ set_network → reboot → upload
-#                               │   PCS_ENV with unit-specific UDP
-#                               │   port → verify
-#   final IPs per network_config.yaml (192.168.1.0/24)
-#       robin_w_front       .10
-#       robin_w_rear_left   .11
-#       robin_w_rear_right  .12
+#   Connect ONE Robin W via Ethernet (it ships at the factory IP
+#   172.168.1.10 per Seyond's Robin W1G User Manual V2.2 §3.1)
+#   ────►
+#   ./provision_robin_w_multiunit.sh --position front
+#   (script: discovers LiDAR → reads its serial number →
+#            set_network → reboot → upload position PCS_ENV →
+#            reboot → verify → append SN to inventory.yaml)
+#   ────►
+#   Power off / disconnect, attach the NEXT Robin W
+#   ────►
+#   ./provision_robin_w_multiunit.sh --position rear_left
+#   ────►
+#   ... and once more for --position rear_right.
 #
-# The script auto-adds a temporary 172.168.1.100/24 IP alias to the
-# sensor NIC so the host (on 192.168.1.5) can reach factory-state
-# LiDARs. Alias is removed on exit.
+# Why one-at-a-time: every brand-new Robin W ships with the
+# same factory IP (172.168.1.10). Two or more factory-state
+# units on the same Ethernet segment would collide. After this
+# script renumbers a unit to its dome IP, it stops colliding,
+# but during provisioning only ONE unit at the factory IP can
+# be on the wire at any time.
 #
-# This is the same procedure Seyond publishes for running three
-# Robin Ws on the same Ethernet segment (multi-unit unicast).
-# Two changes are required per LiDAR:
-#   1. Unique IP, so the host can address each unit individually.
-#   2. Unique UDP destination port, so the three point-cloud
-#      streams don't collide at the host receiver.
+# How to decide which physical LiDAR is which position:
+# the dome SCAD model in `3D files/sensor_dome.scad` defines:
+#   robin_w_front       → mounted at 0°,   IP .10, UDP 8337
+#   robin_w_rear_left   → mounted at 120°, IP .11, UDP 8338
+#   robin_w_rear_right  → mounted at 240°, IP .12, UDP 8339
+# Easiest workflow on a fresh build: label the three units
+# with masking tape (FRONT / REAR-LEFT / REAR-RIGHT) BEFORE
+# you start, then attach them to the host one at a time in
+# that order.
 #
-# Both are handled here. Run ONCE per LiDAR — re-running it on an
-# already-configured LiDAR is harmless (it detects the new IP and
-# skips), but the standard per-host setup (./4_setup_lidar_ptp.sh)
-# is what you run on every fresh OS install of the host PC.
+# After all three pass, RobinW_FW2835_Multiunit/serial_inventory.yaml
+# captures the SN-to-position map for traceability / spares
+# tracking. The file is generated; do not hand-edit.
 #
 # Files this script uses (all in PTP_sync/):
 #   innovusion_lidar_util                  Seyond CLI binary
-#   RobinW_FW2835_Multiunit/                Per-serial PCS_ENV files
-#       RW_FW2835_Allen_<serial>_unicast.env
+#   RobinW_FW2835_Multiunit/                Per-position PCS_ENV files
+#       RW_FW2835_robin_w_front_unicast.env       (port 8337)
+#       RW_FW2835_robin_w_rear_left_unicast.env   (port 8338)
+#       RW_FW2835_robin_w_rear_right_unicast.env  (port 8339)
+#   RobinW_FW2835_Multiunit/serial_inventory.yaml  (generated)
 #   ../config/network_config.yaml          Target IPs + host IP
 #
 # Usage:
 #   chmod +x provision_robin_w_multiunit.sh
-#   ./provision_robin_w_multiunit.sh             # provision all 3
-#   ./provision_robin_w_multiunit.sh --only front
-#   ./provision_robin_w_multiunit.sh --factory-ip 192.168.1.10
-#                                                # if not factory default
+#   ./provision_robin_w_multiunit.sh --position <front|rear_left|rear_right>
 #
-# Re-run is safe: a LiDAR already at its final IP with the right
-# PCS_ENV is skipped with [SKIP] and the script moves on.
+# Optional flags:
+#   --factory-ip 172.168.1.X    if the unit is no longer at the Seyond default
+#   --netmask    255.255.255.0  rarely needed
+#
+# Re-run safety: if the unit is already at its target IP and the
+# on-LiDAR PCS_ENV matches the local file, the script reports
+# [SKIP] and exits cleanly.
 # =============================================================
 
 set -euo pipefail
@@ -53,24 +74,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../config/load_network_config.sh"
 
 # ─── Defaults ────────────────────────────────────────────────
-# Per Seyond's official "Robin W1G LiDAR User Manual" V2.2 (2025-01-03), §3.1:
-#     The initial IP address of the LiDAR is 172.168.1.10.
-#     The initial subnet mask is 255.255.255.0.
-#     The initial gateway is 172.168.1.1.
-# Note that 172.168.1.0/24 is publicly-routable IP space (it is NOT
-# inside RFC 1918's 172.16.0.0/12 private block — that ends at 172.31.x.x).
-# The dome network runs on 192.168.1.0/24 (per network_config.yaml), so
-# this script's job is to move each LiDAR FROM the Seyond factory IP TO
-# its assigned 192.168.1.x address.
 FACTORY_IP="${FACTORY_IP:-172.168.1.10}"
 NETMASK="${NETMASK:-255.255.255.0}"
-ONLY=""                                    # filter: front / rear_left / rear_right
-SLEEP_AFTER_REBOOT="${SLEEP_AFTER_REBOOT:-25}"   # seconds — Robin W needs ~20 s
+POSITION=""
+SLEEP_AFTER_REBOOT="${SLEEP_AFTER_REBOOT:-25}"   # Robin W needs ~20 s
                                                   # to come back up after reboot
 
-# ─── Static unit table — keep in sync with
-# ─── RobinW_FW2835_Multiunit/README.md
-# Format: position|serial|target_ip|udp_port|pcs_env_filename
+ENV_DIR="$SCRIPT_DIR/RobinW_FW2835_Multiunit"
+INVENTORY="$ENV_DIR/serial_inventory.yaml"
+
+# ─── Position table — IP + UDP port per dome position ────────
+#
+# Position name maps to:
+#   - target_ip  (last octet of 192.168.1.0/24)
+#   - udp_port   (point cloud + control + status, see below)
+#   - pcs_env    (filename relative to ENV_DIR)
 #
 # UDP/TCP ports 8337-8339 chosen to avoid:
 #   - Apache Hadoop defaults: 8020 (HDFS NameNode IPC) and 8030 (YARN
@@ -79,25 +97,26 @@ SLEEP_AFTER_REBOOT="${SLEEP_AFTER_REBOOT:-25}"   # seconds — Robin W needs ~20
 #   - The heavily-trafficked 8000-8099 dev-server / HTTP-alt range
 #     (Python http.server, Django, Cypress, Jupyter, etc.).
 # 8337/8338 are IANA-registered to Konica Minolta PowerJet (printer
-# management — vanishingly unlikely to be running on a perception PC).
-# 8339 is unassigned.
-UNIT_TABLE=(
-  "front|533192400101|192.168.1.10|8337|RW_FW2835_Allen_533192400101_unicast.env"
-  "rear_left|533262400110|192.168.1.11|8338|RW_FW2835_Allen_533262400110_unicast.env"
-  "rear_right|533192400103|192.168.1.12|8339|RW_FW2835_Allen_533192400103_unicast.env"
+# management — vanishingly unlikely on a perception PC). 8339 is unassigned.
+#
+# Position table format: position|target_ip|udp_port|pcs_env_filename
+POSITION_TABLE=(
+  "front|192.168.1.10|8337|RW_FW2835_robin_w_front_unicast.env"
+  "rear_left|192.168.1.11|8338|RW_FW2835_robin_w_rear_left_unicast.env"
+  "rear_right|192.168.1.12|8339|RW_FW2835_robin_w_rear_right_unicast.env"
 )
 
 # ─── Parse args ──────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --only)         ONLY="$2"; shift 2 ;;
-        --only=*)       ONLY="${1#*=}"; shift ;;
+        --position)     POSITION="$2"; shift 2 ;;
+        --position=*)   POSITION="${1#*=}"; shift ;;
         --factory-ip)   FACTORY_IP="$2"; shift 2 ;;
         --factory-ip=*) FACTORY_IP="${1#*=}"; shift ;;
         --netmask)      NETMASK="$2"; shift 2 ;;
         --netmask=*)    NETMASK="${1#*=}"; shift ;;
         -h|--help)
-            sed -n '2,50p' "$0"; exit 0 ;;
+            sed -n '2,80p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $1 — use --help"; exit 1 ;;
     esac
 done
@@ -109,26 +128,38 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 skip()  { echo -e "\033[1;36m[SKIP]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 
+# ─── Validate --position ──────────────────────────────────────
+if [ -z "$POSITION" ]; then
+    fail "Missing required --position {front|rear_left|rear_right}. Run with --help for details."
+fi
+
+ROW=""
+for row in "${POSITION_TABLE[@]}"; do
+    IFS='|' read -r p _ _ _ <<< "$row"
+    [ "$p" = "$POSITION" ] && { ROW="$row"; break; }
+done
+if [ -z "$ROW" ]; then
+    fail "Unknown --position '$POSITION'. Must be one of: front, rear_left, rear_right."
+fi
+IFS='|' read -r POSITION TARGET_IP UDP_PORT ENV_FILE <<< "$ROW"
+ENV_PATH="$ENV_DIR/$ENV_FILE"
+
 # ─── Reachability fix: temporary IP alias on the sensor NIC ──
 #
-# Brand-new LiDARs are at Seyond's factory IP 172.168.1.10 (per the
-# Robin W1G User Manual §3.1). The dome host PC lives on the
-# 192.168.1.0/24 subnet (per network_config.yaml). The two subnets do
-# not overlap, so the host cannot reach a factory-state LiDAR without
+# Brand-new LiDARs are at Seyond's factory IP 172.168.1.10. The
+# dome host PC lives on 192.168.1.0/24. The two subnets do not
+# overlap, so the host cannot reach a factory-state LiDAR without
 # an IP in 172.168.1.0/24.
 #
-# We add a temporary alias 172.168.1.100/24 to the sensor NIC at the
-# start of provisioning, and remove it on exit. The alias coexists
-# with the host's 192.168.1.5/24 address (both are reachable at L2),
-# so post-provisioning pings to the new 192.168.1.X address also work
-# from the same script run.
-#
-# The alias is skipped if the host already has an address in
-# 172.168.1.0/24 (rare; only happens if you've manually pre-configured
-# this).
+# We add a temporary alias 172.168.1.100/24 to the sensor NIC at
+# the start of provisioning, and remove it on exit. The alias
+# coexists with the host's 192.168.1.5/24 address (both reachable
+# at L2), so post-provisioning pings to the new 192.168.1.X address
+# also work from the same script run.
 ALIAS_ADDED=0
-ALIAS_IP="${FACTORY_IP%.*}.100/24"   # e.g. 172.168.1.100/24
+ALIAS_IP="${FACTORY_IP%.*}.100/24"
 TARGET_IFACE="${NETCFG_ETH:-}"
+
 maybe_add_alias() {
     [ -z "$TARGET_IFACE" ] && { warn "host.interface unset in network_config.yaml — skipping alias"; return; }
     if ip -4 -o addr show dev "$TARGET_IFACE" 2>/dev/null | grep -q "${FACTORY_IP%.*}\."; then
@@ -155,22 +186,6 @@ cleanup_alias() {
 }
 trap cleanup_alias EXIT
 
-# Add the alias only if at least one LiDAR is expected to still be at
-# the factory IP. If all three are already provisioned (per the table
-# below), this is a no-op re-run and we skip the alias.
-NEED_ALIAS=0
-for row in "${UNIT_TABLE[@]}"; do
-    IFS='|' read -r _ _ target_ip _ _ <<< "$row"
-    if [ -n "$ONLY" ]; then
-        IFS='|' read -r position _ _ _ _ <<< "$row"
-        [ "$ONLY" != "$position" ] && continue
-    fi
-    # If the target IP doesn't respond, the LiDAR is either off or
-    # still at the factory IP — alias is needed in case it's the latter.
-    if ! ping -c1 -W1 "$target_ip" &>/dev/null; then NEED_ALIAS=1; fi
-done
-if [ "$NEED_ALIAS" -eq 1 ]; then maybe_add_alias; fi
-
 # ─── Locate the Seyond utility ───────────────────────────────
 UTIL=""
 for c in "$SCRIPT_DIR/innovusion_lidar_util" \
@@ -179,132 +194,209 @@ for c in "$SCRIPT_DIR/innovusion_lidar_util" \
     if [ -x "$c" ] || command -v "$c" &>/dev/null; then UTIL="$c"; break; fi
 done
 [ -z "$UTIL" ] && fail "innovusion_lidar_util not found. Place it in PTP_sync/."
-ok "Using utility: $UTIL"
 
-ENV_DIR="$SCRIPT_DIR/RobinW_FW2835_Multiunit"
+# ─── Pre-flight checks ───────────────────────────────────────
 [ -d "$ENV_DIR" ] || fail "Missing $ENV_DIR (PCS_ENV files)."
+[ -f "$ENV_PATH" ] || fail "Missing $ENV_PATH for position $POSITION."
 
-# ─── Sanity check: host IP must be in the PCS_ENV files ─────
 HOST_IP="$NETCFG_HOST_IP"
 [ -z "$HOST_IP" ] && fail "Host IP missing in network_config.yaml"
-for f in "$ENV_DIR"/RW_FW2835_*_unicast.env; do
-    if ! grep -q "^UDP_IP=${HOST_IP}$" "$f"; then
-        fail "$f has UDP_IP != $HOST_IP — edit the PCS_ENV file or update network_config.yaml host.ip"
+if ! grep -q "^UDP_IP=${HOST_IP}$" "$ENV_PATH"; then
+    fail "$ENV_PATH has UDP_IP != $HOST_IP — edit the PCS_ENV file or update network_config.yaml host.ip"
+fi
+
+# ─── Banner ──────────────────────────────────────────────────
+info "Robin W single-unit provisioning"
+echo "    position  : $POSITION"
+echo "    target IP : $TARGET_IP"
+echo "    UDP port  : $UDP_PORT"
+echo "    PCS_ENV   : $ENV_FILE"
+echo "    factory IP: $FACTORY_IP"
+echo "    host IP   : $HOST_IP"
+echo "    utility   : $UTIL"
+echo ""
+
+# ─── Discover the attached LiDAR ─────────────────────────────
+# We try TWO addresses:
+#   1. The target IP (e.g. 192.168.1.10) — covers the re-run case
+#      where this unit was already provisioned earlier.
+#   2. The factory IP 172.168.1.10 — covers a brand-new unit
+#      coming out of the box.
+# Either way, we read the LiDAR's serial number with get_static_info
+# so we can record it in serial_inventory.yaml later.
+
+read_serial() {
+    local ip="$1"
+    "$UTIL" "$ip" get_static_info 2>/dev/null | \
+        grep -oE 'sn[: =]*[0-9]+' | head -1 | grep -oE '[0-9]+' || true
+}
+
+CURRENT_IP=""
+SERIAL=""
+
+# Try target IP first (re-run / already-provisioned case)
+if ping -c1 -W2 "$TARGET_IP" &>/dev/null; then
+    SERIAL=$(read_serial "$TARGET_IP")
+    if [ -n "$SERIAL" ]; then
+        ok "Found Robin W at $TARGET_IP, serial $SERIAL"
+        CURRENT_IP="$TARGET_IP"
     fi
-done
-ok "PCS_ENV files agree with host IP $HOST_IP"
+fi
 
-# ─── Provision one unit ──────────────────────────────────────
-provision_unit() {
-    local position="$1" serial="$2" target_ip="$3" udp_port="$4" env_file="$5"
-    local env_path="$ENV_DIR/$env_file"
-
-    info "─── Provisioning robin_w_$position (serial $serial → $target_ip, UDP $udp_port) ───"
-
-    if [ ! -f "$env_path" ]; then
-        warn "Missing $env_path — skipping"
-        return 1
+# Try factory IP (brand-new unit)
+if [ -z "$CURRENT_IP" ]; then
+    maybe_add_alias
+    if ping -c1 -W2 "$FACTORY_IP" &>/dev/null; then
+        SERIAL=$(read_serial "$FACTORY_IP")
+        if [ -n "$SERIAL" ]; then
+            ok "Found factory-state Robin W at $FACTORY_IP, serial $SERIAL"
+            CURRENT_IP="$FACTORY_IP"
+        fi
     fi
+fi
 
-    # ── Step A: locate the LiDAR ──
-    local current_ip=""
-    if ping -c1 -W2 "$target_ip" &>/dev/null; then
-        local sn
-        sn=$("$UTIL" "$target_ip" get_static_info 2>/dev/null | \
-             grep -oE 'sn[: =]*[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
-        if [ "$sn" = "$serial" ]; then
-            ok "Already at $target_ip with matching serial — verifying PCS_ENV..."
-            current_ip="$target_ip"
-        elif [ -n "$sn" ]; then
-            warn "$target_ip is occupied by serial $sn (not $serial) — manual cleanup needed"
-            return 1
-        else
-            warn "$target_ip is reachable but did not answer get_static_info — assuming factory state"
-            current_ip="$FACTORY_IP"
-        fi
-    elif ping -c1 -W2 "$FACTORY_IP" &>/dev/null; then
-        ok "Found a Robin W at factory IP $FACTORY_IP — checking serial..."
-        local sn
-        sn=$("$UTIL" "$FACTORY_IP" get_static_info 2>/dev/null | \
-             grep -oE 'sn[: =]*[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
-        if [ -n "$sn" ] && [ "$sn" != "$serial" ]; then
-            warn "Factory-IP LiDAR has serial $sn (expected $serial). Unplug the other units"
-            warn "and run with --only $position to provision only this one."
-            return 1
-        fi
-        current_ip="$FACTORY_IP"
+if [ -z "$CURRENT_IP" ]; then
+    fail "No Robin W reachable at $TARGET_IP or $FACTORY_IP. \
+Power on the unit, confirm Ethernet link, and re-run."
+fi
+
+# ─── Safety: refuse if target IP is already occupied by a different unit ──
+if [ "$CURRENT_IP" = "$TARGET_IP" ] && \
+   [ -f "$INVENTORY" ] && \
+   grep -A1 "^  $POSITION:" "$INVENTORY" 2>/dev/null | grep -q "serial:"; then
+    recorded=$(grep -A1 "^  $POSITION:" "$INVENTORY" | grep "serial:" | grep -oE '[0-9]+' | head -1 || true)
+    if [ -n "$recorded" ] && [ "$recorded" != "$SERIAL" ]; then
+        warn "$TARGET_IP currently has serial $SERIAL"
+        warn "Inventory says position $POSITION belongs to serial $recorded"
+        warn "If you are intentionally re-assigning, delete the $POSITION block in:"
+        warn "  $INVENTORY"
+        fail "Refusing to overwrite — manual intervention required."
+    fi
+fi
+
+# ─── Step A: change IP if needed ─────────────────────────────
+if [ "$CURRENT_IP" = "$FACTORY_IP" ] && [ "$CURRENT_IP" != "$TARGET_IP" ]; then
+    info "set_network $CURRENT_IP → $TARGET_IP / $NETMASK"
+    "$UTIL" "$CURRENT_IP" set_network "$CURRENT_IP" "$TARGET_IP" "$NETMASK" || \
+        fail "set_network failed"
+    info "Rebooting LiDAR ($CURRENT_IP) — waiting ${SLEEP_AFTER_REBOOT}s"
+    echo "reboot 1" | nc -nv "$CURRENT_IP" 8001 -w1 || true
+    sleep "$SLEEP_AFTER_REBOOT"
+    if ! ping -c2 -W2 "$TARGET_IP" &>/dev/null; then
+        fail "$TARGET_IP not reachable after reboot. Check power / cabling."
+    fi
+    ok "LiDAR is now up at $TARGET_IP"
+fi
+
+# ─── Step B: download current PCS_ENV, compare, upload if different ──
+tmp_current=$(mktemp /tmp/PCS_ENV_${POSITION}.XXXX)
+if "$UTIL" "$TARGET_IP" download_internal_file PCS_ENV "$tmp_current" 2>/dev/null; then
+    if diff -q "$tmp_current" "$ENV_PATH" >/dev/null 2>&1; then
+        skip "PCS_ENV on $TARGET_IP already matches $ENV_FILE — no upload needed"
+        rm -f "$tmp_current"
+        UPLOAD_NEEDED=0
     else
-        warn "Neither $target_ip nor $FACTORY_IP responds. Power on the LiDAR and re-run."
-        return 1
+        UPLOAD_NEEDED=1
     fi
+else
+    UPLOAD_NEEDED=1
+fi
+rm -f "$tmp_current"
 
-    # ── Step B: change IP if needed ──
-    if [ "$current_ip" = "$FACTORY_IP" ] && [ "$current_ip" != "$target_ip" ]; then
-        info "set_network $current_ip → $target_ip / $NETMASK"
-        "$UTIL" "$current_ip" set_network "$current_ip" "$target_ip" "$NETMASK" || \
-            fail "set_network failed"
-        info "Rebooting LiDAR ($current_ip) — waiting ${SLEEP_AFTER_REBOOT}s"
-        echo "reboot 1" | nc -nv "$current_ip" 8001 -w1 || true
-        sleep "$SLEEP_AFTER_REBOOT"
-        if ! ping -c2 -W2 "$target_ip" &>/dev/null; then
-            fail "$target_ip not reachable after reboot. Check power / cabling."
-        fi
-        ok "LiDAR up at $target_ip"
-    fi
-
-    # ── Step C: download current PCS_ENV, compare, upload if different ──
-    local tmp_current
-    tmp_current=$(mktemp /tmp/PCS_ENV_${position}.XXXX)
-    if "$UTIL" "$target_ip" download_internal_file PCS_ENV "$tmp_current" 2>/dev/null; then
-        if diff -q "$tmp_current" "$env_path" >/dev/null 2>&1; then
-            skip "PCS_ENV on $target_ip already matches $env_file — nothing to upload"
-            rm -f "$tmp_current"
-            return 0
-        fi
-    fi
-    rm -f "$tmp_current"
-
-    info "Uploading $env_file to $target_ip"
-    # The Seyond utility uses 'upload_internal_file' for write-side; older docs
-    # mention 'download_internal_file' for both directions, which is a doc typo
-    # — the second invocation in Seyond's tutorial is the upload step.
-    if "$UTIL" "$target_ip" upload_internal_file PCS_ENV "$env_path" 2>/dev/null; then
+if [ "${UPLOAD_NEEDED:-1}" = "1" ]; then
+    info "Uploading $ENV_FILE to $TARGET_IP"
+    # The Seyond utility uses 'upload_internal_file' for the write side;
+    # older docs mention 'download_internal_file' for both directions,
+    # which is a doc typo — the second invocation in Seyond's tutorial is
+    # the upload step.
+    if "$UTIL" "$TARGET_IP" upload_internal_file PCS_ENV "$ENV_PATH" 2>/dev/null; then
         ok "PCS_ENV uploaded"
-    elif "$UTIL" "$target_ip" download_internal_file PCS_ENV "$env_path" 2>/dev/null; then
+    elif "$UTIL" "$TARGET_IP" download_internal_file PCS_ENV "$ENV_PATH" 2>/dev/null; then
         # Some older utility builds use the same verb for both directions.
         ok "PCS_ENV uploaded (legacy verb)"
     else
-        fail "PCS_ENV upload to $target_ip failed"
+        fail "PCS_ENV upload to $TARGET_IP failed"
     fi
 
-    info "Rebooting LiDAR ($target_ip) — waiting ${SLEEP_AFTER_REBOOT}s"
-    echo "reboot 1" | nc -nv "$target_ip" 8001 -w1 || true
+    info "Rebooting LiDAR ($TARGET_IP) — waiting ${SLEEP_AFTER_REBOOT}s"
+    echo "reboot 1" | nc -nv "$TARGET_IP" 8001 -w1 || true
     sleep "$SLEEP_AFTER_REBOOT"
-    if ! ping -c2 -W2 "$target_ip" &>/dev/null; then
-        fail "$target_ip not reachable after PCS_ENV reboot"
+    if ! ping -c2 -W2 "$TARGET_IP" &>/dev/null; then
+        fail "$TARGET_IP not reachable after PCS_ENV reboot"
     fi
-    ok "Provisioning complete for robin_w_$position"
-    return 0
+fi
+
+# ─── Step C: record SN → position in inventory.yaml ─────────
+update_inventory() {
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Initialize file if missing
+    if [ ! -f "$INVENTORY" ]; then
+        cat > "$INVENTORY" << EOF
+# Generated by provision_robin_w_multiunit.sh — DO NOT HAND-EDIT.
+# Records which Seyond Robin W serial number was provisioned to
+# which dome position. Updated automatically on every successful
+# provisioning run. Useful for inventory tracking + spares.
+positions:
+EOF
+    fi
+    # Strip any existing block for this position, then re-add with new SN.
+    python3 - "$INVENTORY" "$POSITION" "$SERIAL" "$TARGET_IP" "$UDP_PORT" "$now" << 'PY'
+import sys, re, pathlib
+
+path, pos, sn, ip, port, ts = sys.argv[1:7]
+p = pathlib.Path(path)
+lines = p.read_text().splitlines()
+
+# Remove the existing block (header + 4 indented lines) for this position
+new = []
+i = 0
+while i < len(lines):
+    if lines[i].rstrip() == f"  {pos}:":
+        # Skip header + up to 4 indented metadata lines
+        i += 1
+        while i < len(lines) and lines[i].startswith("    "):
+            i += 1
+        continue
+    new.append(lines[i])
+    i += 1
+
+# Append the fresh block (under the trailing "positions:" header)
+new.append(f"  {pos}:")
+new.append(f"    serial:          \"{sn}\"")
+new.append(f"    ip:              \"{ip}\"")
+new.append(f"    udp_port:        {port}")
+new.append(f"    provisioned_at:  \"{ts}\"")
+p.write_text("\n".join(new) + "\n")
+PY
+    ok "Recorded SN $SERIAL at position $POSITION in serial_inventory.yaml"
 }
 
-# ─── Main ────────────────────────────────────────────────────
-info "Robin W multi-unit provisioning — host UDP_IP=$HOST_IP, factory IP=$FACTORY_IP"
+update_inventory
+
+# ─── Done ────────────────────────────────────────────────────
 echo ""
-ANY_FAIL=0
-for row in "${UNIT_TABLE[@]}"; do
-    IFS='|' read -r position serial target_ip udp_port env_file <<< "$row"
-    if [ -n "$ONLY" ] && [ "$ONLY" != "$position" ]; then continue; fi
-    if ! provision_unit "$position" "$serial" "$target_ip" "$udp_port" "$env_file"; then
-        ANY_FAIL=1
+ok "Provisioning complete: robin_w_$POSITION = serial $SERIAL @ $TARGET_IP : $UDP_PORT"
+echo ""
+
+# Suggest the next step based on what is still pending
+REMAINING=()
+for row in "${POSITION_TABLE[@]}"; do
+    IFS='|' read -r p _ _ _ <<< "$row"
+    if ! grep -q "^  $p:" "$INVENTORY" 2>/dev/null; then
+        REMAINING+=("$p")
     fi
 done
 
-echo ""
-if [ "$ANY_FAIL" -eq 0 ]; then
-    ok "All requested Robin Ws provisioned."
+if [ "${#REMAINING[@]}" -gt 0 ]; then
+    echo " Next: disconnect this LiDAR, attach the next one, and run:"
+    for p in "${REMAINING[@]}"; do
+        echo "   ./provision_robin_w_multiunit.sh --position $p"
+    done
+else
+    echo " All three Robin Ws are provisioned. See:"
+    echo "   $INVENTORY"
     echo ""
     echo " Next: ./4_setup_lidar_ptp.sh   # per-host PTP + driver setup"
-else
-    warn "One or more units could not be provisioned — see [WARN]/[FAIL] above."
-    exit 2
 fi
+echo ""
