@@ -1,5 +1,23 @@
 // ============================================================
-// 3D Mapping Sensor Dome — v17c
+// 3D Mapping Sensor Dome — v17e
+//
+// CHANGES FROM v17d:
+//   - L1_pillar_height nudged 130mm → 133mm (+3mm) to remove the
+//     LiDAR-vs-Atlas-body interference that v17d introduced.
+//     New LiDAR-bottom = z=54mm vs Atlas-top = z=53.8mm.
+//     Z-gap = 0.2mm — geometrically non-overlapping, but extremely
+//     tight: it leaves NO room for cable routing or print-tolerance
+//     between the LiDAR housings and the Atlas body. Consider
+//     raising to 138–145mm (5–12mm gap) if you want practical
+//     cable clearance and a printable margin.
+//     Net change vs original v17c: pillar is 27mm shorter
+//     (160 → 133), L2 sits at z=139 (was z=166).
+//     M6×20mm bracket BHCS still works (12mm L2 + 8mm tap = 20mm).
+//
+// CHANGES FROM v17c:
+//   - L1_pillar_height SHORTENED from 160mm → 130mm (−30mm) in v17d.
+//     Caused a 2.8mm LiDAR-vs-Atlas-body collision; corrected
+//     in v17e by adding 3mm back (see above).
 //
 // CHANGES FROM v17b:
 //   - INSIDE-CORNER FILLETS on ALL bracket-to-plate junctions.
@@ -249,9 +267,10 @@ L1_thickness = plate_thickness;
 // Pillar height: must clear Atlas body + cables + LiDAR bodies below L2.
 // Atlas top = L1_thickness + atlas_body_height = 53.8mm.
 // LiDAR bottom = L2_z_bottom - robin_body_h.
-// With L1_pillar_height=160: LiDAR_bottom = 166-85 = 81mm,
-//   Atlas_top = 53.8mm, gap = 27.2mm (ample for cable routing).
-L1_pillar_height = 160;
+// v17e: L1_pillar_height = 133 (was 130 in v17d, 160 in v17c).
+//   LiDAR_bottom = 139-85 = 54mm vs Atlas_top = 53.8mm.
+//   Gap = 0.2mm — non-overlapping but very tight (see header).
+L1_pillar_height = 133;
 
 // --- Level 2 ---
 L2_z_bottom = L1_thickness + L1_pillar_height;   // 166
@@ -848,13 +867,14 @@ if (RENDER_MODE == 2) level2();
 // COAXIAL ALIGNMENT (all at X=0, Y=0):
 //   Camera 1/4"-20:      (0, 0, bottom of L1)                   ✓
 //   Atlas CoN:           (0, 0, 6mm)                             ✓
-//   LiDAR ring center:   (0, 0, 166mm = L2_z_bottom)            ✓
-//   GNSS stand recess:   (0, 0, L2_z_top - 8mm = 170mm)         ✓
+//   LiDAR ring center:   (0, 0, 139mm = L2_z_bottom)            ✓ (v17e)
+//   GNSS stand recess:   (0, 0, L2_z_top - 8mm = 143mm)         ✓ (v17e)
 //
-// VERTICAL CLEARANCE (LiDARs below L2):
-//   LiDAR body bottom = L2_z_bottom - robin_body_h = 166 - 85 = 81mm
+// VERTICAL CLEARANCE (LiDARs below L2) — v17e:
+//   LiDAR body bottom = L2_z_bottom - robin_body_h = 139 - 85 = 54mm
 //   Atlas body top    = L1_thickness + atlas_body_height = 53.8mm
-//   Gap               = 81 - 53.8 = 27.2mm (ample for cables)   ✓
+//   Gap               = 54 - 53.8 = 0.2mm  (no collision, tight) ✓
+//   (v17d at pillar=130 gave −2.8mm overlap; v17c at 160 = 27.2mm.)
 //
 // BRACKET GEOMETRY (v17b — 4 hex-vertex + 2 Atlas-side):
 //   HEX-VERTEX BRACKETS (V0, V1, V4, V5):
@@ -929,9 +949,10 @@ if (RENDER_MODE == 2) level2();
 //   and @240°, in the rear zone between the two LiDAR bodies.
 //   Not in any LiDAR's primary scanning direction.                 ✓
 //
-// PRINT NOTES (v17b):
-//   L1: 280×300×166mm (hex+flange, 4 vertex + 2 atlas-side
+// PRINT NOTES (v17e):
+//   L1: 280×300×139mm (hex+flange, 4 vertex + 2 atlas-side
 //       bracket walls up — all flat extrusions, no support)        ✓
+//       (v17c=166mm, v17d=136mm, v17e=139mm.)
 //   L2: 280×300×12mm  (hex+flange plate — trivial)                ✓
 //   2 printed parts. Both fit Raise3D Pro2 (305×305×300mm).       ✓
 //

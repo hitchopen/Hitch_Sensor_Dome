@@ -52,7 +52,7 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 
 ## Sensor Layout
 
-The diagrams below (generated from the v17c SCAD model) label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).
+The diagrams below (generated from the v17e SCAD model) label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).
 
 ![Top-down sensor layout](3D%20files/sensor_dome_layout_top.jpg)
 
@@ -65,11 +65,14 @@ The diagrams below (generated from the v17c SCAD model) label every sensor posit
 ## Repository Structure
 
 ```
-3D files/           OpenSCAD model, READMEs, and exported STL files
-  sensor_dome.scad   Parametric OpenSCAD source (v17c)
-  README.md          Detailed design specifications (English)
-  README_zh.md       Detailed design specifications (Chinese)
-  *.stl              Exported print-ready meshes (L1, L2)
+3D files/                  OpenSCAD model, READMEs, and exported STL files
+  sensor_dome.scad         Parametric OpenSCAD source (v17e) — TWO-PIECE
+                           bolted assembly (L1 + L2 joined by 12× M6 BHCS)
+  sensor_dome_unibody.scad UNIBODY variant — wraps sensor_dome.scad and
+                           fuses L1 + brackets + L2 into ONE printable part
+  README.md                Detailed design specifications (English)
+  README_zh.md             Detailed design specifications (Chinese)
+  *.stl                    Exported print-ready meshes (L1, L2)
 
 Documents/           Component datasheets
   Pointonenav-assembly-atlas-duo.pdf
@@ -117,11 +120,25 @@ GICP_plusplus/                LiDAR-only localization (fork of vectr-ucla/DLIO)
 
 ## Quick Start
 
-1. Install [OpenSCAD](https://openscad.org/)
-2. Open `3D files/sensor_dome.scad`
-3. Set `RENDER_MODE = 1` for Level 1, `RENDER_MODE = 2` for Level 2
-4. Render (F6) and export STL (F7)
-5. Print both parts on a 305 × 305 mm bed (PETG or ABS, 50–60% infill)
+Install [OpenSCAD](https://openscad.org/) and pick one of the two print options below. Both produce the same final geometry; the difference is whether the dome is two bolted plates or one fused part.
+
+### Option A — Two-piece bolted assembly (default, recommended)
+
+The original design. L1 (base + 6 brackets, 139 mm tall) and L2 (top plate, 12 mm thick) print separately and bolt together with 12× M6×20 mm BHCS at the bracket tops. Faster prints, no support material, easy to disassemble for service, easy to swap one plate without reprinting the other.
+
+1. Open `3D files/sensor_dome.scad` in OpenSCAD.
+2. Set `RENDER_MODE = 1`, render (F6), export STL (F7) → that's the **L1 print**.
+3. Set `RENDER_MODE = 2`, render and export → that's the **L2 print**.
+4. Print both on a 305 × 305 mm bed (PETG or ABS, 50–60% infill). No support needed on either part — the brackets are vertical walls and L2 is a flat slab.
+5. Assemble with the BOM in [`3D files/README.md`](3D%20files/README.md).
+
+### Option B — Unibody single-piece print
+
+For deployments where you want zero bolted joints between L1 and L2 — slightly stiffer in torsion, no chance of bolt loosening over time, and one file to slice instead of two. Trade-off: a long print with significant support material under the L2 cantilever.
+
+1. Open `3D files/sensor_dome_unibody.scad` in OpenSCAD. This file `include`s `sensor_dome.scad`, so every parameter (pillar height, plate dimensions, sensor mount patterns) automatically tracks the two-piece version.
+2. Render (F6) and export STL (F7) → that's the **whole-dome print** (≈ 280 × 300 × 151 mm bounding box, fits a 305 × 305 × 300 mm bed in default L1-down orientation).
+3. **Support material is required.** The L2 plate cantilevers between bracket tops over a mostly-empty 280 × 300 mm volume. Use **tree / organic supports** (PrusaSlicer 2.6+, Bambu Studio, Cura "Tree") under L2's underside only — not between bracket walls. Expect ~1.5–2 kg of support PETG and ~28–36 h print time at typical settings; soluble support is impractical at this height. The 12 bracket bolts in the BOM are not needed for this variant.
 
 See [`3D files/README.md`](3D%20files/README.md) for full design specifications, BOM, and assembly instructions.
 

@@ -51,7 +51,7 @@
 
 ## 传感器布局
 
-下方示意图（由 v17c SCAD 模型生成）以 ROS REP 103 车体坐标系（+X 前、+Y 左、+Z 上）标注每个传感器相对于 Atlas Duo 导航中心 (原点) 的位置。
+下方示意图（由 v17e SCAD 模型生成）以 ROS REP 103 车体坐标系（+X 前、+Y 左、+Z 上）标注每个传感器相对于 Atlas Duo 导航中心 (原点) 的位置。
 
 ![俯视图](3D%20files/sensor_dome_layout_top.jpg)
 
@@ -64,11 +64,14 @@
 ## 仓库结构
 
 ```
-3D files/           OpenSCAD 模型、READMEs、导出的 STL 文件
-  sensor_dome.scad   参数化 OpenSCAD 源 (v17c)
-  README.md          详细设计规范 (英文)
-  README_zh.md       详细设计规范 (中文)
-  *.stl              已导出的可打印网格 (L1, L2)
+3D files/                  OpenSCAD 模型、READMEs、导出的 STL 文件
+  sensor_dome.scad         参数化 OpenSCAD 源 (v17e) —— 两件式螺栓装配版
+                           (L1 + L2 由 12 颗 M6 BHCS 螺栓连接)
+  sensor_dome_unibody.scad 一体式 (unibody) 变体 —— 包装 sensor_dome.scad，
+                           将 L1 + 支柱 + L2 融合为单一可打印件
+  README.md                详细设计规范 (英文)
+  README_zh.md             详细设计规范 (中文)
+  *.stl                    已导出的可打印网格 (L1, L2)
 
 Documents/           组件数据手册
   Pointonenav-assembly-atlas-duo.pdf
@@ -116,11 +119,25 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
 
 ## 快速开始
 
-1. 安装 [OpenSCAD](https://openscad.org/)
-2. 打开 `3D files/sensor_dome.scad`
-3. 设置 `RENDER_MODE = 1` 渲染 Level 1，`RENDER_MODE = 2` 渲染 Level 2
-4. 渲染 (F6) 并导出 STL (F7)
-5. 在 305 × 305 mm 打印床上打印两个零件 (PETG 或 ABS，填充 50–60%)
+安装 [OpenSCAD](https://openscad.org/)，并在下面两种打印方案中任选其一。两者最终几何完全相同，区别只在于穹顶是两片螺栓装配，还是融合为单件打印。
+
+### 方案 A —— 两件式螺栓装配 (默认，推荐)
+
+原始设计。L1（底板 + 6 根支柱，整体高 139 mm）与 L2（顶板，厚 12 mm）分开打印，再由 12 颗 M6×20 mm BHCS 螺栓在支柱顶端连接。打印更快、无需支撑材料、便于拆卸维护，单独更换其中一块板时也无需重新打印另一块。
+
+1. 在 OpenSCAD 中打开 `3D files/sensor_dome.scad`。
+2. 设置 `RENDER_MODE = 1`，渲染 (F6)，导出 STL (F7) —— 这是 **L1 打印件**。
+3. 设置 `RENDER_MODE = 2`，渲染并导出 —— 这是 **L2 打印件**。
+4. 在 305 × 305 mm 打印床上打印两件 (PETG 或 ABS，填充 50–60%)。两件都不需要支撑：支柱是垂直墙体，L2 是水平平板。
+5. 依照 [`3D files/README.md`](3D%20files/README.md) 中的 BOM 装配。
+
+### 方案 B —— 一体式 (unibody) 单件打印
+
+适用于希望 L1 与 L2 之间没有任何螺栓接合的部署 —— 抗扭刚度略高、长期使用不会出现螺栓松动、切片时只处理一个文件。代价：打印时间长，L2 下方需要相当数量的支撑材料。
+
+1. 在 OpenSCAD 中打开 `3D files/sensor_dome_unibody.scad`。该文件通过 `include` 引用了 `sensor_dome.scad`，所以所有参数 (支柱高度、板尺寸、传感器孔位等) 都会自动与两件式版本保持同步。
+2. 渲染 (F6) 并导出 STL (F7) —— 这是 **整体穹顶打印件** (大约 280 × 300 × 151 mm，在默认 L1 朝下的方向下可放进 305 × 305 × 300 mm 床面)。
+3. **必须开启支撑材料。** L2 顶板悬挂在支柱顶端之间，跨度覆盖 280 × 300 mm 的近乎空腔区域。请使用 **树形 / 有机支撑** (PrusaSlicer 2.6+、Bambu Studio、Cura "Tree")，**仅** 放在 L2 下表面、不要放进支柱之间。常规参数下约需 1.5–2 kg PETG 支撑材料，打印时间约 28–36 小时；这种高度下溶解性支撑并不实用。本方案不需要 BOM 中的 12 颗 M6 BHCS 支柱螺栓。
 
 完整设计规范、BOM 和装配说明见 [`3D files/README.md`](3D%20files/README.md)。
 

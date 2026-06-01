@@ -1,5 +1,5 @@
 # =============================================================
-# ROS2 Static TF Transforms — Sensor Dome v17c
+# ROS2 Static TF Transforms — Sensor Dome v17e
 #
 # All transforms: parent (imu_link) -> child (sensor_link)
 # Translation in meters, rotation as quaternion (x, y, z, w)
@@ -18,23 +18,33 @@
 #   Verified from Pointonenav-assembly-atlas-duo.pdf side view drawing.
 #   CoN is 18.5 mm above the bottom mounting surface of the Atlas Duo.
 #
-# Geometry source: sensor_dome.scad parameters
+# Geometry source: sensor_dome.scad parameters (v17e)
 #   lidar_ring_radius:  90.0 mm
 #   lidar_angles:       [0, 120, 240] deg
-#   L2_z_bottom:        166.0 mm (LiDAR mount surface)
-#   L2_z_top:           178.0 mm (camera mount surface)
+#   L1_pillar_height:   133.0 mm  ← v17e: shortened 27 mm from v17c=160
+#   L2_z_bottom:        139.0 mm (LiDAR mount surface)   ← was 166 at v17c
+#   L2_z_top:           151.0 mm (camera mount surface)  ← was 178 at v17c
 #   rgb_cam_x:          105.0 mm (radial offset)
 #   rgb_cam_y:           52.0 mm (lateral offset)
 #   plate_thickness:      6.0 mm
 #   atlas_con_z_from_mount_surface: 18.5 mm (verified from drawing)
 #   CoN Z in SCAD coords: 24.5 mm
+#
+# v17e CHANGELOG — what moved relative to v17c:
+#   - All LiDAR  z dropped by 27 mm  (0.1415 → 0.1145 m)
+#   - All camera z dropped by 27 mm  (0.1535 → 0.1265 m)
+#   - GNSS primary nominal z dropped by 27 mm  (0.300 → 0.273 m),
+#     assuming the same physical stand + SP1 hardware
+#   - XY positions, yaw rotations, and base_link transform UNCHANGED
 # =============================================================
 
 # ----- Configuration -----
 # To recalculate Z values for a different CoN height, adjust
 # atlas_con_z_from_mount_surface and recompute:
-#   lidar_z  = (166.0 - 6.0 - 18.5) / 1000 = 0.1415 m
-#   camera_z = (178.0 - 6.0 - 18.5) / 1000 = 0.1535 m
+#   lidar_z  = (L2_z_bottom - plate_thickness - atlas_con_z_from_mount_surface) / 1000
+#            = (139.0 - 6.0 - 18.5) / 1000 = 0.1145 m   (v17e)
+#   camera_z = (L2_z_top    - plate_thickness - atlas_con_z_from_mount_surface) / 1000
+#            = (151.0 - 6.0 - 18.5) / 1000 = 0.1265 m   (v17e)
 
 # =============================================================
 # LiDAR Transforms (lidar2imu)
@@ -111,7 +121,7 @@ static_transforms:
     translation:
       x:  0.090000
       y:  0.000000
-      z:  0.141500
+      z:  0.114500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -125,7 +135,7 @@ static_transforms:
     translation:
       x: -0.045000
       y:  0.077942
-      z:  0.141500
+      z:  0.114500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -139,7 +149,7 @@ static_transforms:
     translation:
       x: -0.045000
       y: -0.077942
-      z:  0.141500
+      z:  0.114500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -169,7 +179,7 @@ static_transforms:
     translation:
       x:  0.105000
       y:  0.052000
-      z:  0.153500
+      z:  0.126500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -183,7 +193,7 @@ static_transforms:
     translation:
       x:  0.105000
       y: -0.052000
-      z:  0.153500
+      z:  0.126500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -197,7 +207,7 @@ static_transforms:
     translation:
       x: -0.097533
       y:  0.064933
-      z:  0.153500
+      z:  0.126500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -212,7 +222,7 @@ static_transforms:
     translation:
       x: -0.097533
       y: -0.064933
-      z:  0.153500
+      z:  0.126500
     rotation:
       x:  0.000000
       y:  0.000000
@@ -269,15 +279,21 @@ static_transforms:
 
   # --- GNSS Antenna: Primary (centered above IMU on magnetic stand) ---
   # SP1 mounted on ArduSimple magnetic survey stand. Atlas Duo's primary
-  # GNSS RF input. The Z value is the height above L2's top from the
-  # combined stand height + antenna body — measure on your build and
-  # update if it deviates from the nominal 0.300 m.
+  # GNSS RF input. The Z value is the antenna phase-center height above
+  # the CoN — measure on your build and update if it deviates from the
+  # nominal.
+  #
+  # v17e nominal: 0.273 m. Equals stand_base (18) + pole (100) + ~SP1
+  # phase-center offset above the recess floor in L2 (≈ 145), all
+  # referenced to CoN at z=24.5 mm SCAD. v17c was 0.300 m with the
+  # 27 mm taller pillar; if you actually swap to a 27 mm taller stand
+  # to keep the antenna at the same global height, restore 0.300.
   - frame_id: "imu_link"
     child_frame_id: "gnss_antenna_primary_link"
     translation:
       x:  0.000000
       y:  0.000000
-      z:  0.300000        # nominal stand + SP1 height; MEASURE & UPDATE
+      z:  0.273000        # nominal stand + SP1; MEASURE & UPDATE
     rotation:
       x:  0.000000
       y:  0.000000
@@ -312,25 +328,28 @@ static_transforms:
       w:  1.000000
 
 # =============================================================
-# Summary Table
+# Summary Table (v17e)
 #
 # Sensor                       X (m)     Y (m)     Z (m)    Yaw (°)
 # -------------------------  --------  --------  --------  --------
 # base_link                   0.0000    0.0000    0.0000      0   (identity — override per vehicle)
-# lidar_front                 0.0900    0.0000    0.1415      0
-# lidar_rear_left            -0.0450    0.0779    0.1415    120
-# lidar_rear_right           -0.0450   -0.0779    0.1415    240
-# cam_front_right             0.1050    0.0520    0.1535      0
-# cam_front_left              0.1050   -0.0520    0.1535      0
-# cam_rear_left              -0.0975    0.0649    0.1535    120
-# cam_rear_right             -0.0975   -0.0649    0.1535    240
-# gnss_antenna_primary        0.0000    0.0000    0.3000      0
+# lidar_front                 0.0900    0.0000    0.1145      0
+# lidar_rear_left            -0.0450    0.0779    0.1145    120
+# lidar_rear_right           -0.0450   -0.0779    0.1145    240
+# cam_front_right             0.1050    0.0520    0.1265      0
+# cam_front_left              0.1050   -0.0520    0.1265      0
+# cam_rear_left              -0.0975    0.0649    0.1265    120
+# cam_rear_right             -0.0975   -0.0649    0.1265    240
+# gnss_antenna_primary        0.0000    0.0000    0.2730      0
 # gnss_antenna_secondary       (FILL IN — dual antenna)        —
 #
 # All roll = 0, pitch = 0.
 # Front stereo baseline: 0.1040 m (104 mm).
 # Rear pair symmetric about X axis.
 # Dual GNSS antenna: enabled when secondary translation norm > 0.05 m.
+#
+# v17e geometry change vs v17c (for reference):
+#   Pillar shortened 27 mm (160 → 133); every Z above dropped 27 mm.
 # =============================================================
 
 # =============================================================
