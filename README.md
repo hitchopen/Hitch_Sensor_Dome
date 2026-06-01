@@ -86,11 +86,14 @@ config/              Project-wide configuration (single source of truth)
   network_config.yaml     NIC, host IP, sensor IPs, DHCP pool
   load_network_config.sh  Sourced by setup_*.sh to export NETCFG_*
 
-PTP_sync/            One-time host + sensor time-sync setup
-  setup_ubuntu_sync.sh    GPS-disciplined PTP grandmaster (gpsd → chrony → ptp4l)
-  setup_robin_w_sync.sh   Enable PTP on Seyond Robin W LiDARs
-  setup_camera_sync.sh    Enable IEEE 1588 PTP on RouteCAM cameras
-  README.md               Architecture, verification, troubleshooting
+PTP_sync/                    One-time host + sensor time-sync setup
+  1_install_packages.sh      apt prereqs, RT permissions, ROS 2 Jazzy
+  2_configure_host_network.sh Host NIC static IP, HW-timestamping detect
+  3_setup_ins_to_pc_sync.sh   gpsd + chrony + ptp4l GM + phc2sys + p1 driver
+  4_setup_lidar_ptp.sh       Robin W PTP slave + Seyond ROS 2 driver
+  5_setup_camera_ptp.sh      RouteCAM PTP slave + Aravis (Tier 2 only)
+  provision_robin_w_multiunit.sh One-time per-LiDAR IP renumber + UDP port
+  README.md                  Architecture, verification, troubleshooting
 
 recording/           Run-time data recording + Foxglove dashboard
   sensor_recorder.py      Detect sensors → verify clock sync → record .mcap

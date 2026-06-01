@@ -85,11 +85,14 @@ config/              项目级配置 (单一信息源)
   network_config.yaml     网卡、主机 IP、传感器 IP、DHCP 池
   load_network_config.sh  由 setup_*.sh source 用以导出 NETCFG_*
 
-PTP_sync/            一次性的主机 + 传感器时间同步搭建
-  setup_ubuntu_sync.sh    GPS 校准的 PTP 主时钟 (gpsd → chrony → ptp4l)
-  setup_robin_w_sync.sh   在 Seyond Robin W LiDAR 上启用 PTP
-  setup_camera_sync.sh    在 RouteCAM 摄像头上启用 IEEE 1588 PTP
-  README.md               架构、验证、故障排查
+PTP_sync/                    一次性的主机 + 传感器时间同步搭建
+  1_install_packages.sh      apt 依赖、RT 权限、ROS 2 Jazzy
+  2_configure_host_network.sh 主机 NIC 静态 IP、硬件时间戳检测
+  3_setup_ins_to_pc_sync.sh   gpsd + chrony + ptp4l GM + phc2sys + p1 驱动
+  4_setup_lidar_ptp.sh       Robin W PTP slave + Seyond ROS 2 驱动
+  5_setup_camera_ptp.sh      RouteCAM PTP slave + Aravis（仅 Tier 2）
+  provision_robin_w_multiunit.sh 每台 LiDAR 一次性 IP 重分配 + UDP 端口
+  README.md                  架构、验证、故障排查
 
 recording/           运行期数据采集 + Foxglove 仪表盘
   sensor_recorder.py      检测传感器 → 验证时钟同步 → 录制 .mcap

@@ -1,100 +1,45 @@
 # Sensor Recording System: Point One Nav Atlas Duo + Seyond Robin W LiDAR + RouteCAM Cameras
 
-Installation and configuration guide for a high-performance GNSS/IMU/LiDAR/camera data recording system running on Ubuntu 24.04 with ROS 2 Jazzy and the PREEMPT_RT real-time kernel.
+Installation and configuration guide for a high-performance GNSS / IMU / LiDAR / camera data recording system running on Ubuntu 24.04 with ROS 2 Jazzy, optionally on a PREEMPT_RT real-time kernel.
 
 **Target Hardware:**
 - Ubuntu 24.04 LTS workstation (tested on Lenovo ThinkPad P1 Gen 6, Intel i9-13900H)
-- Point One Nav Atlas Duo (GNSS/INS with PPS output)
+- Point One Nav Atlas Duo (GNSS / INS with PPS output)
 - Up to 3× Seyond Robin W directional LiDARs
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision cameras (PoE, IEEE 1588 PTP, 2MP global shutter)
 
----
+**Setup flow.** Five numbered scripts in this folder, run in order. Each script handles one logical step, has its own self-test at the end, and tells you the next script to run when it finishes.
 
-## 1. Setup Scripts
+| # | Script | What it does |
+|---|--------|--------------|
+| 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt prerequisites, RT scheduling permissions, kernel tuning, ROS 2 Jazzy |
+| 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | Host NIC static IP, hardware-timestamping detection, RUTM50 reachability |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd, chrony (PPS-locked), ptp4l grandmaster, phc2sys, fusion-engine-driver |
+| 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave enable + Seyond ROS 2 driver |
+| 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave enable + Aravis (Tier 2 only) |
 
-Three scripts automate the entire installation. Run them in order on a fresh Ubuntu 24.04 system.
+A one-time per-LiDAR provisioning step lives in [`provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) — see Section 4.
 
-**Before running anything**, edit [`../config/network_config.yaml`](../config/network_config.yaml) once to match your installation — at minimum, set `host.interface` to your NIC name (e.g. `enp0s31f6`, `eno1`, `eth0` — find yours with `ip link show`). All three scripts pull their defaults from that file, so the commands below need no flags. CLI flags and environment variables still override the YAML at runtime.
-
-**Step 1** installs all system prerequisites, configures the GPS-disciplined PTP grandmaster (gpsd → chrony → ptp4l → phc2sys), installs ROS 2 Jazzy, and builds the Point One Nav driver and host tools.
-
-```bash
-./setup_ubuntu_sync.sh
-```
-
-**Step 2** enables PTP synchronization on each Seyond Robin W LiDAR and builds the Seyond ROS 2 driver. Run when LiDARs are powered and connected.
-
-```bash
-./setup_robin_w_sync.sh
-```
-
-> **One-time per LiDAR — multi-unit provisioning.** Per Seyond's official [*Robin W1G LiDAR User Manual* V2.2 (2025-01-03)](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1, every Robin W ships from the factory with the same default IP **`172.168.1.10`** (netmask `255.255.255.0`, gateway `172.168.1.1`) and the same UDP destination port. The dome network runs on `192.168.1.0/24`, so **each LiDAR must be reset to a unique address inside `192.168.1.0/24`** — `192.168.1.10` / `.11` / `.12` per [`../config/network_config.yaml`](../config/network_config.yaml). Running three units on one network also requires a unique UDP destination port per unit, otherwise the host receives three streams on the same port and cannot tell them apart. Both changes (IP renumbering + per-unit UDP port) are handled by [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) — run it **once for each new LiDAR** (or once for the dome when all three are first assembled) to walk every unit from factory state to the per-position assignments documented in [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md). The script is idempotent — re-running it against already-provisioned LiDARs simply prints `[SKIP]` and exits. The provisioning files (`innovusion_lidar_util`, `automotive-master.cfg`, the three per-serial `PCS_ENV` files) are all in this folder; the host UDP receiver IP inside the `PCS_ENV` files is the project host IP `192.168.1.40` from `network_config.yaml`. Because the factory `172.168.1.0/24` subnet does not overlap with the project's `192.168.1.0/24`, the script auto-adds a temporary `172.168.1.100/24` IP alias to the sensor NIC for the duration of provisioning and removes it on exit. `setup_robin_w_sync.sh` (Step 2) presumes provisioning has already happened — if it cannot reach the LiDARs at `192.168.1.10`/`.11`/`.12`, run the provisioning script first.
-
-**Step 3** installs the Aravis GigE Vision library, enables IEEE 1588 PTP on each RouteCAM camera, and installs ROS 2 camera packages. Run when cameras are powered via PoE.
-
-```bash
-./setup_camera_sync.sh
-```
-
-> **The three commands above are the recommended invocation.** They use the values you set in `config/network_config.yaml`. The block below is a reference for *how* to override on a one-off run — you do not need to type any of it for a normal install.
-
-```bash
-# ─── How to override YAML defaults (reference only) ─────────────
-# All three scripts read defaults from config/network_config.yaml.
-# Override on a per-run basis — without editing the YAML — using
-# CLI flags or environment variables. Precedence: env > CLI > YAML.
-
-# --- CLI flag form: applies only to that invocation ---
-./setup_ubuntu_sync.sh  --eth eno1                       # different NIC
-./setup_ubuntu_sync.sh  --serial /dev/ttyACM0            # different Atlas serial
-./setup_ubuntu_sync.sh  --host-ip 192.168.1.41           # different host IP
-./setup_robin_w_sync.sh --ips 192.168.1.10               # only one LiDAR
-./setup_camera_sync.sh  --ips 192.168.1.20,192.168.1.21  # subset of cameras
-
-# --- Environment variable form: also one-shot ---
-ETH_IFACE=enp1s0f0     ./setup_ubuntu_sync.sh
-LIDAR_IPS_STR=...      ./setup_robin_w_sync.sh
-CAM_IPS_STR=...        ./setup_camera_sync.sh
-
-# --- No flags at all (recommended): values come from the YAML ---
-./setup_ubuntu_sync.sh
-```
-
-Steps 2 and 3 are independent of each other — integrate LiDARs and cameras in any order. Each script includes a self-test at the end that verifies PTP sync quality, service status, and sensor reachability.
-
-### 1.1 Network configuration file
-
-[`../config/network_config.yaml`](../config/network_config.yaml) is the single source of truth for system-dependent network parameters: NIC name, host static IP, sensor IPs, router/switch IPs, and DHCP-pool boundaries. Editing one file once configures all three setup scripts (and any other shell tooling that sources `config/load_network_config.sh`).
-
-| YAML key | Exported variable | Used by |
-|----------|-------------------|---------|
-| `host.interface` | `NETCFG_ETH` | all 3 scripts (`--eth`) |
-| `host.ip` | `NETCFG_HOST_IP` | `setup_ubuntu_sync.sh` (`--host-ip`) |
-| `atlas_duo.serial_port` | `NETCFG_ATLAS_SERIAL` | `setup_ubuntu_sync.sh` (`--serial`) |
-| `lidars[*].ip` | `NETCFG_LIDAR_IPS` | `setup_robin_w_sync.sh` (`--ips`) |
-| `cameras[*].ip` | `NETCFG_CAMERA_IPS` | `setup_camera_sync.sh` (`--ips`) |
-| `gateway`, `subnet`, `router.ip`, `switch.ip`, `atlas_duo.ethernet_ip` | `NETCFG_GATEWAY`, `NETCFG_SUBNET`, `NETCFG_ROUTER_IP`, `NETCFG_SWITCH_IP`, `NETCFG_ATLAS_IP` | reserved for future scripts and host-IP / NTRIP setup |
-
-The YAML loader is [`../config/load_network_config.sh`](../config/load_network_config.sh); it parses the YAML through `python3 + pyyaml` and exports each value as a shell variable.
+**Network defaults.** Every script reads its defaults from [`../config/network_config.yaml`](../config/network_config.yaml). Edit that file once for your installation (mainly `host.interface`) and the scripts pick up everything else (host IP, sensor IPs, gateway, DHCP pool). CLI flags and environment variables still override the YAML at runtime — see each script's `--help` style usage block.
 
 ---
 
-## 2. Prerequisites (Manual Steps)
+## Section 1: Install Ubuntu Real-Time Kernel and Other Packages
 
-The setup scripts handle most installation, but two steps require manual action before running them.
+This section installs everything the host needs that is *not* network or PTP configuration: apt prerequisites, real-time scheduling permissions, kernel `sysctl` tuning, and ROS 2 Jazzy.
 
-### 2.1 PREEMPT_RT Kernel — only needed for hard-real-time control
+### 1.1 PREEMPT_RT kernel — needed only for hard real-time control
 
-**You do not need the RT kernel just to record sensor data.** For perception and localization data collection — the [`recording/`](../recording/) workflow that captures GNSS / IMU / LiDAR / camera into a Foxglove-native MCAP bag for offline mapping, perception training, or SLAM evaluation — the **stock Ubuntu 24.04 generic kernel is sufficient**. PTP timing on the generic kernel typically lands within 1–2× of the RT-kernel numbers in §3, which is well inside what every sensor in this dome can resolve.
+**You do not need the RT kernel just to record sensor data.** For perception and localization data collection — the [`recording/`](../recording/) workflow that captures GNSS / IMU / LiDAR / camera into a Foxglove-native MCAP bag for offline mapping, perception training, or SLAM evaluation — the **stock Ubuntu 24.04 generic kernel is sufficient**. PTP timing on the generic kernel typically lands within 1–2× of the RT-kernel numbers in Section 3, which is well inside what every sensor in this dome can resolve.
 
-The RT kernel matters when the host has to *act* on sensor data with bounded latency: closing a real-time control loop (steering, braking, manipulator servoing), running a deterministic safety monitor, or any scenario where a millisecond of scheduler jitter is unacceptable. If your application is "record now, process later," skip this section entirely.
+The RT kernel matters when the host has to *act* on sensor data with bounded latency: closing a real-time control loop (steering, braking, manipulator servoing), running a deterministic safety monitor, or any scenario where a millisecond of scheduler jitter is unacceptable. If your application is "record now, process later," skip this subsection entirely.
 
 | Use case | Kernel | Why |
 |----------|--------|-----|
 | Recording for mapping, perception, training, offline analysis | **Generic (default)** | Simpler install, full NVIDIA / CUDA / TensorRT, PTP still meets sensor-fusion requirements |
 | Real-time control, deterministic safety loops, hardware-in-the-loop | PREEMPT_RT | Bounded scheduling latency at the cost of CUDA support — see Appendix C |
 
-If you do need RT, install via Ubuntu Pro (free for personal use on up to 5 machines):
+If you do need RT, install via Ubuntu Pro (free for personal use on up to 5 machines), then reboot before continuing:
 
 ```bash
 # Get a free token at ubuntu.com/pro
@@ -111,22 +56,187 @@ uname -a
 # Should show: ... SMP PREEMPT_RT ...
 ```
 
-**NVIDIA GPU note (RT kernel only):** The NVIDIA kernel module (`nvidia.ko`) does not load on PREEMPT_RT — no CUDA, cuDNN, or TensorRT when booted into the RT kernel. Use Intel iGPU for display. See [Appendix C](#c-nvidia-gpu-and-rt-kernel-compatibility) for the dual-boot workflow (record on RT, process on generic).
+**NVIDIA GPU note (RT kernel only):** the NVIDIA kernel module (`nvidia.ko`) does not load on PREEMPT_RT — no CUDA, cuDNN, or TensorRT when booted into the RT kernel. Use Intel iGPU for display. See [Appendix C](#c-nvidia-gpu-and-rt-kernel-compatibility) for the dual-boot workflow.
 
-### 2.2 Identify Your Ethernet Interface
+### 1.2 Run the install script
 
-Find the interface name connected to the sensor network — you will pass it to all three scripts via `--eth`:
+```bash
+chmod +x 1_install_packages.sh
+./1_install_packages.sh
+```
+
+What it installs:
+
+- **apt prerequisites:** `build-essential`, `cmake`, `git`, `linuxptp`, `chrony`, `gpsd`, `pps-tools`, `tcpdump`, `ethtool`, `libyaml-cpp-dev`, Python tooling.
+- **RT scheduling group + limits:** creates the `realtime` group, adds your user, writes `/etc/security/limits.d/99-realtime.conf` granting `rtprio 99` and `memlock unlimited` to that group. Whether or not you're on the RT kernel, these limits are required for the PTP daemons to run at real-time priority.
+- **Kernel `sysctl` tuning:** large UDP buffers (`net.core.rmem_max=32 MiB`) and `vm.swappiness=10` for the high-bandwidth LiDAR / camera streams.
+- **ROS 2 Jazzy:** desktop + dev tools + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools`. Sources `/opt/ros/jazzy/setup.bash` from `~/.bashrc`.
+- **`tcpdump` cap:** `cap_net_raw+ep` so the recorder can sniff sensor UDP without `sudo`.
+
+The script's self-test at the end verifies the RT kernel banner, group membership, the `sysctl` value, and the ROS 2 install.
+
+You will need to **log out and back in** before group membership takes effect — that's the only manual step.
+
+---
+
+## Section 2: Reference Network Configuration on RUTM50 and a PoE Switch
+
+The sensor LAN is built around a **Teltonika RUTM50** 5G/4G cellular router. The reference ships in **two tiers** so a LiDAR-only build doesn't pay for hardware it doesn't need:
+
+- **Tier 1** uses the RUTM50 alone and skips the managed PoE switch — sufficient for 3× LiDARs + INS + PC.
+- **Tier 2** keeps Tier 1 untouched and adds a **Planet WGS-6325-8UP2X** PoE++ switch for the 4× RouteCAM cameras (the cameras need PoE; the switch's IEEE 1588 boundary clock is a bonus).
+
+### 2.1 Tier 1 — LiDAR-only (5 devices, RUTM50 only, no separate switch)
+
+The RUTM50 has 5× RJ45 Gigabit ports (1 WAN + 4 LAN). With the WAN port reconfigured as LAN (RutOS WebUI → Network → LAN → "Use WAN port as LAN" toggle — see Teltonika wiki [Setting up WAN as LAN](https://wiki.teltonika-networks.com/view/Setting_up_WAN_as_LAN)), all 5 ports become LAN and you get exactly the count you need: 1 PC + 1 INS + 3 LiDARs.
+
+```
+Internet (5G cellular)
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Teltonika RUTM50                          192.168.1.1       │
+│  WAN-as-LAN configured                    (cellular WAN     │
+│  DHCP pool .100–.249 (factory default)     stays internal)  │
+├─────────────────────────────────────────────────────────────┤
+│ Port           Device                              IP        │
+│ ----           ------------------------            ------    │
+│ WAN-as-LAN     Host PC                             .5        │
+│ LAN 1          Robin W Front                       .10       │
+│ LAN 2          Robin W Rear-Left                   .11       │
+│ LAN 3          Robin W Rear-Right                  .12       │
+│ LAN 4          Atlas Duo Eth (NTRIP)               .30       │
+└─────────────────────────────────────────────────────────────┘
+
+Atlas Duo INS — three physical paths to the host (not all over Ethernet):
+  PPS  ──► host /dev/pps0     (BNC, hardware PPS — absolute time origin)
+  USB  ──► host /dev/ttyUSB0  (NMEA + FusionEngine messages)
+  Eth  ──► RUTM50 LAN 4       (192.168.1.30, NTRIP RTK corrections only)
+```
+
+**LiDAR power in Tier 1.** Robin W can run on PoE (IEEE 802.3af) **or** 12 V DC; RUTM50 LAN ports do **not** source PoE. In Tier 1 you have two options:
+
+- **Recommended:** power each LiDAR over its M12 connector with a 12 V DC supply (one per LiDAR or a single multi-output bench supply).
+- **Cheap alternative:** put a passive PoE injector inline on each LiDAR Ethernet run with a 48 V DC brick.
+
+The Atlas Duo is powered separately via its own DC barrel input either way.
+
+**PTP timing trade-off in Tier 1.** The RUTM50 is **not** a PTP boundary clock — its internal switch fabric just forwards Ethernet frames. PTP messages from the host PC pick up a few microseconds of residence-time jitter as they cross the RUTM50 to reach the LiDARs. Expected sync at each stage:
+
+| Component | Tier 1 (RUTM50 only) | Tier 2 (Planet BC) | Sensor fusion OK? |
+|-----------|----------------------|--------------------|-------------------|
+| chrony GPS-disciplined `CLOCK_REALTIME` | < 100 ns | < 100 ns | yes (both) |
+| NIC PHC via `phc2sys` | < 200 ns | < 200 ns | yes (both) |
+| Robin W LiDAR PTP slave | 5–50 µs | 300–800 ns | yes (both) |
+
+For LiDAR-IMU fusion, 5–50 µs is completely fine — Robin W frames are ~50–100 ms long at 10–20 FPS, so a few-µs cross-sensor offset is well under one frame period. The dramatic improvement on row 3 only matters when you need camera/LiDAR pixel-perfect alignment, which is exactly what Tier 2 brings.
+
+### 2.2 Tier 2 — adds 4× RouteCAM cameras (Planet WGS-6325-8UP2X added)
+
+The cameras (e-con RouteCAM_P_CU25_CXLC_IP67) are PoE-only and benefit substantially from a real PTP boundary clock. Adding the Planet WGS-6325-8UP2X downstream of the RUTM50 covers both needs: 4× PoE++ ports for the cameras and IEEE 1588 BC for tight cross-sensor sync.
+
+Two ways to wire Tier 2 — pick whichever fits your build:
+
+**(a) Cameras-only on Planet, Tier 1 untouched.** Simplest upgrade — the LiDARs, INS, and PC stay on the RUTM50; only the cameras live on the Planet switch. Uplink the Planet's port 1 to a free RUTM50 LAN port so the cameras can reach the host. LiDAR PTP stays in the 5–50 µs range from Tier 1; camera PTP picks up the Planet's boundary clock (1–10 µs). Good if you want minimal rewiring.
+
+**(b) Move everything onto the Planet.** Host PC migrates to the Planet's SFP1 (10 GbE), all LiDARs migrate to PoE++ ports 6–8, and the RUTM50 becomes purely an uplink to the internet for NTRIP corrections. Every sensor now sits on a PTP-aware fabric and LiDAR PTP tightens to 300–800 ns. Required if you also want jumbo-frame stability under the full ~600 Mbps aggregate sensor load (~60% of a 1 GbE link is uncomfortable; a 10 GbE host link removes the bottleneck). The original Hitch dome reference design used this layout.
+
+Layout (b), for reference:
+
+```
+Internet (5G cellular)
+       │
+       ▼
+┌──────────────────────────┐
+│ Teltonika RUTM50         │  192.168.1.1
+│  (cellular gateway only) │  WAN-as-LAN no longer needed
+└─────────────┬────────────┘
+              │ 1 GbE  (RUTM50 LAN1 → Planet GbE port)
+              ▼
+┌────────────────────────────────────────────────────────┐
+│ Planet WGS-6325-8UP2X (managed L3, IEEE 1588 BC, PoE++)│  192.168.1.2 (mgmt)
+├────────────────────────────────────────────────────────┤
+│ Port    Type            Device                  IP      │
+│ ----    ------------    --------------------    ------ │
+│ 1       1 GbE           → RUTM50 LAN1           (uplink)
+│ 2       2.5 GbE PoE++   RouteCAM Front-Right    .20    │
+│ 3       2.5 GbE PoE++   RouteCAM Front-Left     .21    │
+│ 4       2.5 GbE PoE++   RouteCAM Rear-Left      .22    │
+│ 5       2.5 GbE PoE++   RouteCAM Rear-Right     .23    │
+│ 6       1 GbE  PoE++    Robin W Front           .10    │
+│ 7       1 GbE  PoE++    Robin W Rear-Left       .11    │
+│ 8       1 GbE  PoE++    Robin W Rear-Right      .12    │
+│ SFP1    10 G            Host PC (10G NIC)       .5     │
+│ SFP2    10 G            spare (Atlas Duo Eth / NAS)    │
+└────────────────────────────────────────────────────────┘
+```
+
+### 2.3 IP plan
+
+Same across Tier 1 and Tier 2. Every static device sits below `.100`, so the RUTM50's factory DHCP pool (`.100–.249`) stays untouched and no router configuration beyond static-lease reservations is required.
+
+| 192.168.1.x | Role | Tier 1 | Tier 2 |
+|-------------|------|--------|--------|
+| .1 | RUTM50 router + DHCP server + default gateway | ✓ | ✓ |
+| .2 | Planet WGS-6325-8UP2X management interface | — | ✓ |
+| .5 | Host PC NIC (static via netplan / NetworkManager) | ✓ | ✓ |
+| .10 – .12 | Robin W LiDARs (static on sensor) | ✓ | ✓ |
+| .20 – .23 | RouteCAM cameras (static via Aravis web UI) | — | ✓ |
+| .30 | Atlas Duo INS Ethernet (static, NTRIP RTK only) | ✓ | ✓ |
+| .100 – .249 | RUTM50 DHCP pool — factory default, untouched | ✓ | ✓ |
+
+> **Why `.5` and `.30` are pinned to specific addresses.** Static-lease the PC at .5 and the Atlas Duo at .30 via the RUTM50's Network → LAN → Static Leases page (bind to MAC). This way both devices stay at known IPs across reboots without any device-side static config — the RUTM50 always hands them the same address. See the project root README's network section for the full Static Leases procedure.
+
+**Atlas Duo Ethernet (RTK NTRIP).** The Atlas Duo's Ethernet port has one job in either tier: pull RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30` (or DHCP + reservation), gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. PPS still travels its own physical BNC wire to `/dev/pps0` and remains the absolute time origin — the Ethernet path adds RTK without altering the time-sync chain.
+
+### 2.4 Network bandwidth at each tier
+
+| Configuration | Estimated Bandwidth | Minimum NIC | Tier |
+|---------------|---------------------|-------------|------|
+| 1 Robin W | ~60 Mbps | 1 GbE | Tier 1 |
+| 3 Robin W | ~180 Mbps | 1 GbE | Tier 1 |
+| 4 RouteCAM (2MP @ 20fps) | ~400 Mbps | 1 GbE | requires Tier 2 |
+| 3 Robin W + 4 RouteCAM + PTP | ~600 Mbps + overhead | 1 GbE OK; **10 GbE recommended** for headroom and jumbo-frame stability | Tier 2 (b) |
+
+> **Robin W raw bandwidth:** the Seyond datasheet lists Robin W output at ~60 Mbps per unit (sustained, not the peak-burst number cited in some earlier drafts). 3× Robin W ≈ 180 Mbps sustained; plan jitter/burst headroom at ~1.5×.
+
+### 2.5 Run the host-network script
+
+```bash
+chmod +x 2_configure_host_network.sh
+./2_configure_host_network.sh
+```
+
+What it does:
+
+- Brings the sensor-side NIC up with the static IP from `network_config.yaml` (default `192.168.1.5/24`).
+- Probes IEEE 1588 capability via `ethtool -T` and decides hardware vs software timestamping. The choice is written to `/run/hitch_dome_net.env` so script 3 picks the right `ptp4l` mode automatically.
+- Pings the RUTM50 router as a sanity check.
+- Optionally adds a temporary `172.168.1.100/24` alias on the sensor NIC for factory-state LiDAR provisioning (see Section 4) when called with `--add-factory-alias`.
+
+**Find your interface name first** if you're not sure:
 
 ```bash
 ip link show
 # Look for your wired Ethernet (e.g., enp0s31f6, eth0, eno1)
 ```
 
+### 2.6 Hardware vs software PTP timestamping
+
+Check your NIC's capability with `ethtool -T <interface>` — script 2 does this for you and writes the result to `/run/hitch_dome_net.env`.
+
+| Timestamping | PTP Accuracy | Sufficient For |
+|--------------|--------------|----------------|
+| Hardware | < 1 µs | Production sensor fusion |
+| Software | 20–50 µs | Development, mapping, general robotics |
+
+Most Intel NICs (I210, I225, X550, X710) support hardware timestamping. USB Ethernet adapters typically do not.
+
 ---
 
-## 3. Time Synchronization Architecture
+## Section 3: PTP Sync from INS to PC
 
-Accurate time synchronization across all sensors is critical for sensor fusion. The Atlas Duo's GPS-disciplined PPS signal disciplines the host system clock, which is then distributed to all sensors via IEEE 1588 PTP.
+The Point One Nav Atlas Duo's GPS-disciplined PPS signal disciplines the host system clock, which is then distributed to all sensors via IEEE 1588 PTP. This is the *grandmaster* chain — Sections 4 and 5 set up the sensor *slaves* that synchronize to it.
 
 ```
 ┌─────────────────────────┐
@@ -148,116 +258,39 @@ Accurate time synchronization across all sensors is critical for sensor fusion. 
 │  chrony ← SHM → CLOCK_REALTIME (<100 ns to GPS)   │
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → PTP announce on Ethernet       │
-└──┬────────┬────────┬────────┬────────────────────┘
-   │ PTP    │ PTP    │ PTP    │ PTP (GigE Vision IEEE 1588)
-┌──▼──────┐┌▼──────┐┌▼──────┐┌▼──────────────────────┐
-│Robin W  ││Robin W││Robin W││ 4× RouteCAM            │
-│Front    ││Rear-L ││Rear-R ││ P_CU25_CXLC_IP67       │
-│(0°)     ││(120°) ││(240°) ││ PoE GigE Vision slaves │
-└─────────┘└───────┘└───────┘└────────────────────────┘
+└────────────────────────────────────────────────────┘
 ```
 
-**Expected synchronization accuracy at each stage:**
+**Expected sync accuracy at each stage** (host side — the sensor-side numbers are in Sections 4 and 5):
 
 | Component | Accuracy |
 |-----------|----------|
 | Atlas Duo GNSS PPS | < 20 ns to UTC |
-| chrony (GPS-disciplined CLOCK_REALTIME) | < 100 ns |
-| NIC PHC via phc2sys | < 200 ns |
-| LiDAR PTP slave | 300–800 ns |
-| RouteCAM GigE Vision PTP slave | 1–10 µs |
+| chrony (GPS-disciplined `CLOCK_REALTIME`) | < 100 ns |
+| NIC PHC via `phc2sys` | < 200 ns |
 
-> The RouteCAM number assumes a managed PoE switch with an IEEE 1588 boundary clock (e.g. Planet WGS-6325-8UP2X — see §3.1). Through an unmanaged switch (no boundary clock), expect 5–50 µs instead.
+**Critical:** the host clock MUST be disciplined by GPS (via the Atlas Duo PPS), not by internet NTP alone. NTP provides only ~1–10 ms accuracy, whereas GPS PPS provides < 100 ns. This is what Section 3's script wires up.
 
-**Critical:** The host clock MUST be disciplined by GPS (via the Atlas Duo PPS), not by internet NTP alone. NTP provides only ~1–10 ms accuracy, whereas GPS PPS provides < 100 ns.
+### 3.1 Run the INS-to-PC sync script
 
-### 3.1 Network Requirements
-
-| Configuration | Estimated Bandwidth | Minimum NIC |
-|--------------|-------------------|-------------|
-| 1 Robin W | ~60 Mbps | 1 GbE |
-| 3 Robin W | ~180 Mbps | 1 GbE |
-| 4 RouteCAM (2MP @ 20fps) | ~400 Mbps | 1 GbE |
-| 3 Robin W + 4 RouteCAM + PTP | ~600 Mbps + overhead | 1 GbE OK; **10 GbE recommended** for headroom and jumbo-frame stability |
-
-> **Robin W raw bandwidth:** the Seyond datasheet lists the Robin W output at ~60 Mbps per unit. Earlier drafts of this doc cited 150 Mbps (conflating peak burst with sustained), which overestimates the aggregate by roughly 3×. 3× Robin W = ~180 Mbps sustained; plan jitter/burst headroom at ~1.5× for safety.
-
-**Reference network design**
-
-The recommended hardware combination is a **Teltonika RUTM50 / RUTM54** 5G/4G cellular router (cellular WAN gateway) paired with a **Planet WGS-6325-8UP2X** managed PoE++ switch (sensor LAN with IEEE 1588 boundary clock and 10 GbE uplink). The host PC connects directly to the switch's 10 G SFP+ port — never through the cellular router — so PTP messages travel `host → boundary clock → sensor` and never cross the non-PTP-aware router.
-
-```
-Internet (5G/4G)
-       │
-       ▼
-┌──────────────────────────┐
-│ Teltonika RUTM50/RUTM54  │  192.168.1.1
-│  (cellular gateway only) │  WAN port unused
-└─────────────┬────────────┘
-              │ 1 GbE  (RUTM50 LAN1 → Planet GbE port)
-              ▼
-┌────────────────────────────────────────────────────────┐
-│ Planet WGS-6325-8UP2X (managed L3, IEEE 1588 BC, PoE++)│  192.168.1.2 (mgmt)
-├────────────────────────────────────────────────────────┤
-│ Port    Type            Device                  IP      │
-│ ----    ------------    --------------------    ------ │
-│ 1       1 GbE           → RUTM50 LAN1           (uplink)
-│ 2       2.5 GbE PoE++   RouteCAM Front-Right    .20    │
-│ 3       2.5 GbE PoE++   RouteCAM Front-Left     .21    │
-│ 4       2.5 GbE PoE++   RouteCAM Rear-Left      .22    │
-│ 5       2.5 GbE PoE++   RouteCAM Rear-Right     .23    │
-│ 6       1 GbE  PoE++    Robin W Front           .10    │
-│ 7       1 GbE  PoE++    Robin W Rear-Left       .11    │
-│ 8       1 GbE  PoE++    Robin W Rear-Right      .12    │
-│ SFP1    10 G            Host PC (10G NIC)       .40    │
-│ SFP2    10 G            spare (Atlas Duo Eth / NAS)    │
-└────────────────────────────────────────────────────────┘
-
-Atlas Duo INS — three physical paths to the host (not all over Ethernet):
-  PPS  ──► host /dev/pps0     (BNC, hardware PPS — absolute time origin)
-  USB  ──► host /dev/ttyUSB0  (NMEA + FusionEngine messages)
-  Eth  ──► Planet switch      (192.168.1.30, NTRIP RTK corrections only)
+```bash
+chmod +x 3_setup_ins_to_pc_sync.sh
+./3_setup_ins_to_pc_sync.sh
 ```
 
-**IP plan** — every static device sits below `.100`, so the RUTM50's factory DHCP pool (`.100–.249`) stays untouched and no router configuration is required:
+What it configures:
 
-| 192.168.1.x | Role |
-|-------------|------|
-| .1 | RUTM50 router + DHCP server + default gateway |
-| .2 | Planet WGS-6325-8UP2X management interface |
-| .10 – .12 | Robin W LiDARs (static on sensor) |
-| .20 – .23 | RouteCAM cameras (static via Aravis web UI) |
-| .30 | Atlas Duo INS Ethernet (static, NTRIP RTK only) |
-| .40 | Host PC 10 GbE NIC (static via netplan / NetworkManager) |
-| .100 – .249 | RUTM50 DHCP pool — factory default, untouched |
+- **gpsd:** reads NMEA from the Atlas Duo's serial port (`/dev/ttyUSB0`) and PPS from `/dev/pps0`. Drops into shared memory for chrony.
+- **chrony:** disciplines `CLOCK_REALTIME` to the PPS reference clock (locked to NMEA for second-resolution disambiguation). NTP pools are kept as a holdover fallback.
+- **`ptp4l` grandmaster:** announces on the sensor NIC with `clockClass 6` (locked to primary reference). `time_stamping` is hardware or software depending on what script 2 detected.
+- **`phc2sys`:** copies `CLOCK_REALTIME` into the NIC PHC (only relevant for hardware timestamping).
+- **systemd:** enables and starts `gpsd`, `chrony`, `ptp4l-grandmaster`, `phc2sys-grandmaster`. The chain is live without a reboot.
+- **fusion-engine-driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch.
+- **Point One host tools:** `p1-host-tools/` cloned to `$HOME`, `pip install fusion-engine-client[all]`.
 
-**Why the host connects to the switch, not the router**
+### 3.2 Manual verification
 
-1. *PTP integrity.* The host is the PTP grandmaster. Its sync messages must reach every slave through PTP-aware hardware. The RUTM50 is not a PTP boundary clock; if the host sat on a RUTM50 LAN port, every PTP packet would traverse the router and pick up residence-time jitter that defeats the entire purpose of the boundary-clock switch.
-2. *Bandwidth.* ~600 Mbps of sensor traffic onto a 1 GbE LAN port runs at ~60% saturation. A 10 G SFP+ link host-to-switch eliminates the bottleneck and gives headroom for jumbo frames and bursty camera traffic.
-
-The RUTM50 → Planet uplink carries only NTRIP RTCM3 (~5 kbps) and any host-side internet traffic (SSH, OS updates, NTP fallback). It runs at ~0.1% utilization. Sensor data never leaves the Planet switch.
-
-**Atlas Duo Ethernet (RTK NTRIP)**
-
-The Atlas Duo's Ethernet port has one job in this design: pull RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30`, gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. PPS still travels its own physical BNC wire to `/dev/pps0` and remains the absolute time origin — the Ethernet path adds RTK without altering the time-sync chain.
-
-### 3.2 Hardware vs Software Timestamping
-
-Check your NIC's capabilities with `ethtool -T <interface>`. The setup scripts auto-detect this.
-
-| Timestamping | PTP Accuracy | Sufficient For |
-|-------------|-------------|----------------|
-| Hardware | < 1 µs | Production sensor fusion |
-| Software | 20–50 µs | Development, mapping, general robotics |
-
-Most Intel NICs (I210, I225, X550, X710) support hardware timestamping. USB Ethernet adapters typically do not.
-
----
-
-## 4. Verification (Manual)
-
-After running the setup scripts, verify the full synchronization chain. The scripts run self-tests automatically, but you can re-check manually at any time.
+The script's self-test covers most of this, but here are the manual commands if you want to dig in:
 
 ```bash
 # GPS fix
@@ -278,18 +311,80 @@ sudo journalctl -u ptp4l-grandmaster -f
 sudo journalctl -u phc2sys-grandmaster -f
 # offset values should be < 1000 ns
 
-# PTP slave devices (LiDARs and cameras)
-sudo pmc -u -b 0 'GET PORT_DATA_SET'
-
 # Service status
 sudo systemctl status gpsd chrony ptp4l-grandmaster phc2sys-grandmaster
 ```
 
 ---
 
-## 5. Recording Data
+## Section 4: PTP Sync from PC to LiDARs
 
-### 5.1 Recording Architecture
+Configures the 3× Seyond Robin W LiDARs as PTP slaves of the grandmaster from Section 3, and installs the Seyond ROS 2 driver.
+
+### 4.1 One-time per-LiDAR provisioning (skip if already done)
+
+> **One-time per LiDAR — multi-unit provisioning.** Per Seyond's official [*Robin W1G LiDAR User Manual* V2.2 (2025-01-03)](https://www.seyond.com/wp-content/uploads/2025/03/Seyond-Robin-W1G-LiDAR_User-Manual_V2.2_EN_Public_20250103.pdf) §3.1, every Robin W ships from the factory with the same default IP **`172.168.1.10`** (netmask `255.255.255.0`, gateway `172.168.1.1`) and the same UDP destination port. The dome network runs on `192.168.1.0/24`, so **each LiDAR must be reset to a unique address inside `192.168.1.0/24`** — `192.168.1.10` / `.11` / `.12` per [`../config/network_config.yaml`](../config/network_config.yaml). Running three units on one network also requires a unique UDP destination port per unit, otherwise the host receives three streams on the same port and cannot tell them apart. Both changes (IP renumbering + per-unit UDP port) are handled by [`./provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) — run it **once for each new LiDAR** (or once for the dome when all three are first assembled) to walk every unit from factory state to the per-position assignments documented in [`RobinW_FW2835_Multiunit/README.md`](RobinW_FW2835_Multiunit/README.md). The script is idempotent — re-running it against already-provisioned LiDARs simply prints `[SKIP]` and exits. The provisioning files (`innovusion_lidar_util`, `automotive-master.cfg`, the three per-serial `PCS_ENV` files) are all in this folder; the host UDP receiver IP inside the `PCS_ENV` files is the project host IP `192.168.1.5` from `network_config.yaml`. Because the factory `172.168.1.0/24` subnet does not overlap with the project's `192.168.1.0/24`, the script auto-adds a temporary `172.168.1.100/24` IP alias to the sensor NIC for the duration of provisioning and removes it on exit. Script 4 below presumes provisioning has already happened — if it cannot reach the LiDARs at `192.168.1.10`/`.11`/`.12`, run the provisioning script first.
+
+```bash
+chmod +x provision_robin_w_multiunit.sh
+./provision_robin_w_multiunit.sh
+```
+
+### 4.2 Run the LiDAR PTP-sync script
+
+```bash
+chmod +x 4_setup_lidar_ptp.sh
+./4_setup_lidar_ptp.sh
+```
+
+What it does:
+
+- Verifies the PTP grandmaster from Section 3 is running.
+- Pings each LiDAR at its post-provisioning IP.
+- Enables PTP on each Robin W via `innovusion_lidar_util` (standard IEEE 1588 mode, not automotive gPTP).
+- Clones and builds the Seyond ROS 2 driver (`./build.bash` inside `seyond_ros_driver/`, since `colcon build` from the workspace root doesn't work for Seyond).
+- Self-tests PTP slave sync status on each LiDAR.
+
+Expected post-sync accuracy:
+
+| Component | Accuracy (Tier 1 / RUTM50) | Accuracy (Tier 2 / Planet BC) |
+|-----------|-----------------------------|-------------------------------|
+| Robin W PTP slave to grandmaster | 5–50 µs | 300–800 ns |
+
+---
+
+## Section 5: PTP Sync from PC to Cameras
+
+> **Tier 2 only.** The cameras require PoE and benefit from the Planet WGS-6325-8UP2X boundary clock — see Section 2.2. If you're running a Tier 1 LiDAR-only build, skip this entire section.
+
+### 5.1 Run the camera PTP-sync script
+
+```bash
+chmod +x 5_setup_camera_ptp.sh
+./5_setup_camera_ptp.sh
+```
+
+What it does:
+
+- Verifies the PTP grandmaster from Section 3 is running.
+- Installs the Aravis GigE Vision library and tools (`arv-tool-0.8`, `arv-viewer-0.8`).
+- Installs ROS 2 camera packages (`image_transport`, `camera_info_manager`, etc.).
+- Configures GigE Vision network settings: jumbo frames (MTU 9000) on the sensor NIC, large UDP receive buffers.
+- Detects each RouteCAM on the network via Aravis discovery.
+- Enables PTP on each camera through the GenICam `GevPTPMode = Slave` register.
+- Self-tests PTP slave status on each camera and reports `Synchronized` / `Master` / `Listening`.
+
+Expected post-sync accuracy through the Planet WGS-6325-8UP2X boundary clock:
+
+| Component | Accuracy |
+|-----------|----------|
+| RouteCAM GigE Vision PTP slave | 1–10 µs |
+
+---
+
+## Section 6: Recording Data
+
+### 6.1 Recording architecture
 
 This system uses a **zero-ROS recording approach** for maximum performance:
 
@@ -301,7 +396,7 @@ This system uses a **zero-ROS recording approach** for maximum performance:
 
 Compared to rosbag recording (~30–50% CPU), this skips point cloud decoding, ROS serialization, and DDS middleware during capture. Data is decoded on replay.
 
-### 5.2 Configure Atlas Duo Message Rates
+### 6.2 Configure Atlas Duo message rates
 
 ```bash
 cd ~/p1-host-tools
@@ -312,7 +407,7 @@ python3 bin/config_tool.py apply uart2_message_rate fe ROSIMUMessage on
 python3 bin/config_tool.py save
 ```
 
-### 5.3 Recording with the Fast Recorder Script
+### 6.3 Recording with the fast recorder script
 
 ```bash
 # Single LiDAR
@@ -330,7 +425,7 @@ sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
 
 Interactive commands: `R` start recording, `S` stop, `H` health, `Q` quit.
 
-### 5.4 Session Output Structure
+### 6.4 Session output structure
 
 ```
 ~/recordings/session_20260311_143022/
@@ -351,7 +446,7 @@ Interactive commands: `R` start recording, `S` stop, `H` health, `Q` quit.
 
 All sensors are PTP-synchronized, so timestamps share the same GPS time base and can be aligned in post-processing without additional clock correction.
 
-### 5.5 YAML Configuration Reference
+### 6.5 YAML configuration reference
 
 ```yaml
 point_one_nav:
@@ -374,7 +469,7 @@ recording:
   interface: "eth0"
 ```
 
-### 5.6 Alternative: ROS 2 Native Recording
+### 6.6 Alternative: ROS 2 native recording
 
 If you prefer rosbag (higher CPU but simpler replay):
 
@@ -399,9 +494,9 @@ ros2 topic echo /robin_w_front/points --field header.stamp --once
 
 ---
 
-## 6. Replay and Visualization
+## Section 7: Replay and Visualization
 
-### 6.1 Replay Point One Nav Data (.p1log)
+### 7.1 Replay Point One Nav data (.p1log)
 
 ```bash
 SESSION=~/recordings/session_20260311_143022
@@ -417,7 +512,7 @@ p1_extract $SESSION/p1nav/
 p1_extract --kml $SESSION/p1nav/
 ```
 
-### 6.2 Replay Seyond Robin W PCAPs into ROS 2
+### 7.2 Replay Seyond Robin W PCAPs into ROS 2
 
 ```bash
 ros2 launch seyond start.py \
@@ -427,7 +522,7 @@ ros2 launch seyond start.py \
     frame_topic:=/robin_w_front/points
 ```
 
-### 6.3 Visualize in RViz2 / Foxglove Studio
+### 7.3 Visualize in RViz2 / Foxglove Studio
 
 ```bash
 # RViz2
@@ -440,14 +535,14 @@ foxglove-studio
 # Connect to ws://localhost:8765
 ```
 
-### 6.4 Inspect Raw PCAPs
+### 7.4 Inspect raw PCAPs
 
 ```bash
 tshark -r $SESSION/lidar_pcap/robin_w_front.pcap -q -z io,stat,1
 wireshark $SESSION/lidar_pcap/robin_w_front.pcap
 ```
 
-### 6.5 Convert Replayed Data to Rosbag
+### 7.5 Convert replayed data to rosbag
 
 ```bash
 ros2 bag record -o $SESSION/replayed_rosbag \
@@ -455,7 +550,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
     /tf /tf_static
 ```
 
-### 6.6 Tool Summary
+### 7.6 Tool summary
 
 | Tool | Purpose | Input |
 |------|---------|-------|
@@ -471,19 +566,19 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 
 ## Appendix
 
-### A. Seyond Robin W Default Parameters
+### A. Seyond Robin W default parameters
 
 | Parameter | Factory default | Hitch dome (post-provisioning) | Notes |
 |-----------|-----------------|--------------------------------|-------|
 | IP Address | `172.168.1.10` | `192.168.1.10` / `.11` / `.12` | Factory IP per Seyond *Robin W1G User Manual* V2.2 §3.1. `provision_robin_w_multiunit.sh` renumbers each unit. |
 | Data Port (UDP + TCP) | `8010` | `8337` / `8338` / `8339` | One port per unit. Rebased off Seyond's 8010/8020/8030 example to avoid Hadoop's 8020/8030 and the busy 8000-8099 dev-server range. |
 | Coordinate Mode | `3` (forward/left/up) | same | Matches ROS REP-103 |
-| PTP | Supported | Enabled (standard L3 IEEE 1588) | Enabled by `setup_robin_w_sync.sh` |
+| PTP | Supported | Enabled (standard L3 IEEE 1588) | Enabled by `4_setup_lidar_ptp.sh` |
 | FOV | 120° × 70° | same | |
 | Points/sec | 1.28M | same | 192 scan lines |
 | Range | 0.1–150 m | same | 70 m at 10% reflectivity |
 
-### B. RouteCAM_P_CU25_CXLC_IP67 Key Specs
+### B. RouteCAM_P_CU25_CXLC_IP67 key specs
 
 | Feature | Value |
 |---------|-------|
@@ -496,7 +591,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 | Protection | IP67 |
 | Dome layout | Front stereo pair (104 mm baseline) + rear symmetric pair |
 
-### C. NVIDIA GPU and RT Kernel Compatibility
+### C. NVIDIA GPU and RT kernel compatibility
 
 The NVIDIA kernel module (`nvidia.ko`) cannot load on the PREEMPT_RT kernel. No CUDA, cuDNN, TensorRT, or GPU compute is available on the RT kernel.
 
@@ -505,7 +600,7 @@ The NVIDIA kernel module (`nvidia.ko`) cannot load on the PREEMPT_RT kernel. No 
 | **Generic** | Yes | Training, simulation, GPU inference |
 | **RT** | **No** | Deterministic sensor recording, real-time control |
 
-**Recommended workflow:** Record on the RT kernel (deterministic PTP timing, no GPU needed), then reboot into the generic kernel for post-processing with full CUDA access.
+**Recommended workflow:** record on the RT kernel (deterministic PTP timing, no GPU needed), then reboot into the generic kernel for post-processing with full CUDA access.
 
 ```
 Field recording:   RT kernel → tcpdump + p1_runner (no GPU needed)
@@ -516,7 +611,7 @@ To select the kernel at boot, choose **Advanced options for Ubuntu** in the GRUB
 
 ### D. Troubleshooting
 
-**PTP not syncing (large master offset):** Verify the interface name in the ptp4l config matches your actual interface. Confirm PTP is enabled on each Robin W. Check cable connections.
+**PTP not syncing (large master offset):** Verify the interface name in the `ptp4l` config matches your actual interface. Confirm PTP is enabled on each Robin W. Check cable connections.
 
 **chronyc shows NTP as primary (not PPS/NMEA):** gpsd may not be providing time to chrony. Run `sudo systemctl status gpsd` and `gpsmon`. If `/dev/pps0` does not exist, PPS is not exposed — check your serial connection type.
 
@@ -528,6 +623,6 @@ To select the kernel at boot, choose **Advanced options for Ubuntu** in the GRUB
 
 **gpsd shows "NO FIX":** Ensure the Atlas Duo antenna has clear sky view. Cold start may take up to 30 minutes. Verify the correct baud rate (Atlas Duo defaults to 460800).
 
-**`<cstdint>` build errors:** GCC 14 on Ubuntu 24.04 is stricter. The `setup_ubuntu_sync.sh` script patches this automatically.
+**`<cstdint>` build errors:** GCC 14 on Ubuntu 24.04 is stricter. The `3_setup_ins_to_pc_sync.sh` and `4_setup_lidar_ptp.sh` scripts patch this automatically.
 
-**Seyond build fails:** Use `./build.bash` inside `seyond_ros_driver/` (not `colcon build` from the workspace root). The script `setup_robin_w_sync.sh` handles this.
+**Seyond build fails:** Use `./build.bash` inside `seyond_ros_driver/` (not `colcon build` from the workspace root). The script `4_setup_lidar_ptp.sh` handles this.

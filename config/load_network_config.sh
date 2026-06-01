@@ -19,7 +19,7 @@
 #
 #     NETCFG_FILE          absolute path to the YAML used
 #     NETCFG_ETH           host.interface          (e.g. enp0s31f6)
-#     NETCFG_HOST_IP       host.ip                 (e.g. 192.168.1.40)
+#     NETCFG_HOST_IP       host.ip                 (e.g. 192.168.1.5)
 #     NETCFG_GATEWAY       gateway                 (e.g. 192.168.1.1)
 #     NETCFG_SUBNET        subnet                  (e.g. 192.168.1.0/24)
 #     NETCFG_ATLAS_IP      atlas_duo.ethernet_ip   (e.g. 192.168.1.30)

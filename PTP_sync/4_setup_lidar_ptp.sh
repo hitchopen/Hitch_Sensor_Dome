@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================
-# Step 2: Seyond Robin W LiDAR — PTP Sync + ROS 2 Driver
+# Section 4: PTP Sync from PC to LiDARs
 #
 # Configures up to 3 Seyond Robin W LiDARs as PTP slaves
-# synchronized to the grandmaster set up in Step 1, and installs
-# the Seyond ROS 2 driver.
+# synchronized to the grandmaster built in Section 3, and
+# installs the Seyond ROS 2 driver.
+#
+# Position in the sequence:
+#   ./1_install_packages.sh
+#   ./2_configure_host_network.sh
+#   ./3_setup_ins_to_pc_sync.sh
+#   ./4_setup_lidar_ptp.sh           ← you are here
+#   ./5_setup_camera_ptp.sh
+#
+# One-time per-LiDAR provisioning (IP renumber + per-unit UDP
+# port) is handled by a separate script:
+#   ./provision_robin_w_multiunit.sh
+# Run that ONCE for each new Robin W (or once for the dome
+# when all three are first assembled). This script (Section 4)
+# is the per-host setup you re-run on every fresh OS install
+# and assumes provisioning has already happened.
 #
 # What this script does:
-#   1. Verify PTP grandmaster is running (from Step 1)
+#   1. Verify PTP grandmaster is running (from Section 3)
 #   2. Ping each LiDAR to confirm network connectivity
 #   3. Enable PTP on each Robin W via innovusion_lidar_util
 #   4. Set standard PTP mode (not automotive gPTP)
@@ -15,8 +30,8 @@
 #   6. Verify PTP slave synchronization
 #
 # Prerequisites:
-#   - Step 1 (setup_ubuntu_sync.sh) completed
-#   - Robin W LiDARs powered on and connected to sensor Ethernet
+#   - Sections 1–3 completed
+#   - Robin W LiDARs powered on and connected to sensor LAN
 #   - Default LiDAR IPs: 192.168.1.10, .11, .12
 #
 # Defaults are pulled from ../config/network_config.yaml — edit
@@ -24,14 +39,14 @@
 # optional. CLI flags and env vars still override the YAML.
 #
 # Usage:
-#   chmod +x setup_robin_w_sync.sh
-#   ./setup_robin_w_sync.sh                             # use YAML defaults
-#   ./setup_robin_w_sync.sh [--eth IFACE] [--ips IP1,IP2,IP3]
+#   chmod +x 4_setup_lidar_ptp.sh
+#   ./4_setup_lidar_ptp.sh                              # use YAML defaults
+#   ./4_setup_lidar_ptp.sh [--eth IFACE] [--ips IP1,IP2,IP3]
 #
 # Examples:
-#   ./setup_robin_w_sync.sh
-#   ./setup_robin_w_sync.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11
-#   ./setup_robin_w_sync.sh --ips 192.168.1.10                  # single LiDAR
+#   ./4_setup_lidar_ptp.sh
+#   ./4_setup_lidar_ptp.sh --eth enp0s31f6 --ips 192.168.1.10,192.168.1.11
+#   ./4_setup_lidar_ptp.sh --ips 192.168.1.10           # single LiDAR
 # =============================================================
 
 set -euo pipefail
@@ -67,19 +82,19 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 
 # =============================================================
-info "Step 2: Seyond Robin W LiDAR Setup"
+info "Section 4: PTP sync — PC to LiDARs"
 info "  Ethernet: $ETH_IFACE"
 info "  LiDAR IPs: ${LIDAR_IPS[*]}"
 echo ""
 
 # ─── 1. Verify PTP grandmaster is running ────────────────────
-info "Checking PTP grandmaster from Step 1..."
+info "Checking PTP grandmaster from Section 3..."
 if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
     ok "ptp4l-grandmaster is running"
 else
     warn "ptp4l-grandmaster is not running. Starting it..."
     sudo systemctl start gpsd chrony ptp4l-grandmaster phc2sys-grandmaster 2>/dev/null || \
-        fail "Could not start PTP stack. Run Step 1 first: ./setup_ubuntu_sync.sh"
+        fail "Could not start PTP stack. Run Section 3 first: ./3_setup_ins_to_pc_sync.sh"
     sleep 2
     if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
         ok "ptp4l-grandmaster started"
@@ -323,7 +338,7 @@ verify_lidar_sync() {
     echo " Quick test: launch a LiDAR in ROS 2:"
     echo "   source ~/.bashrc && ros2 launch seyond start.py"
     echo ""
-    echo " Next: ./setup_camera_sync.sh --eth $ETH_IFACE"
+    echo " Next: ./5_setup_camera_ptp.sh --eth $ETH_IFACE"
     echo ""
 }
 

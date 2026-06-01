@@ -32,7 +32,7 @@ If you change the ports, three files have to move together:
 
 The provisioning script's `--help` output and the PCS_ENV files are the canonical source — keep the sensor_config.yaml in sync.
 
-The receiving host's IP is set to **`192.168.1.40`** in every file — that is the project host PC's static IP per [`../../config/network_config.yaml`](../../config/network_config.yaml). Seyond's reference example used `172.168.1.100`; we replaced it because the dome network runs on `192.168.1.0/24`.
+The receiving host's IP is set to **`192.168.1.5`** in every file — that is the project host PC's static IP per [`../../config/network_config.yaml`](../../config/network_config.yaml). Seyond's reference example used `172.168.1.100`; we replaced it because the dome network runs on `192.168.1.0/24`.
 
 ## Note on the Seyond factory default IP
 
@@ -40,9 +40,9 @@ A brand-new Robin W1G ships with **`172.168.1.10`** as its factory IP, per Seyon
 
 > *"The initial IP address of the LiDAR is 172.168.1.10. The initial subnet mask is 255.255.255.0. The initial gateway is 172.168.1.1."*
 
-That subnet is publicly-routable IPv4 space (it is **not** inside RFC 1918's `172.16.0.0/12` private block, which ends at `172.31.x.x` — `172.168.x.x` is an entirely different range). For our purposes this is fine because the dome NIC is air-gapped from the public internet, but it does mean the host PC cannot ping a factory-state LiDAR from its normal `192.168.1.40` address — the two subnets don't share an L3 path.
+That subnet is publicly-routable IPv4 space (it is **not** inside RFC 1918's `172.16.0.0/12` private block, which ends at `172.31.x.x` — `172.168.x.x` is an entirely different range). For our purposes this is fine because the dome NIC is air-gapped from the public internet, but it does mean the host PC cannot ping a factory-state LiDAR from its normal `192.168.1.5` address — the two subnets don't share an L3 path.
 
-`provision_robin_w_multiunit.sh` handles this automatically by adding a **temporary** `172.168.1.100/24` IP alias to the sensor NIC at the start of provisioning, then removing it on exit. The alias coexists with the regular `192.168.1.40/24` address (both work simultaneously at L2), so the post-provisioning ping at the new `192.168.1.X` address also succeeds inside the same script run. If you ever need to reach a factory LiDAR by hand:
+`provision_robin_w_multiunit.sh` handles this automatically by adding a **temporary** `172.168.1.100/24` IP alias to the sensor NIC at the start of provisioning, then removing it on exit. The alias coexists with the regular `192.168.1.5/24` address (both work simultaneously at L2), so the post-provisioning ping at the new `192.168.1.X` address also succeeds inside the same script run. If you ever need to reach a factory LiDAR by hand:
 
 ```bash
 # Add (run once at the start of a manual provisioning session):
@@ -61,7 +61,7 @@ Before the first multi-unit provisioning run, confirm that the serials in the ta
 # At factory state (with the 172.168.1.100/24 alias up):
 curl -s http://172.168.1.10/api/v1/static_info | python3 -m json.tool | grep -i serial
 
-# After provisioning (host's normal 192.168.1.40 address suffices):
+# After provisioning (host's normal 192.168.1.5 address suffices):
 curl -s http://192.168.1.10/api/v1/static_info | python3 -m json.tool | grep -i serial
 ```
 
@@ -71,7 +71,7 @@ If a serial does not appear in the table above, the provisioning script will ref
 
 ```
 TCP_SERVICE_PORT=833X       # TCP control port (matches UDP_PORT_*)
-UDP_IP=192.168.1.40         # host PC destination
+UDP_IP=192.168.1.5         # host PC destination
 UDP_PORT_DATA=833X          # point cloud frames
 UDP_PORT_MESSAGE=833X       # status messages
 UDP_PORT_STATUS=833X        # health status

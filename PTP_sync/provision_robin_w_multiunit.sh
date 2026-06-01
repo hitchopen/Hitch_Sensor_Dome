@@ -14,7 +14,7 @@
 #       robin_w_rear_right  .12
 #
 # The script auto-adds a temporary 172.168.1.100/24 IP alias to the
-# sensor NIC so the host (on 192.168.1.40) can reach factory-state
+# sensor NIC so the host (on 192.168.1.5) can reach factory-state
 # LiDARs. Alias is removed on exit.
 #
 # This is the same procedure Seyond publishes for running three
@@ -26,7 +26,7 @@
 #
 # Both are handled here. Run ONCE per LiDAR — re-running it on an
 # already-configured LiDAR is harmless (it detects the new IP and
-# skips), but the standard per-host setup (./setup_robin_w_sync.sh)
+# skips), but the standard per-host setup (./4_setup_lidar_ptp.sh)
 # is what you run on every fresh OS install of the host PC.
 #
 # Files this script uses (all in PTP_sync/):
@@ -119,7 +119,7 @@ fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 #
 # We add a temporary alias 172.168.1.100/24 to the sensor NIC at the
 # start of provisioning, and remove it on exit. The alias coexists
-# with the host's 192.168.1.40/24 address (both are reachable at L2),
+# with the host's 192.168.1.5/24 address (both are reachable at L2),
 # so post-provisioning pings to the new 192.168.1.X address also work
 # from the same script run.
 #
@@ -138,7 +138,7 @@ maybe_add_alias() {
     info "Adding temporary IP alias $ALIAS_IP on $TARGET_IFACE (sudo)"
     if sudo ip addr add "$ALIAS_IP" dev "$TARGET_IFACE" 2>/dev/null; then
         ALIAS_ADDED=1
-        ok "Alias up — host reachable on both 192.168.1.40 and ${ALIAS_IP%/*}"
+        ok "Alias up — host reachable on both 192.168.1.5 and ${ALIAS_IP%/*}"
     else
         warn "Could not add IP alias. You may need to run:"
         warn "  sudo ip addr add $ALIAS_IP dev $TARGET_IFACE"
@@ -303,7 +303,7 @@ echo ""
 if [ "$ANY_FAIL" -eq 0 ]; then
     ok "All requested Robin Ws provisioned."
     echo ""
-    echo " Next: ./setup_robin_w_sync.sh   # per-host PTP + driver setup"
+    echo " Next: ./4_setup_lidar_ptp.sh   # per-host PTP + driver setup"
 else
     warn "One or more units could not be provisioned — see [WARN]/[FAIL] above."
     exit 2

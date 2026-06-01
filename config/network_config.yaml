@@ -9,13 +9,29 @@
 # CLI flags and environment variables still override these
 # defaults at runtime (env > CLI > this YAML > built-in).
 #
-# Reference topology (see PTP_sync/README.md §3.1):
-#   Internet → Teltonika RUTM50/RUTM54 (router, .1)
-#                → Planet WGS-6325-8UP2X (managed PoE++ switch, .2)
-#                    → Host PC 10G NIC          (.40)
-#                    → 4× RouteCAM cameras      (.20–.23)
-#                    → 3× Robin W LiDARs        (.10–.12)
-#                    → Atlas Duo Eth (NTRIP)    (.30)
+# Reference topology — two tiers (see PTP_sync/README.md §3.1):
+#
+#   ╔══ Tier 1 — LiDAR-only (no separate PoE switch) ════════╗
+#   Internet → Teltonika RUTM50 (router, .1)
+#       │  WAN port reconfigured as LAN (Network → LAN → "Use
+#       │  WAN port as LAN") so all 5 RJ45 ports are LAN.
+#       ├─ WAN-as-LAN port → Host PC (.5)
+#       ├─ LAN 1 → Robin W front          (.10)
+#       ├─ LAN 2 → Robin W rear-left      (.11)
+#       ├─ LAN 3 → Robin W rear-right     (.12)
+#       └─ LAN 4 → Atlas Duo Eth (NTRIP)  (.30)
+#       LiDARs need 12 V DC (or a passive PoE injector) since
+#       RUTM50 ports do not source PoE. PTP traverses the RUTM50
+#       internal switch — expect ~5–50 µs LiDAR sync (no
+#       boundary clock); still well inside LiDAR fusion needs.
+#
+#   ╔══ Tier 2 — adds 4× cameras (PoE++ + boundary clock) ═══╗
+#   Tier 1 stays untouched; insert a Planet WGS-6325-8UP2X
+#   downstream of the RUTM50 to host the 4× RouteCAM cameras.
+#   Camera PTP rides the Planet's IEEE 1588 boundary clock for
+#   1–10 µs accuracy. PC, INS, and LiDARs may migrate onto the
+#   Planet switch at this point if you want every sensor on a
+#   PTP-aware fabric.
 # =============================================================
 
 # ─── Network identity ──────────────────────────────────────
@@ -32,7 +48,8 @@ broadcast: "192.168.1.255"
 #   enp1s0f0    PCIe NIC slot 1 port 0 (e.g. Intel X550-T2)
 host:
   interface: "enp0s31f6"        # CHANGE THIS for your system
-  ip:        "192.168.1.40"     # static, below RUTM50 DHCP pool
+  ip:        "192.168.1.5"      # static, below RUTM50 DHCP pool
+                                # (was .40 in pre-Tier-1 design)
 
 # ─── Infrastructure ────────────────────────────────────────
 router:

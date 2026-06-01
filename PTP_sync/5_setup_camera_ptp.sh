@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================
-# Step 3: RouteCAM GigE Vision Cameras — PTP Sync + Driver
+# Section 5: PTP Sync from PC to Cameras
 #
 # Configures 4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision
-# cameras for PTP-synchronized image capture via IEEE 1588.
+# cameras as PTP slaves of the grandmaster built in Section 3.
+#
+# Position in the sequence:
+#   ./1_install_packages.sh
+#   ./2_configure_host_network.sh
+#   ./3_setup_ins_to_pc_sync.sh
+#   ./4_setup_lidar_ptp.sh
+#   ./5_setup_camera_ptp.sh          ← you are here
+#
+# Cameras REQUIRE Tier 2 of the reference network (PoE++
+# switch). See PTP_sync/README.md §2. If you're running a
+# LiDAR-only Tier 1 build, skip this script entirely.
 #
 # What this script does:
 #   1. Install Aravis GigE Vision library and tools
@@ -14,22 +25,22 @@
 #   6. Verify PTP synchronization status
 #
 # Prerequisites:
-#   - Step 1 (setup_ubuntu_sync.sh) completed
-#   - Cameras powered via PoE switch on sensor Ethernet
+#   - Sections 1–3 completed
+#   - Cameras powered via PoE switch on sensor LAN (Tier 2)
 #   - Default camera IPs: 192.168.1.20–.23
 #
-# Usage:
 # Defaults are pulled from ../config/network_config.yaml — edit
 # that file once for your installation, and these flags become
 # optional. CLI flags and env vars still override the YAML.
 #
-#   chmod +x setup_camera_sync.sh
-#   ./setup_camera_sync.sh                              # use YAML defaults
-#   ./setup_camera_sync.sh [--eth IFACE] [--ips IP1,IP2,IP3,IP4]
+# Usage:
+#   chmod +x 5_setup_camera_ptp.sh
+#   ./5_setup_camera_ptp.sh                             # use YAML defaults
+#   ./5_setup_camera_ptp.sh [--eth IFACE] [--ips IP1,IP2,IP3,IP4]
 #
 # Examples:
-#   ./setup_camera_sync.sh
-#   ./setup_camera_sync.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21
+#   ./5_setup_camera_ptp.sh
+#   ./5_setup_camera_ptp.sh --eth enp0s31f6 --ips 192.168.1.20,192.168.1.21
 # =============================================================
 
 set -euo pipefail
@@ -66,13 +77,13 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 
 # =============================================================
-info "Step 3: RouteCAM GigE Vision Camera Setup"
+info "Section 5: PTP sync — PC to Cameras"
 info "  Ethernet: $ETH_IFACE"
 info "  Camera IPs: ${CAM_IPS[*]}"
 echo ""
 
 # ─── 1. Verify PTP grandmaster is running ────────────────────
-info "Checking PTP grandmaster from Step 1..."
+info "Checking PTP grandmaster from Section 3..."
 if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
     ok "ptp4l-grandmaster is running"
 else
@@ -223,7 +234,7 @@ verify_camera_sync() {
         ok "  ptp4l-grandmaster is running"
         ((PASS++))
     else
-        echo "  FAIL: ptp4l-grandmaster not running — run Step 1 first"
+        echo "  FAIL: ptp4l-grandmaster not running — run Section 3 first"
         ((FAIL++))
     fi
 
