@@ -4,7 +4,7 @@
 
 **目标硬件：**
 - Ubuntu 24.04 LTS 工作站（在 Lenovo ThinkPad P1 Gen 6、Intel i9-13900H 上验证）
-- Point One Nav Atlas Duo（带 PPS 输出的 GNSS / INS）
+- Point One Nav Atlas Duo（GNSS / INS，仅以太网）
 - 最多 3 台 Seyond Robin W 方向性 LiDAR
 - 4 台 e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision 摄像头（PoE、IEEE 1588 PTP、2MP 全局快门）
 
@@ -14,7 +14,7 @@
 |---|--------|--------|
 | 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt 依赖、RT 调度权限、内核调优、ROS 2 Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | 主机 NIC 静态 IP、硬件时间戳检测、RUTM50 可达性 |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd、chrony（PPS 锁定）、ptp4l grandmaster、phc2sys、fusion-engine-driver |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd（TCP 上的 NMEA）、chrony、ptp4l grandmaster、phc2sys、fusion-engine-driver（TCP） |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave 启用 + Seyond ROS 2 驱动 |
 | 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave 启用 + Aravis（仅 Tier 2） |
 
@@ -108,11 +108,17 @@ Internet (5G 蜂窝)
 │ LAN 4          Atlas Duo 以太 (NTRIP)               .30       │
 └─────────────────────────────────────────────────────────────┘
 
-Atlas Duo INS —— 三条到主机的物理通道（并非全部走以太网）：
-  PPS  ──► 主机 /dev/pps0     (BNC, 硬件 PPS —— 绝对时间源)
-  USB  ──► 主机 /dev/ttyUSB0  (NMEA + FusionEngine 报文)
-  以太 ──► RUTM50 LAN 4       (192.168.1.30, 仅用于 NTRIP RTK 校正)
+Atlas Duo INS —— 单条以太网通道到主机：
+  以太 ──► RUTM50 LAN 4       (192.168.1.30)
+                              ├── FusionEngine over TCP 30201 → 主机
+                              │    (/pose, /imu, /gps/fix, /odom)
+                              ├── NMEA 0183 over TCP 30200 → 主机
+                              │    (gpsd → chrony → CLOCK_REALTIME, ~10–100 ms 精度)
+                              └── NTRIP RTCM3 from caster → Atlas
+                                   (RTK 校正，约 5 kbps)
 ```
+
+> **仅以太网的 Atlas Duo 连接。** 这是 Atlas Duo 在时间和数据上对外暴露的唯一通道 —— 设备本身不提供 BNC PPS 引脚，也不提供 USB 串口的 NMEA 输出。一条从 Atlas Duo 到 RUTM50 LAN 4 的网线承担全部职责：FusionEngine（姿态 / IMU / GPSFix / odom）走 TCP 30201、NMEA 0183 走 TCP 30200 供 chrony 使用、NTRIP RTCM3 由 caster 反向喂回 Atlas、设备的 REST API 走 HTTP。后果：主机 `CLOCK_REALTIME` 精度为 ~10–100 ms（仅 NMEA via gpsd），而不是硬件 PPS 可达的亚 100 ns；跨传感器 PTP 同步**不受影响**，主机 NIC PHC 仍在局域网上作 PTP grandmaster，LiDAR / 摄像头同步保持在 5–50 µs / 1–10 µs；绝对 GPS 时间对所有从 FusionEngine 消息头读取时间戳的消费者也**不受影响** —— Atlas 在每条消息里嵌入自己的 GPS 时间戳。
 
 **Tier 1 下 LiDAR 的供电。** Robin W 可走 PoE（IEEE 802.3af）**或**12 V DC；RUTM50 LAN 口**不**带 PoE 输出。Tier 1 下有两种选择：
 
@@ -187,7 +193,7 @@ Tier 1 和 Tier 2 共用同一份地址表。所有静态设备都在 `.100` 以
 
 > **为什么 `.5` 和 `.30` 固定到这两个地址。** 在 RUTM50 的 Network → LAN → Static Leases 页通过 MAC 地址把 PC 静态租约到 .5、把 Atlas Duo 静态租约到 .30。这样两台设备重启之后还是同一地址，而设备端完全不需要写静态网络配置 —— RUTM50 每次都发同一个 IP。完整的 Static Leases 操作步骤见项目根目录 README 的网络小节。
 
-**Atlas Duo 以太网（RTK NTRIP）。** Atlas Duo 的以太网口在两层架构下都只承担一项任务：从你的 caster（Trimble VRS Now、本地基站等）拉取 RTK NTRIP 校正（RTCM3）。通过 Atlas Web UI 配置：静态 IP `192.168.1.30`（或 DHCP + 保留）、网关 `192.168.1.1`、DNS `192.168.1.1`，将 NTRIP 客户端指向你的 caster。PPS 仍然走自己的 BNC 物理线缆到 `/dev/pps0`，保持作为绝对时间源 —— 以太网通道仅添加 RTK，不改变时间同步链。
+**Atlas Duo 以太网（时间 + 数据 + NTRIP）。** Atlas Duo 唯一对外暴露的时间与数据接口就是以太网口 —— 它的硬件不带 BNC PPS 引脚，也不带 USB 串口的数据输出。同一条网线既把 FusionEngine（TCP 30201）和 NMEA（TCP 30200）送到主机，也从你的 caster（Trimble VRS Now、本地基站等）反向拉取 RTK NTRIP 校正（RTCM3）。通过 Atlas Web UI 配置：静态 IP `192.168.1.30`（或 DHCP + 保留）、网关 `192.168.1.1`、DNS `192.168.1.1`，将 NTRIP 客户端指向你的 caster。整条时间同步链（gpsd → chrony → ptp4l）都跑在这同一条以太网上 —— 主机侧的配置见 §3。
 
 ### 2.4 各层带宽估算
 
@@ -236,40 +242,42 @@ ip link show
 
 ## 第 3 节：INS 到 PC 的 PTP 同步
 
-Point One Nav Atlas Duo 的 GPS 规范 PPS 信号规范主机系统时钟，再由主机通过 IEEE 1588 PTP 分发给所有传感器。这是 *grandmaster* 链路 —— 第 4、5 节配置同步到它的传感器 *slave*。
+Point One Nav Atlas Duo 通过 TCP 输出 NMEA 用于规范主机 `CLOCK_REALTIME`，同时通过 TCP 输出 FusionEngine 把姿态 / IMU / GPSFix / 里程信息送给 ROS 2 驱动。主机则在传感器局域网上扮演 PTP grandmaster 角色 —— 第 4、5 节配置同步到它的传感器 *slave*。
 
 ```
 ┌─────────────────────────┐
 │  GPS 卫星                 │
 └───────────┬─────────────┘
             │ RF
-┌───────────▼─────────────┐
-│  Point One Nav Atlas Duo │  ← GPS 规范时钟 (<20 ns 精度)
-│  - PPS 输出 (1Hz 脉冲)    │
-│  - NMEA/FusionEngine     │
-│  - IMU @ 200Hz           │
-└─────┬──────────┬────────┘
-      │ PPS      │ NMEA 串口
-      │ /dev/pps0│ /dev/ttyUSB0
-┌─────▼──────────▼─────────────────────────────────┐
-│  Ubuntu 24.04 主机 (PTP Grandmaster)              │
+┌───────────▼──────────────────┐
+│  Point One Nav Atlas Duo      │  ← GPS 定位 + 通过 Polaris/NTRIP 拉 RTK
+│  - FusionEngine TCP 30201     │  ← /pose, /imu, /gps/fix, /odom
+│  - NMEA 0183  TCP 30200       │  ← gpsd 源 (GPS 时间，无 PPS)
+│  - REST API HTTP 80           │  ← 配置 + 监控
+└─────────────┬─────────────────┘
+              │ 以太网 (单根线到 RUTM50 LAN 4)
+              │ Atlas at 192.168.1.30
+┌─────────────▼─────────────────────────────────────┐
+│  Ubuntu 24.04 主机 (PTP Grandmaster, 192.168.1.5) │
 │                                                    │
-│  gpsd ← PPS + NMEA → 共享内存 (SHM)                │
-│  chrony ← SHM → CLOCK_REALTIME (<100 ns 到 GPS)   │
+│  gpsd ← tcp://192.168.1.30:30200 (NMEA) → SHM     │
+│  chrony ← SHM → CLOCK_REALTIME (~10–100 ms 到 GPS) │
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → 在以太网上 announce PTP        │
+│  fusion-engine-driver: TCP 30201 → /pose /imu /…   │
 └────────────────────────────────────────────────────┘
 ```
 
 **主机侧各阶段的预期同步精度**（传感器侧数值见第 4、5 节）：
 
-| 组件 | 精度 |
-|------|------|
-| Atlas Duo GNSS PPS | < 20 ns to UTC |
-| chrony (GPS 规范 `CLOCK_REALTIME`) | < 100 ns |
-| NIC PHC via `phc2sys` | < 200 ns |
+| 组件 | 精度 | 说明 |
+|------|------|-----|
+| Atlas Duo 内部 GPS 时间 | < 20 ns to UTC | 在设备内部；通过 FusionEngine 消息时间戳暴露出来 |
+| chrony (NMEA 规范的 `CLOCK_REALTIME`) | ~10–100 ms | 仅 NMEA，无 PPS。见下方说明。 |
+| NIC PHC via `phc2sys` | 跟踪 `CLOCK_REALTIME` ± 200 ns | 即使 `CLOCK_REALTIME` 相对 GPS 漂移，相对跟踪仍然紧密 |
+| FusionEngine 消息 `header.stamp` | < 20 ns to GPS | Atlas 嵌入每条消息，与主机时钟无关 |
 
-**关键：** 主机时钟必须由 GPS 规范（通过 Atlas Duo PPS），而不是仅由互联网 NTP 规范。NTP 仅提供约 1–10 ms 精度，而 GPS PPS 提供 < 100 ns。这正是第 3 节脚本所搭建的链路。
+> **为什么主机时钟变松。** Atlas Duo 唯一对外暴露的时间输出是通过 TCP 出来的 NMEA 句子流（设备硬件本身没有 PPS BNC 输出，也没有 USB 串口数据输出）。NMEA 是句速率（1 Hz），没有亚秒级边沿，所以 chrony 通常能把 `CLOCK_REALTIME` 规范到 ±10–100 ms 量级 —— 不是硬件 PPS 边沿能给的 < 100 ns 精度。这对于 ROS 话题 `header.stamp` 来说没问题，因为录制脚本会从 FusionEngine 消息头里取 Atlas 时间戳（那个仍然是设备端的 GPS 精度，与主机时钟漂移无关）。raw `tcpdump` 包的内核时间戳继承的是较松的 `CLOCK_REALTIME` 精度 —— 如果你在乎包级时间精确对齐到 GPS 亚毫秒，做后处理时让它与同一份抓包里的 FusionEngine 消息互相对齐即可。跨传感器 PTP（主机 PHC ↔ LiDAR / 摄像头从机）不受影响 —— 相对跨传感器同步仍是亚 µs（硬件时间戳）或亚 50 µs（软件时间戳）。
 
 ### 3.1 运行 INS-to-PC 同步脚本
 
@@ -280,12 +288,12 @@ chmod +x 3_setup_ins_to_pc_sync.sh
 
 它会配置：
 
-- **gpsd：** 从 Atlas Duo 串口（`/dev/ttyUSB0`）读 NMEA，从 `/dev/pps0` 读 PPS。落到共享内存供 chrony 使用。
-- **chrony：** 用 PPS 参考时钟规范 `CLOCK_REALTIME`（用 NMEA 锁定秒值消歧）。NTP 池保留作为备援。
-- **`ptp4l` grandmaster：** 在传感器 NIC 上以 `clockClass 6`（锁定到一级参考）announce。`time_stamping` 根据第 2 节脚本检测到的能力选择 hardware 或 software。
+- **gpsd：** 通过 TCP 从 Atlas Duo 的 `tcp://192.168.1.30:30200` 读 NMEA。落到共享内存供 chrony 使用。不再用 `/dev/ttyUSB0` 或 `/dev/pps0`。
+- **chrony：** 用 gpsd SHM（仅 NMEA）规范 `CLOCK_REALTIME`。NTP 池保留作为备援。稳态预期精度约 10–100 ms。
+- **`ptp4l` grandmaster：** 在传感器 NIC 上 announce。由于主机时钟不再被规范到 < 100 ns 的 GPS 精度，脚本默认把 `clockClass` 设为 **13**（应用专用、锁到内部参考），而不是 6（锁到一级 GPS 参考）。跨传感器 PTP 同步仍然紧密；改成 13 只是诚实告诉 PTP 从机当前的绝对时间归属。
 - **`phc2sys`：** 把 `CLOCK_REALTIME` 复制到 NIC PHC（仅硬件时间戳时相关）。
 - **systemd：** enable 并启动 `gpsd`、`chrony`、`ptp4l-grandmaster`、`phc2sys-grandmaster`。整个链路无需重启即可生效。
-- **fusion-engine-driver：** 克隆并 `colcon build` Point One Nav ROS 2 驱动到 `~/ros2_ws/`。自动打 GCC 14 的 `<cstdint>` 补丁。
+- **fusion-engine-driver：** 克隆并 `colcon build` Point One Nav ROS 2 驱动到 `~/ros2_ws/`。自动打 GCC 14 的 `<cstdint>` 补丁。驱动调用使用 `connection_type:=tcp` 加 Atlas Duo IP（不再使用 `connection_type:=tty`）。
 - **Point One host tools：** 把 `p1-host-tools/` 克隆到 `$HOME`，`pip install fusion-engine-client[all]`。
 
 ### 3.2 手动验证
@@ -297,10 +305,22 @@ chmod +x 3_setup_ins_to_pc_sync.sh
 gpsmon
 # 应显示卫星、定位类型 (3D)、时间
 
-# chrony —— GPS PPS 应被星号标记，而不是 NTP
+# Atlas Duo 可达性
+ping -c 3 192.168.1.30
+curl -s http://192.168.1.30/api/v1/device/status | python3 -m json.tool
+
+# 从 Atlas Duo 拉 TCP NMEA 流
+nc -w 5 192.168.1.30 30200 | head -20
+# 应看到 $GPGGA、$GPRMC 等句子
+
+# 从 Atlas Duo 拉 TCP FusionEngine 流
+nc -w 5 192.168.1.30 30201 | xxd | head -5
+# 应看到二进制 FusionEngine 帧
+
+# chrony —— NMEA 应被星号标记
 chronyc sources -v
 chronyc tracking
-# "Reference ID" 应显示 PPS 或 NMEA，而不是 NTP 服务器 IP
+# "Reference ID" 应显示 NMEA，而不是 NTP 服务器 IP
 
 # PTP grandmaster
 sudo journalctl -u ptp4l-grandmaster -f
@@ -450,8 +470,9 @@ sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
 
 ```yaml
 point_one_nav:
-  device_port: "/dev/ttyUSB0"
-  baud_rate: 460800
+  connection_type: "tcp"
+  tcp_host: "192.168.1.30"
+  tcp_port: 30201
 
 lidars:
   - name: "robin_w_front"
@@ -474,9 +495,11 @@ recording:
 如果你更习惯 rosbag（CPU 占用更高但回放更简单）：
 
 ```bash
-# 终端 1 —— Point One Nav
+# 终端 1 —— Point One Nav（TCP 上的 FusionEngine）
 ros2 run fusion-engine-driver fusion_engine_ros_driver --ros-args \
-    -p connection_type:=tty -p tty_port:=/dev/ttyUSB0
+    -p connection_type:=tcp \
+    -p tcp_host:=192.168.1.30 \
+    -p tcp_port:=30201
 
 # 终端 2 —— Seyond Robin W
 ros2 launch seyond start.py
@@ -613,7 +636,7 @@ NVIDIA 内核模块（`nvidia.ko`）无法在 PREEMPT_RT 内核上加载。RT �
 
 **PTP 不同步（master offset 很大）：** 确认 `ptp4l` 配置中的接口名称与实际匹配。确认每台 Robin W 都启用了 PTP。检查电缆连接。
 
-**chronyc 显示 NTP 为主源（不是 PPS/NMEA）：** gpsd 可能未给 chrony 提供时间。运行 `sudo systemctl status gpsd` 和 `gpsmon`。如果 `/dev/pps0` 不存在，说明 PPS 没暴露 —— 检查你的串口连接方式。
+**chronyc 显示 NTP 为主源（不是 NMEA）：** gpsd 可能没拿到 Atlas Duo 的 TCP 流。先 `ping 192.168.1.30` 确认可达，再确认 Atlas Duo 已在 Web UI 上点了 Start Navigating（不启动导航引擎，就没有 NMEA 输出）。运行 `sudo systemctl status gpsd` 和 `gpsmon`。绕开 gpsd 直接测原始 NMEA：`nc -w 5 192.168.1.30 30200 | head`。
 
 **LiDAR 丢包：** 通常是网络带宽饱和。用 `sudo ethtool -S eth0 | grep -i drop` 检查。3 台 Robin W + 4 台摄像头建议用 10 GbE NIC。
 

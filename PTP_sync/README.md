@@ -4,7 +4,7 @@ Installation and configuration guide for a high-performance GNSS / IMU / LiDAR /
 
 **Target Hardware:**
 - Ubuntu 24.04 LTS workstation (tested on Lenovo ThinkPad P1 Gen 6, Intel i9-13900H)
-- Point One Nav Atlas Duo (GNSS / INS with PPS output)
+- Point One Nav Atlas Duo (GNSS / INS, Ethernet-only)
 - Up to 3× Seyond Robin W directional LiDARs
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision cameras (PoE, IEEE 1588 PTP, 2MP global shutter)
 
@@ -14,7 +14,7 @@ Installation and configuration guide for a high-performance GNSS / IMU / LiDAR /
 |---|--------|--------------|
 | 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt prerequisites, RT scheduling permissions, kernel tuning, ROS 2 Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | Host NIC static IP, hardware-timestamping detection, RUTM50 reachability |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd, chrony (PPS-locked), ptp4l grandmaster, phc2sys, fusion-engine-driver |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd (NMEA over TCP), chrony, ptp4l grandmaster, phc2sys, fusion-engine-driver (TCP) |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave enable + Seyond ROS 2 driver |
 | 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave enable + Aravis (Tier 2 only) |
 
@@ -108,11 +108,17 @@ Internet (5G cellular)
 │ LAN 4          Atlas Duo Eth (NTRIP)               .30       │
 └─────────────────────────────────────────────────────────────┘
 
-Atlas Duo INS — three physical paths to the host (not all over Ethernet):
-  PPS  ──► host /dev/pps0     (BNC, hardware PPS — absolute time origin)
-  USB  ──► host /dev/ttyUSB0  (NMEA + FusionEngine messages)
-  Eth  ──► RUTM50 LAN 4       (192.168.1.30, NTRIP RTK corrections only)
+Atlas Duo INS — single Ethernet path to the host:
+  Eth  ──► RUTM50 LAN 4       (192.168.1.30)
+                              ├── FusionEngine over TCP 30201 → host
+                              │    (/pose, /imu, /gps/fix, /odom)
+                              ├── NMEA 0183 over TCP 30200 → host
+                              │    (gpsd → chrony → CLOCK_REALTIME, ~10–100 ms accuracy)
+                              └── NTRIP RTCM3 from caster → Atlas
+                                   (RTK corrections, ~5 kbps)
 ```
+
+> **Ethernet-only Atlas Duo connection.** This is the only path the Atlas Duo exposes for time + data — its hardware does not provide a BNC PPS pin or a USB serial NMEA stream. One cable from the Atlas Duo to RUTM50 LAN 4 carries everything: FusionEngine (pose / IMU / GPSFix / odom) over TCP 30201, NMEA 0183 over TCP 30200 for chrony, NTRIP RTCM3 inbound from the caster, and the device's REST API over HTTP. Consequences: host `CLOCK_REALTIME` discipline is ~10–100 ms (NMEA-only via gpsd) instead of the sub-100 ns a hardware PPS would give; cross-sensor PTP sync is **unaffected** because the host's NIC PHC is still the PTP grandmaster on the LAN, and LiDARs/cameras stay in the 5–50 µs / 1–10 µs ranges (see §3 / §4 / §5 tables); absolute GPS time is **also unaffected** for any consumer that reads it from FusionEngine message headers, since each message carries its own GPS timestamp built in by the Atlas.
 
 **LiDAR power in Tier 1.** Robin W can run on PoE (IEEE 802.3af) **or** 12 V DC; RUTM50 LAN ports do **not** source PoE. In Tier 1 you have two options:
 
@@ -187,7 +193,7 @@ Same across Tier 1 and Tier 2. Every static device sits below `.100`, so the RUT
 
 > **Why `.5` and `.30` are pinned to specific addresses.** Static-lease the PC at .5 and the Atlas Duo at .30 via the RUTM50's Network → LAN → Static Leases page (bind to MAC). This way both devices stay at known IPs across reboots without any device-side static config — the RUTM50 always hands them the same address. See the project root README's network section for the full Static Leases procedure.
 
-**Atlas Duo Ethernet (RTK NTRIP).** The Atlas Duo's Ethernet port has one job in either tier: pull RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30` (or DHCP + reservation), gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. PPS still travels its own physical BNC wire to `/dev/pps0` and remains the absolute time origin — the Ethernet path adds RTK without altering the time-sync chain.
+**Atlas Duo Ethernet (time + data + NTRIP).** The Atlas Duo's Ethernet port is the only interface it exposes for time and data — its hardware does not have a BNC PPS output or a USB serial data output. The same cable that carries FusionEngine (TCP 30201) and NMEA (TCP 30200) to the host also pulls RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30` (or DHCP + reservation), gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. The time-sync chain (gpsd → chrony → ptp4l) all rides on this same Ethernet path — see §3 for the host-side configuration.
 
 ### 2.4 Network bandwidth at each tier
 
@@ -236,40 +242,42 @@ Most Intel NICs (I210, I225, X550, X710) support hardware timestamping. USB Ethe
 
 ## Section 3: PTP Sync from INS to PC
 
-The Point One Nav Atlas Duo's GPS-disciplined PPS signal disciplines the host system clock, which is then distributed to all sensors via IEEE 1588 PTP. This is the *grandmaster* chain — Sections 4 and 5 set up the sensor *slaves* that synchronize to it.
+The Point One Nav Atlas Duo serves NMEA over TCP to discipline the host's `CLOCK_REALTIME`, while FusionEngine over TCP carries pose / IMU / GPSFix / odometry to the ROS 2 driver. The host then acts as the PTP grandmaster on the sensor LAN — Sections 4 and 5 set up the sensor *slaves* that synchronize to it.
 
 ```
 ┌─────────────────────────┐
 │  GPS Satellites          │
 └───────────┬─────────────┘
             │ RF
-┌───────────▼─────────────┐
-│  Point One Nav Atlas Duo │  ← GPS-disciplined clock (<20 ns accuracy)
-│  - PPS output (1Hz pulse)│
-│  - NMEA/FusionEngine     │
-│  - IMU @ 200Hz           │
-└─────┬──────────┬────────┘
-      │ PPS      │ NMEA serial
-      │ /dev/pps0│ /dev/ttyUSB0
-┌─────▼──────────▼─────────────────────────────────┐
-│  Ubuntu 24.04 Host (PTP Grandmaster)              │
+┌───────────▼──────────────────┐
+│  Point One Nav Atlas Duo      │  ← GPS-fixed solution, RTK on Polaris/NTRIP
+│  - FusionEngine TCP 30201     │  ← /pose, /imu, /gps/fix, /odom
+│  - NMEA 0183  TCP 30200       │  ← gpsd source (GPS time, no PPS)
+│  - REST API HTTP 80           │  ← config + monitoring
+└─────────────┬─────────────────┘
+              │ Ethernet (single cable to RUTM50 LAN 4)
+              │ Atlas at 192.168.1.30
+┌─────────────▼─────────────────────────────────────┐
+│  Ubuntu 24.04 Host (PTP Grandmaster, 192.168.1.5) │
 │                                                    │
-│  gpsd ← PPS + NMEA → shared memory (SHM)          │
-│  chrony ← SHM → CLOCK_REALTIME (<100 ns to GPS)   │
+│  gpsd ← tcp://192.168.1.30:30200 (NMEA) → SHM     │
+│  chrony ← SHM → CLOCK_REALTIME (~10–100 ms to GPS)│
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → PTP announce on Ethernet       │
+│  fusion-engine-driver: TCP 30201 → /pose /imu /…   │
 └────────────────────────────────────────────────────┘
 ```
 
 **Expected sync accuracy at each stage** (host side — the sensor-side numbers are in Sections 4 and 5):
 
-| Component | Accuracy |
-|-----------|----------|
-| Atlas Duo GNSS PPS | < 20 ns to UTC |
-| chrony (GPS-disciplined `CLOCK_REALTIME`) | < 100 ns |
-| NIC PHC via `phc2sys` | < 200 ns |
+| Component | Accuracy | Notes |
+|-----------|----------|-------|
+| Atlas Duo internal GPS time | < 20 ns to UTC | Inside the device; surfaces in FusionEngine message timestamps |
+| chrony (NMEA-disciplined `CLOCK_REALTIME`) | ~10–100 ms | NMEA alone, no PPS. See note below. |
+| NIC PHC via `phc2sys` | tracks `CLOCK_REALTIME` ± 200 ns | Relative tracking is tight even if `CLOCK_REALTIME` itself drifts vs GPS |
+| FusionEngine message `header.stamp` | < 20 ns to GPS | Built into each message by the Atlas — independent of host clock |
 
-**Critical:** the host clock MUST be disciplined by GPS (via the Atlas Duo PPS), not by internet NTP alone. NTP provides only ~1–10 ms accuracy, whereas GPS PPS provides < 100 ns. This is what Section 3's script wires up.
+> **Why the host clock loosens.** The Atlas Duo's only time output is the NMEA sentence stream over TCP (the device hardware has no PPS BNC output and no USB serial output). NMEA is sentence-rate (1 Hz) with no sub-second edge, so chrony can discipline `CLOCK_REALTIME` to roughly ±10–100 ms — not the < 100 ns a hardware PPS edge would achieve. This is fine for ROS topic `header.stamp` because the recorder pulls Atlas timestamps from FusionEngine message headers (where they're still GPS-accurate at the device, independent of host-clock drift). Raw `tcpdump` packet kernel timestamps inherit the looser `CLOCK_REALTIME` accuracy — if you care about wire-level packet timing aligned to GPS sub-ms, post-correlate against FusionEngine messages in the same capture. PTP across sensors (host PHC ↔ LiDAR / camera slaves) is unaffected — relative cross-sensor sync stays sub-µs (hardware timestamping) or sub-50 µs (software).
 
 ### 3.1 Run the INS-to-PC sync script
 
@@ -280,12 +288,12 @@ chmod +x 3_setup_ins_to_pc_sync.sh
 
 What it configures:
 
-- **gpsd:** reads NMEA from the Atlas Duo's serial port (`/dev/ttyUSB0`) and PPS from `/dev/pps0`. Drops into shared memory for chrony.
-- **chrony:** disciplines `CLOCK_REALTIME` to the PPS reference clock (locked to NMEA for second-resolution disambiguation). NTP pools are kept as a holdover fallback.
-- **`ptp4l` grandmaster:** announces on the sensor NIC with `clockClass 6` (locked to primary reference). `time_stamping` is hardware or software depending on what script 2 detected.
+- **gpsd:** reads NMEA over TCP from the Atlas Duo at `tcp://192.168.1.30:30200`. Drops into shared memory for chrony. No PPS, no `/dev/ttyUSB0`, no `/dev/pps0`.
+- **chrony:** disciplines `CLOCK_REALTIME` from the gpsd SHM (NMEA only). NTP pools are kept as a holdover fallback. Expected steady-state accuracy ~10–100 ms.
+- **`ptp4l` grandmaster:** announces on the sensor NIC. Because the host clock is no longer disciplined to <100 ns GPS, the script defaults `clockClass` to **13** (application-specific, locked-to-internal-reference) instead of 6 (locked to primary GPS reference). Cross-sensor PTP sync remains tight; the change is just an honest advertisement to PTP slaves about the absolute-time pedigree.
 - **`phc2sys`:** copies `CLOCK_REALTIME` into the NIC PHC (only relevant for hardware timestamping).
 - **systemd:** enables and starts `gpsd`, `chrony`, `ptp4l-grandmaster`, `phc2sys-grandmaster`. The chain is live without a reboot.
-- **fusion-engine-driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch.
+- **fusion-engine-driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch. Driver invocation uses `connection_type:=tcp` with the Atlas Duo IP (no longer `connection_type:=tty`).
 - **Point One host tools:** `p1-host-tools/` cloned to `$HOME`, `pip install fusion-engine-client[all]`.
 
 ### 3.2 Manual verification
@@ -293,14 +301,26 @@ What it configures:
 The script's self-test covers most of this, but here are the manual commands if you want to dig in:
 
 ```bash
-# GPS fix
+# Atlas Duo reachability
+ping -c 3 192.168.1.30
+curl -s http://192.168.1.30/api/v1/device/status | python3 -m json.tool
+
+# NMEA stream from Atlas Duo over TCP
+nc -w 5 192.168.1.30 30200 | head -20
+# Should show $GPGGA, $GPRMC sentences
+
+# FusionEngine stream from Atlas Duo over TCP
+nc -w 5 192.168.1.30 30201 | xxd | head -5
+# Should show binary FusionEngine frames
+
+# gpsd is consuming the TCP NMEA stream
 gpsmon
 # Should show satellites, fix type (3D), and time
 
-# chrony — GPS PPS should be starred, not NTP
+# chrony — NMEA should be the chosen source
 chronyc sources -v
 chronyc tracking
-# "Reference ID" should show PPS or NMEA, not an NTP server IP
+# "Reference ID" should show NMEA, not an NTP server IP
 
 # PTP grandmaster
 sudo journalctl -u ptp4l-grandmaster -f
@@ -450,8 +470,9 @@ All sensors are PTP-synchronized, so timestamps share the same GPS time base and
 
 ```yaml
 point_one_nav:
-  device_port: "/dev/ttyUSB0"
-  baud_rate: 460800
+  connection_type: "tcp"
+  tcp_host: "192.168.1.30"
+  tcp_port: 30201
 
 lidars:
   - name: "robin_w_front"
@@ -474,9 +495,11 @@ recording:
 If you prefer rosbag (higher CPU but simpler replay):
 
 ```bash
-# Terminal 1 — Point One Nav
+# Terminal 1 — Point One Nav (FusionEngine over TCP)
 ros2 run fusion-engine-driver fusion_engine_ros_driver --ros-args \
-    -p connection_type:=tty -p tty_port:=/dev/ttyUSB0
+    -p connection_type:=tcp \
+    -p tcp_host:=192.168.1.30 \
+    -p tcp_port:=30201
 
 # Terminal 2 — Seyond Robin W
 ros2 launch seyond start.py
@@ -613,7 +636,7 @@ To select the kernel at boot, choose **Advanced options for Ubuntu** in the GRUB
 
 **PTP not syncing (large master offset):** Verify the interface name in the `ptp4l` config matches your actual interface. Confirm PTP is enabled on each Robin W. Check cable connections.
 
-**chronyc shows NTP as primary (not PPS/NMEA):** gpsd may not be providing time to chrony. Run `sudo systemctl status gpsd` and `gpsmon`. If `/dev/pps0` does not exist, PPS is not exposed — check your serial connection type.
+**chronyc shows NTP as primary (not NMEA):** gpsd may not be reaching the Atlas Duo over TCP. Verify `ping 192.168.1.30` works, and that the Atlas Duo is set to "Start Navigating" in its web UI (without the navigation engine running, no NMEA is emitted). Run `sudo systemctl status gpsd` and `gpsmon`. To raw-test the NMEA stream independently of gpsd: `nc -w 5 192.168.1.30 30200 | head`.
 
 **LiDAR packet drops:** Likely network bandwidth saturation. Check with `sudo ethtool -S eth0 | grep -i drop`. For 3 Robin W LiDARs + 4 cameras, a 10 GbE NIC is required.
 
@@ -621,7 +644,7 @@ To select the kernel at boot, choose **Advanced options for Ubuntu** in the GRUB
 
 **Timestamps misaligned in rosbag:** Verify `use_sim_time` is `false` in all ROS 2 nodes. Check `chronyc tracking` to confirm GPS discipline is active.
 
-**gpsd shows "NO FIX":** Ensure the Atlas Duo antenna has clear sky view. Cold start may take up to 30 minutes. Verify the correct baud rate (Atlas Duo defaults to 460800).
+**gpsd shows "NO FIX":** Ensure the Atlas Duo antenna has clear sky view. Cold start may take up to 30 minutes. Open the Atlas Duo web UI at `http://192.168.1.30` and confirm the navigation engine is running (Start button on the Map View).
 
 **`<cstdint>` build errors:** GCC 14 on Ubuntu 24.04 is stricter. The `3_setup_ins_to_pc_sync.sh` and `4_setup_lidar_ptp.sh` scripts patch this automatically.
 

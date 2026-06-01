@@ -148,13 +148,17 @@ class SensorDetector:
         if not c.get("enabled", True):
             entry.detail = "disabled in config"
             return entry
-        port = c.get("device_port", "/dev/ttyUSB0")
-        if Path(port).exists():
-            entry.detected = True
-            entry.detail = f"serial port {port} present"
-        else:
-            entry.detail = f"{port} not found (Atlas Duo unplugged?)"
-        # Bonus: confirm gpsd / NMEA reachability if it's running.
+        # Atlas Duo is Ethernet-only — probe the FusionEngine TCP port.
+        # (Hardware has no BNC PPS pin and no USB serial output.)
+        host = c.get("tcp_host", "192.168.1.30")
+        port = int(c.get("tcp_port", 30201))
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                entry.detected = True
+                entry.detail = f"FusionEngine TCP {host}:{port} open"
+        except Exception as e:
+            entry.detail = f"{host}:{port} not reachable ({type(e).__name__}: Atlas off or nav engine not started?)"
+        # Bonus: confirm gpsd is consuming the NMEA stream if it's running.
         if entry.detected and shutil.which("gpspipe"):
             try:
                 r = subprocess.run(

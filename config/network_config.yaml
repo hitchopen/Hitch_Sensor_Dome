@@ -60,12 +60,17 @@ switch:
   ip:    "192.168.1.2"          # management interface (optional)
 
 # ─── Atlas Duo INS ─────────────────────────────────────────
-# Ethernet path is for NTRIP RTK only.  PPS travels its own BNC
-# wire to /dev/pps0; FusionEngine messages travel USB serial.
+# The Atlas Duo's only physical link to the host is Ethernet
+# (its hardware does not expose a BNC PPS pin or USB serial
+# data output). Everything flows through this one IP:
+#   - NMEA 0183     TCP 30200  → gpsd → chrony → CLOCK_REALTIME
+#   - FusionEngine  TCP 30201  → ros2-fusion-engine-driver
+#   - NTRIP RTCM3   inbound from caster (RTK corrections)
+#   - REST API      HTTP 80    config + monitoring
 atlas_duo:
-  ethernet_ip: "192.168.1.30"
-  serial_port: "/dev/ttyUSB0"
-  pps_device:  "/dev/pps0"
+  ethernet_ip:   "192.168.1.30"
+  nmea_tcp_port: 30200
+  fe_tcp_port:   30201
 
 # ─── Seyond Robin W LiDARs ─────────────────────────────────
 # IPs are set on each unit via its web UI or innovusion_lidar_util.

@@ -22,9 +22,9 @@
 #     NETCFG_HOST_IP       host.ip                 (e.g. 192.168.1.5)
 #     NETCFG_GATEWAY       gateway                 (e.g. 192.168.1.1)
 #     NETCFG_SUBNET        subnet                  (e.g. 192.168.1.0/24)
-#     NETCFG_ATLAS_IP      atlas_duo.ethernet_ip   (e.g. 192.168.1.30)
-#     NETCFG_ATLAS_SERIAL  atlas_duo.serial_port   (e.g. /dev/ttyUSB0)
-#     NETCFG_ATLAS_PPS     atlas_duo.pps_device    (e.g. /dev/pps0)
+#     NETCFG_ATLAS_IP       atlas_duo.ethernet_ip   (e.g. 192.168.1.30)
+#     NETCFG_ATLAS_NMEA_PORT atlas_duo.nmea_tcp_port (e.g. 30200)
+#     NETCFG_ATLAS_FE_PORT  atlas_duo.fe_tcp_port    (e.g. 30201)
 #     NETCFG_LIDAR_IPS     comma-joined lidar IPs  (e.g. .10,.11,.12)
 #     NETCFG_CAMERA_IPS    comma-joined camera IPs
 #     NETCFG_ROUTER_IP     router.ip
@@ -87,9 +87,9 @@ emit("NETCFG_GATEWAY",      need(c, "gateway"))
 emit("NETCFG_SUBNET",       need(c, "subnet"))
 emit("NETCFG_ROUTER_IP",    need(c, "router", "ip"))
 emit("NETCFG_SWITCH_IP",    need(c, "switch", "ip"))
-emit("NETCFG_ATLAS_IP",     need(c, "atlas_duo", "ethernet_ip"))
-emit("NETCFG_ATLAS_SERIAL", need(c, "atlas_duo", "serial_port"))
-emit("NETCFG_ATLAS_PPS",    need(c, "atlas_duo", "pps_device"))
+emit("NETCFG_ATLAS_IP",        need(c, "atlas_duo", "ethernet_ip"))
+emit("NETCFG_ATLAS_NMEA_PORT", need(c, "atlas_duo", "nmea_tcp_port"))
+emit("NETCFG_ATLAS_FE_PORT",   need(c, "atlas_duo", "fe_tcp_port"))
 
 emit("NETCFG_LIDAR_IPS",
      ",".join(l["ip"] for l in c.get("lidars", []) if "ip" in l))

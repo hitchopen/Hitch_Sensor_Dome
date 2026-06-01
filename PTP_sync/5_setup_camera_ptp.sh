@@ -403,7 +403,7 @@ verify_camera_sync() {
     echo "   tcpdump -i $ETH_IFACE host IP -w cam.pcap    # Record raw packets"
     echo ""
     echo " Full sync chain now active:"
-    echo "   GPS → Atlas Duo PPS → gpsd → chrony → ptp4l → LiDARs + cameras"
+    echo "   GPS → Atlas Duo (NMEA over TCP) → gpsd → chrony → ptp4l → LiDARs + cameras"
     echo ""
 }
 

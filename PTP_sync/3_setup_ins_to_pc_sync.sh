@@ -2,17 +2,27 @@
 # =============================================================
 # Section 3: PTP Sync from INS to PC
 #
-# Builds the GPS-disciplined PTP grandmaster chain on the host:
+# Builds the GPS-disciplined clock + PTP grandmaster chain on
+# the host. The Atlas Duo's only physical link to the host is
+# Ethernet (no BNC PPS, no USB serial — the device hardware
+# does not expose them). All time and data flow through that
+# single Ethernet cable:
 #
-#   Atlas Duo PPS + NMEA
-#     → gpsd
-#     → chrony (PPS-locked CLOCK_REALTIME)
-#     → phc2sys (CLOCK_REALTIME → NIC PHC)
-#     → ptp4l (NIC PHC → PTP grandmaster announce on Ethernet)
+#   Atlas Duo (192.168.1.30) ── Ethernet ──> RUTM50 LAN 4
+#     - NMEA 0183 over TCP 30200
+#         → gpsd ── SHM → chrony → CLOCK_REALTIME
+#         → phc2sys: CLOCK_REALTIME → NIC PHC
+#         → ptp4l: NIC PHC → PTP announce on Ethernet
+#     - FusionEngine over TCP 30201
+#         → ros2-fusion-engine-driver → /pose, /imu, /gps/fix, /odom
+#     - NTRIP RTCM3 inbound from caster (RTK corrections)
 #
-# Also installs the fusion-engine-driver ROS 2 package and
-# Point One host tools so the Atlas Duo's pose / IMU / GPSFix
-# can be consumed by the recorder and by GLIM++.
+# Steady-state accuracy: host CLOCK_REALTIME ~10–100 ms to GPS
+# (NMEA-only discipline, no PPS edge). Cross-sensor PTP is
+# unaffected; LiDARs and cameras still sync to the host NIC
+# PHC at sub-µs (hardware timestamping) or sub-50 µs (software).
+# FusionEngine message headers carry GPS time directly from the
+# Atlas — that path is independent of host-clock drift.
 #
 # Position in the sequence:
 #   ./1_install_packages.sh
@@ -22,14 +32,15 @@
 #   ./5_setup_camera_ptp.sh
 #
 # Prerequisites:
-#   - Section 1 + Section 2 completed
-#   - Atlas Duo connected via serial (PPS to /dev/pps0,
-#     NMEA / FusionEngine to /dev/ttyUSB0 by default)
+#   - Sections 1 + 2 completed
+#   - Atlas Duo wired to RUTM50 LAN 4, reachable at 192.168.1.30
+#   - Atlas Duo navigation engine started (web UI Map View →
+#     "Start Navigating"; without this, no NMEA is emitted)
 #
 # Usage:
 #   chmod +x 3_setup_ins_to_pc_sync.sh
 #   ./3_setup_ins_to_pc_sync.sh
-#   ./3_setup_ins_to_pc_sync.sh --serial /dev/ttyACM0
+#   ./3_setup_ins_to_pc_sync.sh --atlas-ip 192.168.1.30
 # =============================================================
 
 set -euo pipefail
@@ -49,8 +60,9 @@ source "$SCRIPT_DIR/../config/load_network_config.sh"
 
 # ─── Configuration (env > CLI > YAML / /run/hitch_dome_net.env) ──
 ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
-ATLAS_SERIAL="${ATLAS_SERIAL:-$NETCFG_ATLAS_SERIAL}"
-ATLAS_PPS="${ATLAS_PPS:-$NETCFG_ATLAS_PPS}"
+ATLAS_IP="${ATLAS_IP:-$NETCFG_ATLAS_IP}"
+ATLAS_NMEA_PORT="${ATLAS_NMEA_PORT:-30200}"
+ATLAS_FE_PORT="${ATLAS_FE_PORT:-30201}"
 ROS_DISTRO="jazzy"
 WS_DIR="$HOME/ros2_ws"
 : "${PTP_TIMESTAMPING:=software}"   # default to SW if script 2 didn't run
@@ -58,11 +70,11 @@ WS_DIR="$HOME/ros2_ws"
 # ─── Parse arguments ─────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --serial)   ATLAS_SERIAL="$2"; shift 2 ;;
-        --serial=*) ATLAS_SERIAL="${1#*=}"; shift ;;
-        --eth)      ETH_IFACE="$2"; shift 2 ;;
-        --eth=*)    ETH_IFACE="${1#*=}"; shift ;;
-        *)          echo "Unknown arg: $1"; exit 1 ;;
+        --atlas-ip)   ATLAS_IP="$2"; shift 2 ;;
+        --atlas-ip=*) ATLAS_IP="${1#*=}"; shift ;;
+        --eth)        ETH_IFACE="$2"; shift 2 ;;
+        --eth=*)      ETH_IFACE="${1#*=}"; shift ;;
+        *)            echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
@@ -73,29 +85,40 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 
 # =============================================================
-info "Section 3: PTP sync — INS to PC"
-info "  Ethernet:     $ETH_IFACE"
-info "  Atlas serial: $ATLAS_SERIAL"
-info "  Atlas PPS:    $ATLAS_PPS"
-info "  Timestamping: $PTP_TIMESTAMPING"
+info "Section 3: PTP sync — INS to PC (Ethernet-only)"
+info "  Ethernet:        $ETH_IFACE"
+info "  Atlas Duo IP:    $ATLAS_IP"
+info "  NMEA TCP:        $ATLAS_IP:$ATLAS_NMEA_PORT"
+info "  FusionEngine TCP: $ATLAS_IP:$ATLAS_FE_PORT"
+info "  PTP timestamping: $PTP_TIMESTAMPING"
 echo ""
 
-# ─── 1. gpsd ────────────────────────────────────────────────
-info "Configuring gpsd for Atlas Duo at $ATLAS_SERIAL..."
+# Pre-flight: verify Atlas Duo is reachable
+if ! ping -c 2 -W 2 "$ATLAS_IP" &>/dev/null; then
+    warn "Atlas Duo at $ATLAS_IP did not respond to ping — continuing setup, but check the cable / RUTM50 LAN 4 / Atlas power before expecting NMEA to flow."
+fi
+
+# ─── 1. gpsd reads NMEA over TCP from Atlas Duo ──────────────
+info "Configuring gpsd to read NMEA from tcp://$ATLAS_IP:$ATLAS_NMEA_PORT..."
 sudo tee /etc/default/gpsd > /dev/null << EOF
-DEVICES="$ATLAS_SERIAL $ATLAS_PPS"
+# gpsd consumes NMEA 0183 from the Atlas Duo's Ethernet TCP server.
+# Atlas Duo has no PPS BNC and no USB serial output, so this is the
+# only host-clock discipline source available.
+DEVICES="tcp://$ATLAS_IP:$ATLAS_NMEA_PORT"
 GPSD_OPTIONS="-n -b"
 START_DAEMON="true"
 USBAUTO="false"
 EOF
-ok "gpsd configured."
+ok "gpsd configured for TCP NMEA source."
 
-# ─── 2. chrony (GPS-disciplined CLOCK_REALTIME) ─────────────
-info "Configuring chrony with GPS PPS discipline..."
+# ─── 2. chrony disciplines CLOCK_REALTIME from gpsd SHM ──────
+info "Configuring chrony — NMEA-only discipline (no PPS available on Atlas Duo)..."
 sudo tee /etc/chrony/chrony.conf > /dev/null << 'EOF'
-# Primary: GPS via gpsd shared memory
-refclock SHM 0 offset 0.5 delay 0.2 refid NMEA noselect
-refclock PPS /dev/pps0 lock NMEA refid PPS
+# Primary: GPS NMEA via gpsd shared memory.
+# The Atlas Duo does not expose hardware PPS — sentence-rate (1 Hz)
+# NMEA is the only source. Expected steady-state accuracy ~10–100 ms.
+# (Was < 100 ns in legacy PPS-disciplined setups.)
+refclock SHM 0 offset 0.5 delay 0.2 refid NMEA
 
 # Fallback: NTP
 pool ntp.ubuntu.com iburst maxsources 4
@@ -106,9 +129,9 @@ driftfile /var/lib/chrony/chrony.drift
 rtcsync
 maxupdateskew 100.0
 EOF
-ok "chrony configured."
+ok "chrony configured for NMEA-only discipline."
 
-# ─── 3. ptp4l (PTP grandmaster) ─────────────────────────────
+# ─── 3. ptp4l grandmaster on sensor NIC ─────────────────────
 info "Configuring ptp4l grandmaster on $ETH_IFACE..."
 sudo mkdir -p /etc/linuxptp
 sudo tee /etc/linuxptp/ptp4l-grandmaster.conf > /dev/null << EOF
@@ -116,16 +139,20 @@ sudo tee /etc/linuxptp/ptp4l-grandmaster.conf > /dev/null << EOF
 # IEEE 1588 grandmaster priorities — lower = higher priority.
 priority1               127
 priority2               128
-# clockClass 6  = locked to a primary reference (GPS/PPS)
-# clockClass 7  = holdover after losing primary reference
-# clockClass 13 = application-specific, locked
-# clockClass 52 = application-specific, holdover
-# clockClass 128 = default, NOT synchronized — wrong for a GPS-disciplined GM.
-# The Atlas Duo PPS disciplines CLOCK_REALTIME via chrony, so advertise 6.
-# ptp4l does not auto-step this based on chrony state; if you anticipate long
-# GPS outages, add logic to switch to 7 (e.g. a watchdog that rewrites the
-# config via pmc SET GRANDMASTER_SETTINGS_NP and reloads).
-clockClass              6
+# clockClass values:
+#   6   = locked to a primary GPS/PPS reference (requires hardware PPS)
+#   7   = holdover after losing primary reference
+#   13  = application-specific, locked to an internal reference
+#   52  = application-specific, holdover
+#   128 = default, NOT synchronized (the default ptp4l ships with)
+# We advertise 13 because the host's CLOCK_REALTIME is disciplined
+# from NMEA via gpsd → chrony, which is GPS-locked but not at the
+# < 100 ns precision of a hardware PPS edge. clockClass 13 honestly
+# represents "we have a GPS-derived internal reference" without
+# overstating accuracy. Cross-sensor relative sync is unaffected
+# by the choice of clockClass; this is just the metadata PTP slaves
+# read to weigh competing masters on the same fabric.
+clockClass              13
 slaveOnly               0
 delay_mechanism         E2E
 logging_level           6
@@ -135,7 +162,7 @@ time_stamping           $PTP_TIMESTAMPING
 
 [$ETH_IFACE]
 EOF
-ok "ptp4l grandmaster configured."
+ok "ptp4l grandmaster configured (clockClass=13)."
 
 # ─── 4. phc2sys (CLOCK_REALTIME → NIC PHC) ──────────────────
 info "Configuring phc2sys..."
@@ -181,15 +208,12 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-# --now enables at boot AND starts immediately so the PTP chain is live
-# without requiring a reboot. If a service fails to start (e.g. no GPS yet),
-# systemctl still returns success; check status/journalctl below.
 sudo systemctl enable --now gpsd.service chrony.service \
     ptp4l-grandmaster.service phc2sys-grandmaster.service || \
     warn "One or more services did not start cleanly — check 'systemctl status <svc>'."
 ok "systemd services enabled and started."
 
-# ─── 6. Point One Nav driver + tools ────────────────────────
+# ─── 6. Point One Nav driver + tools (TCP transport) ────────
 info "Installing Point One Nav ROS 2 driver..."
 source /opt/ros/${ROS_DISTRO}/setup.bash
 mkdir -p "$WS_DIR/src"
@@ -221,6 +245,12 @@ pip install -r requirements.txt --break-system-packages 2>/dev/null || true
 pip install "fusion-engine-client[all]" --break-system-packages 2>/dev/null || true
 
 ok "Point One Nav driver and tools installed."
+info "Driver invocation example (TCP transport):"
+echo "  ros2 run fusion-engine-driver fusion_engine_ros_driver --ros-args \\"
+echo "      -p connection_type:=tcp \\"
+echo "      -p tcp_host:=$ATLAS_IP \\"
+echo "      -p tcp_port:=$ATLAS_FE_PORT \\"
+echo "      -p frame_id:=imu_link"
 
 # =============================================================
 # Self-test
@@ -232,55 +262,59 @@ verify_grandmaster() {
     echo " VERIFICATION: Section 3 — INS → PC PTP grandmaster"
     echo "============================================================="
 
-    # ── Test 1: gpsd + GPS fix ──
-    info "Test 1/6: gpsd and GPS fix"
-    if systemctl is-active --quiet gpsd 2>/dev/null; then
-        ok "  gpsd service is running"
+    # ── Test 1: Atlas Duo reachable ──
+    info "Test 1/6: Atlas Duo reachable at $ATLAS_IP"
+    if ping -c 2 -W 2 "$ATLAS_IP" &>/dev/null; then
+        ok "  $ATLAS_IP responds to ping"
         ((PASS++))
-        if timeout 5 gpspipe -w 2>/dev/null | head -5 | grep -q '"class":"TPV"'; then
-            ok "  GPS fix detected (TPV message received)"
-            ((PASS++))
-        else
-            warn "  No GPS fix yet — antenna may need clear sky view (cold start: up to 30 min)"
-            ((WARN_COUNT++))
-        fi
     else
-        warn "  gpsd not running — start with: sudo systemctl start gpsd"
+        warn "  $ATLAS_IP did not respond — check cable, RUTM50 LAN 4, Atlas Duo power"
         ((WARN_COUNT++))
     fi
 
-    # ── Test 2: PPS signal ──
-    info "Test 2/6: PPS signal"
-    if [ -e /dev/pps0 ]; then
-        ok "  /dev/pps0 exists"
-        ((PASS++))
-        if timeout 3 sudo ppstest /dev/pps0 2>/dev/null | head -3 | grep -q "assert"; then
-            ok "  PPS pulses detected"
+    # ── Test 2: NMEA TCP stream live ──
+    info "Test 2/6: NMEA TCP stream from $ATLAS_IP:$ATLAS_NMEA_PORT"
+    if NMEA_HEAD=$(timeout 5 nc -w 4 "$ATLAS_IP" "$ATLAS_NMEA_PORT" 2>/dev/null | head -3); then
+        if echo "$NMEA_HEAD" | grep -qE '^\$(GP|GN|GA)[A-Z]{3},'; then
+            ok "  NMEA sentences received ($(echo "$NMEA_HEAD" | head -1 | cut -c1-15)...)"
             ((PASS++))
         else
-            warn "  No PPS pulses — Atlas Duo may not have GPS lock yet"
+            warn "  Port open but no NMEA sentences — Atlas navigation engine may be stopped"
+            warn "  Open http://$ATLAS_IP and click Start Navigating on the Map View"
             ((WARN_COUNT++))
         fi
     else
-        warn "  /dev/pps0 not found — chrony will use NMEA only (~1 ms accuracy)"
+        warn "  Could not read $ATLAS_IP:$ATLAS_NMEA_PORT — Atlas web UI Output Settings may have NMEA disabled"
         ((WARN_COUNT++))
     fi
 
-    # ── Test 3: chrony GPS discipline ──
-    info "Test 3/6: chrony clock discipline"
+    # ── Test 3: FusionEngine TCP stream live ──
+    info "Test 3/6: FusionEngine TCP stream from $ATLAS_IP:$ATLAS_FE_PORT"
+    if FE_BYTES=$(timeout 5 nc -w 4 "$ATLAS_IP" "$ATLAS_FE_PORT" 2>/dev/null | head -c 64 | wc -c); then
+        if [ "$FE_BYTES" -gt 16 ]; then
+            ok "  FusionEngine bytes flowing ($FE_BYTES bytes in 4 s)"
+            ((PASS++))
+        else
+            warn "  FusionEngine port open but no data — check Atlas Output Settings"
+            ((WARN_COUNT++))
+        fi
+    else
+        warn "  Could not read $ATLAS_IP:$ATLAS_FE_PORT"
+        ((WARN_COUNT++))
+    fi
+
+    # ── Test 4: chrony NMEA discipline ──
+    info "Test 4/6: chrony clock discipline"
     if systemctl is-active --quiet chrony 2>/dev/null; then
         ok "  chrony service is running"
         ((PASS++))
 
         CHRONY_SRC=$(chronyc sources 2>/dev/null || true)
-        if echo "$CHRONY_SRC" | grep -q '^\*.*PPS'; then
-            ok "  chrony primary source: PPS (< 100 ns accuracy)"
+        if echo "$CHRONY_SRC" | grep -q '^\*.*NMEA'; then
+            ok "  chrony primary source: NMEA (~10–100 ms accuracy)"
             ((PASS++))
-        elif echo "$CHRONY_SRC" | grep -q '^\*.*NMEA'; then
-            warn "  chrony primary source: NMEA (~1 ms accuracy, no PPS)"
-            ((WARN_COUNT++))
         elif echo "$CHRONY_SRC" | grep -q '^\*'; then
-            warn "  chrony primary source is NTP (not GPS) — gpsd may not be providing time"
+            warn "  chrony primary source is NTP (not GPS NMEA) — gpsd may not be providing time"
             ((WARN_COUNT++))
         else
             warn "  chrony has no selected source"
@@ -294,8 +328,8 @@ verify_grandmaster() {
         ((WARN_COUNT++))
     fi
 
-    # ── Test 4: ptp4l grandmaster ──
-    info "Test 4/6: ptp4l grandmaster"
+    # ── Test 5: ptp4l grandmaster ──
+    info "Test 5/6: ptp4l grandmaster"
     if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
         ok "  ptp4l-grandmaster service is running"
         ((PASS++))
@@ -316,37 +350,21 @@ verify_grandmaster() {
         ((WARN_COUNT++))
     fi
 
-    # ── Test 5: phc2sys (hardware timestamping only) ──
-    info "Test 5/6: phc2sys (CLOCK_REALTIME → NIC PHC)"
+    # ── Test 6: phc2sys (HW timestamping only) + ROS 2 driver ──
+    info "Test 6/6: phc2sys + ROS 2 driver"
     if [ "$PTP_TIMESTAMPING" = "hardware" ]; then
         if systemctl is-active --quiet phc2sys-grandmaster 2>/dev/null; then
             ok "  phc2sys-grandmaster running"
             ((PASS++))
-
-            PHC_LOG=$(sudo journalctl -u phc2sys-grandmaster --no-pager -n 20 2>/dev/null || true)
-            LAST_PHC=$(echo "$PHC_LOG" | grep "offset" | tail -1)
-            if [ -n "$LAST_PHC" ]; then
-                info "  Last phc2sys log: $LAST_PHC"
-                PHC_OFFSET=$(echo "$LAST_PHC" | grep -oP 'offset\s+\K[-0-9]+' || true)
-                if [ -n "$PHC_OFFSET" ] && [ "${PHC_OFFSET#-}" -lt 1000 ] 2>/dev/null; then
-                    ok "  PHC offset < 1 µs"
-                    ((PASS++))
-                elif [ -n "$PHC_OFFSET" ] && [ "${PHC_OFFSET#-}" -lt 10000 ] 2>/dev/null; then
-                    warn "  PHC offset < 10 µs (acceptable)"
-                    ((WARN_COUNT++))
-                fi
-            fi
         else
             warn "  phc2sys-grandmaster not running"
             ((WARN_COUNT++))
         fi
     else
-        info "  Software timestamping — phc2sys not needed (ptp4l uses system clock directly)"
+        info "  Software timestamping — phc2sys not needed"
         ((PASS++))
     fi
 
-    # ── Test 6: ROS 2 driver ──
-    info "Test 6/6: Point One Nav ROS 2 driver"
     source "$WS_DIR/install/setup.bash" 2>/dev/null || true
     if ros2 pkg list 2>/dev/null | grep -q "fusion-engine-driver"; then
         ok "  fusion-engine-driver package found"
@@ -356,20 +374,13 @@ verify_grandmaster() {
         ((WARN_COUNT++))
     fi
 
-    if command -v p1_print &>/dev/null || [ -f "$HOME/p1-host-tools/bin/p1_print" ]; then
-        ok "  Point One host tools available"
-        ((PASS++))
-    else
-        warn "  p1_print not found — install: pip install fusion-engine-client[all]"
-        ((WARN_COUNT++))
-    fi
-
     echo ""
     echo "============================================================="
     echo " RESULTS: $PASS passed, $WARN_COUNT warnings, $FAIL failed"
     echo "============================================================="
     if [ $WARN_COUNT -gt 0 ]; then
-        echo " Warnings may resolve after GPS lock or a reboot."
+        echo " Warnings may resolve once the Atlas Duo finishes GPS lock"
+        echo " or after Start Navigating is clicked in its web UI."
     fi
     echo ""
     echo " Next: ./4_setup_lidar_ptp.sh"

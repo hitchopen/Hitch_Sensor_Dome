@@ -4,7 +4,7 @@
 # Used by recording/sensor_recorder.py
 #
 # Topology (matches PTP_sync/README.md and ROS2 config/sensor_dome_tf.yaml):
-#   - 1× Point One Nav Atlas Duo (GNSS + IMU + pose, GPS-disciplined PPS)
+#   - 1× Point One Nav Atlas Duo (GNSS + IMU + pose, Ethernet-only TCP transport)
 #   - 3× Seyond Robin W LiDARs (front 0°, rear-left 120°, rear-right 240°)
 #   - 4× e-con RouteCAM_P_CU25_CXLC_IP67 (front stereo + rear pair)
 # =============================================================
@@ -15,11 +15,16 @@ network:
 
 # -------------------------------------------------------------
 # Point One Nav Atlas Duo (GNSS / INS)
+# Ethernet-only transport — the Atlas Duo hardware does not
+# expose a BNC PPS pin or a USB serial NMEA stream. FusionEngine
+# rides TCP 30201 to the host's fusion-engine-driver; NMEA
+# rides TCP 30200 to gpsd (see PTP_sync/3_setup_ins_to_pc_sync.sh).
 # -------------------------------------------------------------
 point_one_nav:
   enabled: true
-  device_port: "/dev/ttyUSB0"
-  baud_rate: 460800
+  connection_type: "tcp"     # passed to fusion-engine-driver
+  tcp_host: "192.168.1.30"   # Atlas Duo IP on RUTM50 LAN 4
+  tcp_port: 30201            # FusionEngine TCP port
   frame_id: "imu_link"
   # ROS topics published by fusion-engine-driver
   topics:
@@ -92,8 +97,9 @@ sync:
   # Other modes available in the script: "hard" (refuse) and "log" (continue).
   mode: "prompt"
 
-  # chrony — host clock vs. GPS-disciplined PPS.
-  chrony_offset_ns: 1000      # 1 µs — generous margin for GPS-PPS systems
+  # chrony — host clock vs. GPS NMEA discipline over Ethernet TCP.
+  # Atlas Duo has no PPS pin, so accuracy is NMEA-bound (~10–100 ms).
+  chrony_offset_ns: 100000000 # 100 ms — appropriate ceiling for NMEA-only sync
   chrony_max_age_s: 30        # last update must be within 30 s
 
   # ptp4l — NIC PHC vs. host clock (master offset).
@@ -176,11 +182,12 @@ foxglove:
 # -------------------------------------------------------------
 drivers:
   point_one_nav:
+    # Ethernet-only transport — Atlas Duo hardware has no USB serial output.
     cmd: ["ros2", "run", "fusion_engine_driver", "fusion_engine_ros_driver",
           "--ros-args",
-          "-p", "connection_type:=tty",
-          "-p", "tty_port:={device_port}",
-          "-p", "tty_baud:={baud_rate}",
+          "-p", "connection_type:={connection_type}",
+          "-p", "tcp_host:={tcp_host}",
+          "-p", "tcp_port:={tcp_port}",
           "-p", "frame_id:={frame_id}",
           "-r", "imu:={topics.imu}",
           "-r", "gps_fix:={topics.gps_fix}",
