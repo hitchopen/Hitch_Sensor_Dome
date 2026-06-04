@@ -1,5 +1,5 @@
 # =============================================================
-# ROS2 Static TF Transforms — Sensor Dome v17e
+# ROS2 Static TF Transforms — Sensor Dome v17j (FINAL)
 #
 # All transforms: parent (imu_link) -> child (sensor_link)
 # Translation in meters, rotation as quaternion (x, y, z, w)
@@ -18,24 +18,74 @@
 #   Verified from Pointonenav-assembly-atlas-duo.pdf side view drawing.
 #   CoN is 18.5 mm above the bottom mounting surface of the Atlas Duo.
 #
-# Geometry source: sensor_dome.scad parameters (v17e)
-#   lidar_ring_radius:  90.0 mm
+# Geometry source: sensor_dome.scad parameters (v17f)
+#   lidar_ring_radius:   80.0 mm  ← v17f: was 90.0 in v17–v17e
 #   lidar_angles:       [0, 120, 240] deg
-#   L1_pillar_height:   133.0 mm  ← v17e: shortened 27 mm from v17c=160
-#   L2_z_bottom:        139.0 mm (LiDAR mount surface)   ← was 166 at v17c
-#   L2_z_top:           151.0 mm (camera mount surface)  ← was 178 at v17c
-#   rgb_cam_x:          105.0 mm (radial offset)
+#   L1_pillar_height:   133.0 mm
+#   L2_z_bottom:        139.0 mm (LiDAR mount surface)
+#   L2_z_top:           151.0 mm (camera mount surface)
+#   rgb_cam_x:          105.0 mm (radial offset, unchanged in v17f)
 #   rgb_cam_y:           52.0 mm (lateral offset)
 #   plate_thickness:      6.0 mm
 #   atlas_con_z_from_mount_surface: 18.5 mm (verified from drawing)
 #   CoN Z in SCAD coords: 24.5 mm
 #
-# v17e CHANGELOG — what moved relative to v17c:
-#   - All LiDAR  z dropped by 27 mm  (0.1415 → 0.1145 m)
-#   - All camera z dropped by 27 mm  (0.1535 → 0.1265 m)
-#   - GNSS primary nominal z dropped by 27 mm  (0.300 → 0.273 m),
-#     assuming the same physical stand + SP1 hardware
-#   - XY positions, yaw rotations, and base_link transform UNCHANGED
+# v17f CHANGELOG — what moved relative to v17e:
+#   - LiDAR ring radius shortened 90 → 80 mm. New XY for each LiDAR:
+#       lidar_front       x:  0.090 → 0.080,  y unchanged
+#       lidar_rear_left   x: -0.045 → -0.040, y:  0.077942 → 0.069282
+#       lidar_rear_right  x: -0.045 → -0.040, y: -0.077942 → -0.069282
+#   - LiDAR z, camera positions, GNSS antenna positions UNCHANGED.
+#   - Other SCAD changes (GNSS recess ø86 → ø88, Atlas front bolt
+#     holes → slots) have no TF impact.
+#
+# v17h CHANGELOG — what moved relative to v17g (camera-LiDAR fix):
+#   - Front-stereo cameras  y: ±0.052 → ±0.065  (lateral shift toward
+#     the unused V0–V1 / V4–V5 hex edges). Yaw unchanged (still 0°).
+#   - Rear-pair cameras moved AND re-aimed:
+#       cam_rear_left   xy: (-0.0975, +0.0649) → (-0.10812, +0.04727)
+#       cam_rear_right  xy: (-0.0975, -0.0649) → (-0.10812, -0.04727)
+#     Yaw flipped from radial-outward (120° / 240°) to a "look at
+#     dome center" aim — each rear camera's optical axis now passes
+#     through the imu_link X=Y=0 vertical axis.
+#       cam_rear_left   yaw: 120° → -23.616° (quat z=-0.204630, w=0.978839)
+#       cam_rear_right  yaw: 240° → +23.616° (quat z=+0.204630, w=0.978839)
+#   - LiDAR + GNSS positions UNCHANGED.
+#
+# v17i CHANGELOG — corrections to v17h:
+#   - Rear-camera aim FLIPPED 180° from look-at-center to look-OUTWARD
+#     along the same radial-through-center line. Lens now points away
+#     from the dome rather than into it. Position unchanged.
+#       cam_rear_left   yaw: -23.616° → +156.384°
+#                       quat (z, w):  (-0.20463, +0.97884)
+#                                   → (+0.97884, +0.20463)
+#       cam_rear_right  yaw: +23.616° → -156.384°
+#                       quat (z, w):  (+0.20463, +0.97884)
+#                                   → (-0.97884, +0.20463)
+#   - Front cameras pushed further toward V0/V1 and V4/V5 edges:
+#       cam_front_*  x: 0.105 → 0.085  (20 mm rearward)
+#       cam_front_*  y: ±0.065 → ±0.073  (8 mm further lateral)
+#     Net: 26 mm wall to nearest front-LiDAR M6; 2.6 mm wall to side 2;
+#     front-stereo baseline grows 130 → 146 mm.
+#
+# v17j CHANGELOG — FINAL (Option B from 360°-coverage analysis):
+#   - Rear-camera aim reverted from "outward through center" (±156.384°)
+#     to LiDAR-frame radial (120° / 240°). Full 360° horizontal
+#     coverage restored at the cost of the axis-through-center
+#     property. Optical-axis line now crosses X axis at x ≈ -62.5 mm
+#     (about 6 cm behind the imu_link origin) — acceptable for
+#     surround perception.
+#       cam_rear_left   yaw: +156.384° → 120°
+#                       quat (z, w):  (+0.97884, +0.20463)
+#                                   → (+0.86603, +0.50000)
+#       cam_rear_right  yaw: -156.384° → 240°
+#                       quat (z, w):  (-0.97884, +0.20463)
+#                                   → (+0.86603, -0.50000)
+#   - Front-camera positions UNCHANGED from v17i (85, ±73) — they
+#     still sit close to the V0/V1 and V4/V5 hex edges.
+#   - Rear-camera POSITIONS UNCHANGED from v17i (-0.10812, ±0.04727)
+#     — still near the cable cutout, only the YAW changed.
+#   - LiDAR + GNSS positions UNCHANGED.
 # =============================================================
 
 # ----- Configuration -----
@@ -119,7 +169,7 @@ static_transforms:
   - frame_id: "imu_link"
     child_frame_id: "lidar_front_link"
     translation:
-      x:  0.090000
+      x:  0.080000
       y:  0.000000
       z:  0.114500
     rotation:
@@ -133,8 +183,8 @@ static_transforms:
   - frame_id: "imu_link"
     child_frame_id: "lidar_rear_left_link"
     translation:
-      x: -0.045000
-      y:  0.077942
+      x: -0.040000
+      y:  0.069282
       z:  0.114500
     rotation:
       x:  0.000000
@@ -147,8 +197,8 @@ static_transforms:
   - frame_id: "imu_link"
     child_frame_id: "lidar_rear_right_link"
     translation:
-      x: -0.045000
-      y: -0.077942
+      x: -0.040000
+      y: -0.069282
       z:  0.114500
     rotation:
       x:  0.000000
@@ -177,8 +227,8 @@ static_transforms:
   - frame_id: "imu_link"
     child_frame_id: "cam_front_right_link"
     translation:
-      x:  0.105000
-      y:  0.052000
+      x:  0.085000
+      y:  0.073000
       z:  0.126500
     rotation:
       x:  0.000000
@@ -191,8 +241,8 @@ static_transforms:
   - frame_id: "imu_link"
     child_frame_id: "cam_front_left_link"
     translation:
-      x:  0.105000
-      y: -0.052000
+      x:  0.085000
+      y: -0.073000
       z:  0.126500
     rotation:
       x:  0.000000
@@ -200,13 +250,17 @@ static_transforms:
       z:  0.000000
       w:  1.000000
 
-  # --- Camera: Rear-Left (120°, +Y offset) ---
-  # Faces 120° from +X. Global position: (-97.5, +64.9) mm.
+  # --- Camera: Rear-Left (v17j FINAL — yaw 120°, LiDAR-radial aim) ---
+  # Position derived from local (95, +70) rotated by 120°. Aim
+  # reverts to the LiDAR-frame radial direction (yaw 120°) so the
+  # 4-camera union covers the full 360° horizon. The optical-axis
+  # line crosses the X axis at x ≈ -62.5 mm rather than at the
+  # dome center — acceptable trade-off for surround perception.
   - frame_id: "imu_link"
     child_frame_id: "cam_rear_left_link"
     translation:
-      x: -0.097533
-      y:  0.064933
+      x: -0.108122
+      y:  0.047272
       z:  0.126500
     rotation:
       x:  0.000000
@@ -214,14 +268,13 @@ static_transforms:
       z:  0.866025
       w:  0.500000
 
-  # --- Camera: Rear-Right (240°, -Y offset) ---
-  # Faces 240° from +X. Global position: (-97.5, -64.9) mm.
-  # Mirrors rear-left about X axis.
+  # --- Camera: Rear-Right (v17j FINAL — yaw 240°, LiDAR-radial aim) ---
+  # X-axis mirror of cam_rear_left_link.
   - frame_id: "imu_link"
     child_frame_id: "cam_rear_right_link"
     translation:
-      x: -0.097533
-      y: -0.064933
+      x: -0.108122
+      y: -0.047272
       z:  0.126500
     rotation:
       x:  0.000000
@@ -328,28 +381,31 @@ static_transforms:
       w:  1.000000
 
 # =============================================================
-# Summary Table (v17e)
+# Summary Table (v17j FINAL)
 #
 # Sensor                       X (m)     Y (m)     Z (m)    Yaw (°)
 # -------------------------  --------  --------  --------  --------
 # base_link                   0.0000    0.0000    0.0000      0   (identity — override per vehicle)
-# lidar_front                 0.0900    0.0000    0.1145      0
-# lidar_rear_left            -0.0450    0.0779    0.1145    120
-# lidar_rear_right           -0.0450   -0.0779    0.1145    240
-# cam_front_right             0.1050    0.0520    0.1265      0
-# cam_front_left              0.1050   -0.0520    0.1265      0
-# cam_rear_left              -0.0975    0.0649    0.1265    120
-# cam_rear_right             -0.0975   -0.0649    0.1265    240
+# lidar_front                 0.0800    0.0000    0.1145      0
+# lidar_rear_left            -0.0400    0.0693    0.1145    120
+# lidar_rear_right           -0.0400   -0.0693    0.1145    240
+# cam_front_right             0.0850    0.0730    0.1265      0
+# cam_front_left              0.0850   -0.0730    0.1265      0
+# cam_rear_left              -0.1081    0.0473    0.1265    120     (LiDAR-radial outward)
+# cam_rear_right             -0.1081   -0.0473    0.1265    240     (LiDAR-radial outward)
 # gnss_antenna_primary        0.0000    0.0000    0.2730      0
 # gnss_antenna_secondary       (FILL IN — dual antenna)        —
 #
 # All roll = 0, pitch = 0.
-# Front stereo baseline: 0.1040 m (104 mm).
+# Front stereo baseline: 0.1460 m (146 mm).
 # Rear pair symmetric about X axis.
+# 4-camera horizontal coverage: full 360° (front 134° + rear-L 53°–187°
+#   + rear-R 173°–307° = complete with overlap at the joins).
 # Dual GNSS antenna: enabled when secondary translation norm > 0.05 m.
 #
-# v17e geometry change vs v17c (for reference):
-#   Pillar shortened 27 mm (160 → 133); every Z above dropped 27 mm.
+# v17j is the FINAL design — see v17j changelog block above for the
+# rationale behind giving up the axis-through-center property in favor
+# of full 360° coverage.
 # =============================================================
 
 # =============================================================

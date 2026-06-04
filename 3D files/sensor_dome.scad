@@ -1,5 +1,203 @@
 // ============================================================
-// 3D Mapping Sensor Dome — v17e
+// 3D Mapping Sensor Dome — v17j (FINAL)
+//
+// CHANGES FROM v17i (Option B from the 360°-coverage analysis):
+//   - Rear-camera aim REVERTED from "outward along radial-through-
+//     center" (atan2(y, x) = ±156.4°) to the LiDAR-frame radial
+//     direction (literal 120° / 240°). This was Option B from the
+//     coverage-vs-axis-through-center trade-off:
+//       - The v17h "axis-through-center, INWARD" experiment left
+//         the entire rear half of the world uncovered (175° gap).
+//       - The v17i "axis-through-center, OUTWARD" fix put the lens
+//         on the correct side of the dome, but with the rear cams
+//         positioned near the cable cutout, the radial aim came
+//         out at ±156°, leaving 22° gaps at each broadside.
+//       - v17j gives up the axis-through-center property and
+//         restores the v17g LiDAR-radial yaws. Full 360° coverage
+//         comes back with healthy overlap (front 134° + rear-left
+//         53°–187° + rear-right 173°–307°). The optical-axis line
+//         now crosses the X axis at x ≈ −62.5 mm (about 6 cm
+//         behind the imu_link origin) rather than at the origin —
+//         acceptable for surround perception.
+//   - All v17h/v17i POSITION changes are KEPT:
+//       Front cameras at (85, ±73) — close to V0/V1 / V4/V5 edges,
+//         146 mm stereo baseline, 26 mm wall to front-LiDAR M6.
+//       Rear cameras at global (-108.1, ±47.3) — close to the
+//         cable cutout, 19 mm wall to rear-LiDAR M6.
+//   - aim_away_from_origin() helper deleted (no longer used).
+//
+// CHANGES FROM v17h (camera-placement corrections):
+//   - Rear-camera aim flipped from "inward (look at center)" to
+//     "outward along the radial through the center". The optical-
+//     axis LINE still passes through the dome center axis (X=Y=0)
+//     as required, but the LENS now points away from the center,
+//     so each rear camera's field of view covers the world OUTSIDE
+//     the dome rather than looking back across L2 at itself.
+//     Yaw change:
+//       cam_rear_left   -23.616°  →  +156.384°
+//       cam_rear_right  +23.616°  →  -156.384°
+//     The 180° flip leaves the M3 bolt pattern in the same holes
+//     (4-bolt 16.5×16.5 square is invariant under 180° rotation),
+//     so no L2 drill positions change.
+//   - Front cameras pushed further toward V0/V1 and V4/V5 edges:
+//       (rgb_cam_x_front, rgb_cam_y_front)
+//       v17g: (105, 52)  →  v17h: (105, 65)  →  v17i: (85, 73)
+//     The camera moves 20 mm rearward AND 8 mm further laterally.
+//     Net wall-to-side-2 from each upper M3 hole edge is now
+//     2.65 mm (printable); net wall-to-front-LiDAR-M6 grows to
+//     25.6 mm (was 14 mm in v17h, 1.6 mm in v17g). Side-effect:
+//     front-stereo baseline widens to 146 mm (was 130 in v17h,
+//     104 in v17a–g) — even better depth-resolution geometry.
+//
+// CHANGES FROM v17g (camera placement vs LiDAR mount interference):
+//   - v17g flagged that the front-stereo cameras at (105, ±52)
+//     and the rear cameras at the same local (105, 52) rotated
+//     by 120°/240° both sit within ~9 mm of the nearest Robin W
+//     M6 top-mount countersink edge. With a ø11 countersink and
+//     ø3.4 M3 camera bolt, the structural wall between them was
+//     ~1.6 mm — a printable but uncomfortable margin.
+//   - v17h moves both pairs into the empty edges next to them:
+//
+//     Front pair (cameras at angle 0°):
+//       (rgb_cam_x_front, rgb_cam_y_front)
+//       OLD: (105, ±52)  →  NEW: (105, ±65)
+//       The lateral move pushes the M3 mount holes toward the
+//       V0–V1 (left, 60° side) and V4–V5 (right, 300° side)
+//       edges of the hex — both of which were unused. The front
+//       LiDAR bolts at (109, ±36) / (51, ±36) now sit 21 mm
+//       away from the nearest camera M3, giving a 14 mm wall.
+//       Side-effect: front-stereo baseline grows 104 → 130 mm,
+//       slightly better triangulation for depth resolution.
+//
+//     Rear pair (cameras at angles 120° / 240°):
+//       (rgb_cam_x_rear, rgb_cam_y_rear)
+//       OLD: (105, ±52)  →  NEW: (95, ±70)
+//       Each rear camera moves rearward and outward in its
+//       local frame, which in the rotated global frame pulls
+//       the camera closer to the cable-cutout teardrop on side
+//       4 (rear flange) and away from the rear LiDARs. Rear-
+//       left camera moves from (-97.5, +64.9) to (-108.1, +47.3),
+//       gaining 27 mm of vertical separation from the cable-
+//       cutout upper diagonal and pushing the camera ~27 mm away
+//       from the nearest rear-left LiDAR M6 — 20 mm wall.
+//
+//     *** REAR-CAMERA AIM RE-POINTED AT DOME CENTER (v17h) ***
+//     In v17g the rear cameras pointed radially OUTWARD (along
+//     the 120° / 240° rays), which placed their optical axes
+//     skew to the dome's vertical Z axis. v17h rotates each
+//     rear camera about its own Z axis so its optical axis
+//     (camera local +X) passes through the dome center (X=0,
+//     Y=0). The aim angle is computed by `aim_away_from_origin()` as
+//     atan2(-gy, -gx) for global position (gx, gy):
+//       rear-left  aim = -23.62°  (global, was +120°)
+//       rear-right aim = +23.62°  (global, was +240°/-120°)
+//     The L2 M3 bolt pattern rotates with the camera body, so
+//     the holes drilled in L2 stay aligned with the re-aimed
+//     mount. Verified clearances: M3 ↔ LiDAR M6 wall = 20 mm,
+//     all four M3 bolts inside the v17g irregular hex outline,
+//     6.7 mm minimum margin to the cable-cutout upper diagonal.
+//
+//     Front cosmetic note: the front-stereo body upper-right
+//     corner at (131.5, 88) overhangs the new front edge at
+//     X=121.32 by 10 mm in X and the side-2 diagonal by ~14 mm
+//     visually. M3 bolts all stay inside the plate (top-right
+//     M3 at (113.25, 73.25) is 1.5 mm inside side 2 — tight).
+//     Rear cosmetic note: each rear-camera body overhangs the
+//     cable-cutout teardrop boundary by a few mm; bolts stay
+//     in the plate.
+//
+//   - rgb_cam_layout now carries per-row local (x, y) so front
+//     and rear can be tuned independently. If you ever want to
+//     restore v17g coincident positions, set
+//       rgb_cam_x_front = rgb_cam_x_rear = 105
+//       rgb_cam_y_front = rgb_cam_y_rear = 52
+//     and the layout stays valid.
+//
+//   - config/sensor_dome_tf.yaml updated to match:
+//       cam_front_*  y: ±0.052 → ±0.065
+//       cam_rear_*   (x, |y|): (-0.0975, 0.0649) → (-0.10812, 0.04727)
+//
+// CHANGES FROM v17f (further compaction — irregular hex outline):
+//   - Hex vertices V0 (30°), V1 (90°), V4 (270°), V5 (330°) are
+//     pulled radially inward by hex_vertex_pullback = 10 mm.
+//     V2 (150°) and V3 (210°) — the two rear vertices on either
+//     side of the Atlas flange — are unchanged.
+//     The plate outline is no longer a regular hexagon; it
+//     becomes an irregular 6-gon, still mirror-symmetric about
+//     the X axis (so the dome stays left/right symmetric).
+//   - All 4 hex-vertex support columns (V0/V1/V4/V5 brackets)
+//     move inward with their vertices, so each column still
+//     connects flush to the L1 and L2 edges. Bracket bolt
+//     positions, fillets, and tap holes all follow.
+//   - The 2 Atlas-side brackets and the rear flange (anchored
+//     by V2/V3 and the rear of the Atlas Duo body) are
+//     unchanged from v17f.
+//   - New vertex positions:
+//       V0: (130, 75.05)  →  (121.33, 70.05)
+//       V1: (0,  150.10)  →  (0,      140.10)
+//       V4: (0, -150.10)  →  (0,     -140.10)
+//       V5: (130,-75.05)  →  (121.33,-70.05)
+//     Side 1 (front edge, between V5 & V0) shrinks from
+//     X=130, Y=±75.05 to X=121.33, Y=±70.05 — about 8.7 mm
+//     closer to the dome center and ~5 mm shorter on each
+//     side. Total L2 plate area drops by ~6%.
+//
+//   *** OVERHANG TRADE-OFF — front of dome ***
+//   Pulling V0/V5 inward also moves side 1 from X=130 to X=121.3,
+//   which RE-INTRODUCES some of the front-LiDAR overhang that
+//   v17f had just eliminated. With ring radius = 80 and Robin W
+//   body depth 106.7:
+//        front LiDAR body max X      = 80 + 53.35 = 133.35 mm
+//        new side 1 front edge       =                121.32 mm
+//        new front overhang          =                 12.03 mm
+//      (was 3.35 mm at v17f side 1 = 130 mm)
+//   The overhang is structurally harmless — the LiDAR top-mount
+//   M6 countersinks reach only r=114.5, which is still 6.8 mm
+//   inside the new front edge. Bracket bolts and camera M3 bolts
+//   are also all inside the new outline. The overhang is purely
+//   visual: the Robin W body sticks out past the L2 hex edge by
+//   ~12 mm at the front when viewed from above. If that visual
+//   matters to you, options are (a) reduce lidar_ring_radius
+//   further (80 → 71 zeroes the overhang at the new edge), or
+//   (b) restore some of the pullback (lower hex_vertex_pullback
+//   from 10 to 5 puts overhang back to ~7 mm). The same pullback
+//   also makes the FRONT-STEREO CAMERAS at (105, ±52) overhang
+//   the new front-edge Y-span by ~5 mm cosmetically — M3 bolt
+//   holes at |Y|≤60.25 are still safely inside the plate, so
+//   the structural mount is unaffected.
+//
+// CHANGES FROM v17e (post-print compaction & tolerance fixes):
+//   - LiDAR ring radius shortened: 90 mm → 80 mm (−10 mm).
+//     The Robin W bodies stuck out past the L2 hex side edges
+//     by ~13 mm at angle 0° in v17e; reducing the ring radius
+//     by 10 mm pulls every body back to ~3 mm overhang (purely
+//     cosmetic) while keeping the M6 top-mount bolt clearance
+//     to the hex edge ample (~15.5 mm wall, up from ~5.5 mm).
+//     Cascade: the LiDAR TF entries in config/sensor_dome_tf.yaml
+//     get updated to match (lidar_front x: 0.090 → 0.080;
+//     rear pair x: -0.045 → -0.040, |y|: 0.077942 → 0.069282).
+//     *** CLEARANCE NOTE — repeat from v17e ***
+//     The Z gap between the LiDAR body bottoms (z=54) and the
+//     Atlas Duo body top (z=53.8) is still only 0.2 mm. Pulling
+//     the LiDAR ring inward GROWS the XY overlap between each
+//     LiDAR body and the Atlas footprint, so any sag or print
+//     warp now has more area in which to cause physical contact.
+//     If you have not already, consider raising L1_pillar_height
+//     by a few mm before printing v17f.
+//   - GNSS stand recess enlarged: ø86 → ø88 (+1 mm radius).
+//     Post-print shrinkage made the ø86 pocket too tight against
+//     the nominal ø88 magnetic base; ø88 lets the stand seat
+//     without forcing. Floor thickness drops from 5 mm to 4 mm,
+//     wall to nearest LiDAR countersink grows because the LiDAR
+//     ring moved inward (see above).
+//   - Atlas Duo center-pair bolt holes are now SLOTS, not round.
+//     The two FRONT bolt holes (at x = +78.7 mm, closer to the
+//     dome center) become slotted ±2 mm in the X direction so
+//     the screws can shift fwd/aft to compensate for print
+//     tolerance vs the Atlas's nominal hole pattern. The two
+//     REAR bolts (x = −141.3 mm, on the flange) stay round —
+//     once the center pair is in, they pin the rotation and the
+//     rear pair lines up naturally.
 //
 // CHANGES FROM v17d:
 //   - L1_pillar_height nudged 130mm → 133mm (+3mm) to remove the
@@ -89,10 +287,22 @@
 //
 // All centers (GNSS, LiDAR ring, Atlas CoN, camera) coaxial at X=0, Y=0.
 //
-// RENDER_MODE: 0=assembly, 1=level1, 2=level2
+// RENDER_MODE: 0=assembly (default), 1=level1, 2=level2
 // ============================================================
 
 RENDER_MODE = 0;
+
+// v17h: when unibody_mode = true, the bolt holes that would otherwise
+// be drilled at each bracket top (L1 tap pockets) AND through L2
+// (clearance through-holes) are SKIPPED entirely. Use this when
+// printing the dome as a single unibody part — there are no bolts to
+// install through those holes, so they're just stress concentrators.
+// The two-piece bolted assembly (RENDER_MODE 1 + RENDER_MODE 2)
+// keeps the default unibody_mode = false and drills the holes.
+//
+// The unibody wrapper (3D files/sensor_dome_unibody.scad) sets this
+// to true after `include <sensor_dome.scad>`.
+unibody_mode = false;
 
 // ===================== PARAMETERS ============================
 
@@ -117,6 +327,14 @@ atlas_bolts = [
     [ datum_x - atlas_rear_bolt_x,    datum_y],
     [ datum_x - atlas_rear_bolt_x,   -(atlas_bolt_height_pattern - datum_y)]
 ];
+
+// v17f: print-tolerance slots for the FRONT pair (closer to dome
+// center). Each front bolt hole is a slot running ±atlas_slot_play
+// mm in X, so the M4 screw can shift fwd/aft to land in the Atlas
+// thread despite ~0.1–0.3 mm dimensional drift typical of FDM PETG.
+// The REAR pair stays round and pins rotation once the front pair
+// is engaged.
+atlas_slot_play = 2.0;          // mm of fwd/aft play in the slot
 
 atlas_body_length = 235.3;
 atlas_body_width = 117.8;
@@ -145,7 +363,10 @@ robin_body_w = 104.8;   // width (Y in LiDAR local frame)
 robin_body_h = 85;       // height (Z when upright)
 robin_body_d = 106.7;   // depth (X, scanning direction)
 
-lidar_ring_radius = 90;      // v17: increased from 65 for more center spacing
+// v17f: 80 mm (was 90 mm in v17–v17e). Pulls LiDAR bodies back
+// inside the L2 hex outline; outermost bolt countersink at r=114.5
+// (was r=124.5) leaves a comfortable 15.5 mm wall to the hex edge.
+lidar_ring_radius = 80;
 lidar_angles = [0, 120, 240];
 
 // --- Hexagonal Plate (v17) ---
@@ -200,7 +421,27 @@ hex_vertex_angles = [30, 90, 150, 210, 270, 330];
 // Indices of hex vertices that get brackets (V0, V1, V4, V5 only)
 hex_bracket_vertices = [0, 1, 4, 5];
 
-// Bracket wall direction and inward normal (simple even/odd rule)
+// v17g: irregular-hex compaction. The four vertices that carry
+// brackets (V0/V1/V4/V5 — see hex_bracket_vertices) are pulled
+// radially inward by hex_vertex_pullback mm. V2 and V3 (the two
+// vertices on either side of the rear flange) stay at the original
+// circumradius so the flange geometry is unchanged.
+hex_vertex_pullback = 10;
+
+function is_pulled_vertex(i) =
+    (i == 0 || i == 1 || i == 4 || i == 5);
+
+function hex_vertex_xy(i) =
+    let(a = hex_vertex_angles[i],
+        r = is_pulled_vertex(i)
+              ? hex_circumradius - hex_vertex_pullback
+              : hex_circumradius)
+    [r * cos(a), r * sin(a)];
+
+// Bracket wall direction and inward normal (simple even/odd rule).
+// Note: only the VERTEX POSITION moves with the pullback; the
+// direction vectors stay tied to the original 30°/90°/270°/330°
+// rays, so the bracket walls point the same way as in v17e/v17f.
 function bracket_wall_dir(i) =
     let(a = hex_vertex_angles[i])
     (i % 2 == 0) ? a + 120 : a - 120;
@@ -209,14 +450,16 @@ function bracket_wall_norm(i) =
     let(a = hex_vertex_angles[i])
     (i % 2 == 0) ? a - 150 : a + 150;
 
-// Bolt positions: 2 per bracket (at 30% and 70% along wall length)
+// Bolt positions: 2 per bracket (at 30% and 70% along wall length).
+// v17g: vertex anchor now comes from hex_vertex_xy(i) so brackets
+// at V0/V1/V4/V5 move inward with their pulled vertices.
 function bracket_bolt_pos(i, j) =
     let(
-        a = hex_vertex_angles[i],
-        vx = hex_circumradius * cos(a),
-        vy = hex_circumradius * sin(a),
-        d = bracket_wall_dir(i),
-        n = bracket_wall_norm(i),
+        v  = hex_vertex_xy(i),
+        vx = v[0],
+        vy = v[1],
+        d  = bracket_wall_dir(i),
+        n  = bracket_wall_norm(i),
         frac = (j == 0) ? 0.3 : 0.7
     )
     [vx + bracket_leg_len * frac * cos(d) + bracket_wall_t/2 * cos(n),
@@ -282,7 +525,9 @@ L2_z_top = L2_z_bottom + L2_thickness;            // 178 (was 172 in v17)
 // glued into a circular centering recess on L2 top surface.
 // *** MEASURE YOUR STAND AND ADJUST gnss_stand_base_dia IF NEEDED ***
 gnss_stand_base_dia    = 88;    // magnetic base outer diameter (MEASURE!)
-gnss_stand_recess_dia  = 86;    // centering pocket
+// v17f: 88 (was 86 in v17-v17e). +1 mm radius accommodates post-print
+// shrinkage; the ø88 nominal base now seats without forcing.
+gnss_stand_recess_dia  = 88;    // centering pocket
 gnss_stand_recess_depth = 8;    // recess depth (leaves 4mm floor in 12mm plate)
 
 // Cable opening — teardrop cutout on side 4 (L2 ONLY)
@@ -327,17 +572,66 @@ rgb_cam_body_d    = 52.95;    // body depth without lens
 rgb_cam_body_h_total = 65.12; // total height with lens protrusion
 rgb_cam_mount_spacing = 16.5; // M3 bolt pattern square spacing
 rgb_cam_bolt_dia  = 3.4;      // M3 clearance hole diameter
-rgb_cam_x         = 105;      // radial position from center (along LiDAR direction)
-rgb_cam_y         = 52;       // lateral offset magnitude from LiDAR center
 
-// Camera layout: [LiDAR_angle, y_sign]
-//   y_sign = +1 → camera at +Y (CCW side) in local frame
-//   y_sign = -1 → camera at −Y (CW side) in local frame
+// v17h: front and rear cameras now carry their own (x, y) so each pair
+// can dodge the LiDAR top-mount bolts independently. See header.
+//
+//   FRONT pair (cameras facing 0°) — pushed laterally toward the unused
+//   V0–V1 and V4–V5 hex edges (sides 2 and 6). The local frame here is
+//   the un-rotated camera frame: +X = camera optical axis (= forward),
+//   +Y = camera's left.
+//   v17i: pushed even further toward V0/V1 and V4/V5, with the camera
+//   body pulled rearward to keep a comfortable wall to side 2. New
+//   numbers leave a 2.6 mm wall from each upper-Y M3 hole edge to side
+//   2 and a 26 mm wall to the nearest front-LiDAR M6 countersink.
+//   Side-effect: front-stereo baseline widens 130 → 146 mm.
+rgb_cam_x_front   = 85;       // forward distance (was 105 v17a–h)
+rgb_cam_y_front   = 73;       // lateral offset (was 52 v17a–g, 65 v17h)
+
+//   REAR pair (cameras facing 120° / 240°) — pulled rearward in the
+//   LiDAR-relative local frame, which in global coords pulls them
+//   closer to the cable-cutout teardrop on the rear flange and away
+//   from the rear LiDAR M6 mounts.
+rgb_cam_x_rear    = 95;       // local radial distance (was 105)
+rgb_cam_y_rear    = 70;       // local lateral offset (was 52)
+
+// 2D rotation helper used to derive rear-camera global positions.
+function rot2d(p, deg) =
+    let(c = cos(deg), s = sin(deg))
+    [p[0]*c - p[1]*s, p[0]*s + p[1]*c];
+
+// Rear-camera GLOBAL positions are obtained by rotating their
+// LiDAR-relative local placement by the dome angle (120° / 240°).
+// This keeps the v17g semantic — "rear cameras sit alongside the
+// rear LiDARs" — while letting us re-aim them independently below.
+rear_left_global  = rot2d([rgb_cam_x_rear,  rgb_cam_y_rear], 120);
+rear_right_global = rot2d([rgb_cam_x_rear, -rgb_cam_y_rear], 240);
+
+// v17j FINAL — rear-camera aim is the LiDAR-frame radial direction
+// (120° / 240°), matching the LiDARs they sit alongside. This is
+// "Option B" from the 360°-coverage analysis: full horizontal
+// coverage is restored at the cost of the v17h/v17i axis-through-
+// center property. Each rear camera's optical axis no longer
+// passes through (X=0, Y=0) — instead it crosses the X axis at
+// approximately x = -62.5 mm — but the lens still points outward
+// and the 4-camera union covers the full 360° horizon with overlap.
+//
+// History of rear-camera aim:
+//   v17a–v17g : aim = LiDAR angle (120° / 240°)         → 360° ✓
+//   v17h      : aim = atan2(-y, -x) (INWARD at center) → 175° gap (broken)
+//   v17i      : aim = atan2( y,  x) (outward thru ctr) → two 22° gaps
+//   v17j      : aim = 120° / 240°                       → 360° ✓ (final)
+//
+// Camera layout — one row per camera, with EXPLICIT (global_x,
+// global_y, aim_deg). Front cameras face +X (aim 0°). Rear cameras
+// face the LiDAR-frame radial-outward direction (aim 120° / 240°).
+//
+//   row format: [global_x, global_y, aim_deg]
 rgb_cam_layout = [
-    [  0,  1],   // front stereo right (+Y)
-    [  0, -1],   // front stereo left  (−Y)
-    [120,  1],   // rear left  (+Y → global +Y side)
-    [240, -1],   // rear right (−Y → mirrors 120° about X axis)
+    [ rgb_cam_x_front,  rgb_cam_y_front, 0],                  // front +Y
+    [ rgb_cam_x_front, -rgb_cam_y_front, 0],                  // front -Y
+    [ rear_left_global[0],  rear_left_global[1],  120],       // rear-left
+    [ rear_right_global[0], rear_right_global[1], 240],       // rear-right
 ];
 
 // Camera M3 bolt positions in local frame (bottom mount, 4 holes)
@@ -354,22 +648,34 @@ module rounded_rect(w, h, r) {
     offset(r) offset(-r) square([w, h], center=true);
 }
 
-// Regular hexagon plate outline (L2 and base shape for L1).
-// Flat side 1 faces +X. Vertices at 30°, 90°, 150°, 210°, 270°, 330°.
-module hex_plate_outline() {
-    offset(r=corner_r) offset(r=-corner_r)
-        rotate([0, 0, 30])
-            circle(r=hex_circumradius, $fn=6);
+// v17f — slot 2D outline used by the front-pair Atlas bolt holes.
+// Slot's long axis is the X axis, length = d + 2*atlas_slot_play.
+// hull() of two end circles produces clean rounded ends and a
+// printable, watertight 2D contour.
+module atlas_slot_2d(d) {
+    hull() {
+        translate([-atlas_slot_play, 0]) circle(d=d, $fn=32);
+        translate([ atlas_slot_play, 0]) circle(d=d, $fn=32);
+    }
 }
 
-// L1 plate: hex + rectangular flange at side 4 for Atlas rear bolts.
-// The flange extends straight back from hex side 4, matching the
-// side's Y span for a seamless join. Rear corners are rounded.
+// v17g — irregular hexagon plate outline (L2 and base shape for L1).
+// Vertices at 30°, 90°, 150°, 210°, 270°, 330°. V0/V1/V4/V5 are
+// pulled inward by hex_vertex_pullback; V2/V3 stay at the original
+// circumradius. corner_r rounding is preserved via offset+offset.
+module hex_plate_outline() {
+    offset(r=corner_r) offset(r=-corner_r)
+        polygon([for (i = [0:5]) hex_vertex_xy(i)]);
+}
+
+// L1 plate: irregular hex + rectangular flange at side 4 for Atlas
+// rear bolts. v17g: the hex is now the irregular outline (V0/V1/V4/V5
+// pulled inward); side 4 (between V2 and V3) is unchanged, so the
+// flange Y-span ±atlas_flange_half_width still matches V2/V3 cleanly.
 module L1_plate_outline() {
     offset(r=corner_r) offset(r=-corner_r)
     union() {
-        rotate([0, 0, 30])
-            circle(r=hex_circumradius, $fn=6);
+        polygon([for (i = [0:5]) hex_vertex_xy(i)]);
         // Flange: rectangle extending side 4 in -X direction
         translate([-atlas_flange_extent, -atlas_flange_half_width])
             square([atlas_flange_extent - hex_inradius + 1,
@@ -454,8 +760,11 @@ module hex_bracket_fillet_profile(vertex_index) {
 module hex_brackets() {
     for (i = hex_bracket_vertices) {
         a = hex_vertex_angles[i];
-        vx = hex_circumradius * cos(a);
-        vy = hex_circumradius * sin(a);
+        // v17g: vertex anchor comes from hex_vertex_xy(i) so the
+        // bracket moves inward with the pulled vertex (V0/V1/V4/V5).
+        v  = hex_vertex_xy(i);
+        vx = v[0];
+        vy = v[1];
 
         // Fillet: smooth inside-corner transition from plate to wall.
         // Clipped to L1 plate outline so nothing extends beyond the
@@ -661,12 +970,28 @@ module level1() {
             atlas_side_brackets();
         }
 
-        // Atlas M4 holes + counterbore from bottom
+        // Atlas M4 holes + counterbore from bottom.
+        // v17f: the FRONT pair (bolt[0] > 0, closer to the dome
+        // center) are slots running ±atlas_slot_play mm in X to
+        // absorb print-tolerance error. The REAR pair (bolt[0] < 0,
+        // on the rear flange) stays as round holes — they pin the
+        // rotation once the front pair is in place.
         for (bolt = atlas_bolts) {
-            translate([bolt[0], bolt[1], -1])
-                cylinder(d=atlas_bolt_dia, h=L1_thickness+2, $fn=32);
-            translate([bolt[0], bolt[1], -1])
-                cylinder(d=atlas_bolt_csink_dia, h=atlas_bolt_csink_depth+1, $fn=32);
+            if (bolt[0] > 0) {
+                // Front pair → slots
+                translate([bolt[0], bolt[1], -1])
+                    linear_extrude(L1_thickness + 2)
+                        atlas_slot_2d(atlas_bolt_dia);
+                translate([bolt[0], bolt[1], -1])
+                    linear_extrude(atlas_bolt_csink_depth + 1)
+                        atlas_slot_2d(atlas_bolt_csink_dia);
+            } else {
+                // Rear pair → round (unchanged from v17e)
+                translate([bolt[0], bolt[1], -1])
+                    cylinder(d=atlas_bolt_dia, h=L1_thickness+2, $fn=32);
+                translate([bolt[0], bolt[1], -1])
+                    cylinder(d=atlas_bolt_csink_dia, h=atlas_bolt_csink_depth+1, $fn=32);
+            }
         }
 
         // Camera mount 1/4"-20 insert pocket
@@ -675,8 +1000,11 @@ module level1() {
         translate([0, 0, -1])
             cylinder(d=camera_thread_dia+2, h=2.5, $fn=32);
 
-        // Bracket tap holes (12 total, 2 per bracket × 6 brackets)
-        all_bracket_tap_holes();
+        // Bracket tap holes (12 total, 2 per bracket × 6 brackets).
+        // v17h: suppressed entirely in unibody mode — when the dome
+        // prints as one piece, there are no bolts to install through
+        // the bracket tops, so the holes would just be stress risers.
+        if (!unibody_mode) all_bracket_tap_holes();
 
         // Wiring slots
         for (angle = [0, 90, 180, 270]) {
@@ -713,20 +1041,25 @@ module level2() {
                 cable_opening_2d();
 
         // RGB camera mount holes (4 cameras × 4 M3 holes each = 16 holes)
-        // RouteCAM_P_CU25_CXLC_IP67 bottom mount: 4× M3, 16.5 mm square
-        // Through-holes for M3 bolts from L2 underside into camera bottom threads
+        // RouteCAM_P_CU25_CXLC_IP67 bottom mount: 4× M3, 16.5 mm square.
+        // v17h: each row is [global_x, global_y, aim_deg]. The mount
+        // bolt pattern rotates with the camera body, so for the rear
+        // pair (aim_deg ≠ 0) the holes in L2 align with the re-aimed
+        // (look-at-center) camera orientation.
         for (cam = rgb_cam_layout) {
-            rotate([0, 0, cam[0]]) {
-                for (off = rgb_cam_bolt_offsets) {
-                    translate([rgb_cam_x + off[0],
-                               cam[1] * rgb_cam_y + off[1], -1])
-                        cylinder(d=rgb_cam_bolt_dia, h=L2_thickness+2, $fn=32);
-                }
-            }
+            translate([cam[0], cam[1], -1])
+                rotate([0, 0, cam[2]])
+                    for (off = rgb_cam_bolt_offsets) {
+                        translate([off[0], off[1], 0])
+                            cylinder(d=rgb_cam_bolt_dia,
+                                     h=L2_thickness+2, $fn=32);
+                    }
         }
 
-        // Bracket bolt holes (12 total, clearance only — BHCS head on surface)
-        bolt_clearance_at(hex_bracket_bolt_positions, L2_thickness);
+        // Bracket bolt holes (12 total, clearance only — BHCS head on surface).
+        // v17h: suppressed entirely in unibody mode (see level1() note).
+        if (!unibody_mode)
+            bolt_clearance_at(hex_bracket_bolt_positions, L2_thickness);
 
         // Axis etching on top surface
         axis_etching(L2_thickness);
@@ -829,12 +1162,14 @@ module full_assembly() {
                     robin_w_ghost();
     }
 
-    // RGB cameras on L2 top (4 cameras: front stereo pair + rear symmetric pair)
+    // RGB cameras on L2 top (4 cameras: front stereo pair + rear symmetric pair).
+    // v17h: per-camera (global_x, global_y, aim_deg) from rgb_cam_layout.
+    // Rear cameras get aim_away_from_origin so their lenses point back at the
+    // dome center axis (X=Y=0). Front cameras keep aim = 0° (face +X).
     for (cam = rgb_cam_layout)
-        translate([0, 0, L2_z_top])
-            rotate([0, 0, cam[0]])
-                translate([rgb_cam_x, cam[1] * rgb_cam_y, 0])
-                    rgb_camera_ghost();
+        translate([cam[0], cam[1], L2_z_top])
+            rotate([0, 0, cam[2]])
+                rgb_camera_ghost();
 
     // Commercial GNSS magnetic stand (glued into L2 recess)
     gnss_stand_ghost();
