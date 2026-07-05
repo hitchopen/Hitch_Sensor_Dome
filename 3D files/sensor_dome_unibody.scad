@@ -38,15 +38,19 @@
 // WHAT'S DIFFERENT FROM THE TWO-PIECE PRINT
 // -------------------------------------------------------------
 // Beyond fusing L1 and L2, the unibody also LACKS:
-//   - 12 × ø5.5 tap pockets (10 mm deep) at the top of each
-//     bracket. In two-piece mode the M6 BHCS bolts thread into
-//     these. In unibody mode there are no bolts → no pockets.
-//   - 12 × ø6.5 clearance through-holes in L2 above the
+//   - 10 × ø5.5 tap pockets (15 mm deep) at the top of the brackets
+//     (v17q: was 12 × 10 mm-deep pockets at v17e–v17p). In two-piece
+//     mode the M6 BHCS bolts thread into these. In unibody mode there
+//     are no bolts → no pockets.
+//   - 10 × ø6.5 clearance through-holes in L2 above the
 //     bracket tops. In two-piece mode the M6 BHCS heads pass
 //     through these. In unibody mode → no holes.
 //
-// Net BOM reduction vs two-piece (v17e):
-//   Removed:  12× M6×20 mm BHCS  (bracket-to-L2 bolts)
+// Net BOM reduction vs two-piece (v17q):
+//   Removed:  10× M6×25 mm BHCS  (bracket-to-L2 bolts)
+//             — 4 along the V0-V1 side wall, 4 along the V4-V5 side
+//               wall, 1 on the V2 column (Atlas-upper), 1 on the V3
+//               column (Atlas-lower). Was 12× M6×20 at v17b–v17p.
 //   Unchanged:
 //     12× M6×16 mm SHCS  — LiDAR top mount (3 LiDARs × 4)
 //      4× M4×10 mm        — Atlas Duo to L1 (front pair use slots)

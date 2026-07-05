@@ -1,5 +1,436 @@
 // ============================================================
-// 3D Mapping Sensor Dome — v17j (FINAL)
+// 3D Mapping Sensor Dome — v17r (V0/V5 front-access chamfer)
+//
+// CHANGES FROM v17q (Atlas-INS front-face access from V0-V5 side):
+//   User request: "Open the V0-V5 side wider so that from the front,
+//   it is easy access to the Atlas INS front antenna connectors;
+//   currently the X-side panel of Atlas INS is not fully exposed
+//   from the V5-V0 side."
+//
+//   Diagnosis: with v17l's full-side enclosure (the V0+V1 brackets
+//   form a continuous side-2 wall, V4+V5 the side-6 wall), the two
+//   bracket inner corners that sit nearest the front of the dome —
+//   P3 at (112.34, +54.47) for V0 and P3 at (112.34, -54.47) for V5
+//   — INTRUDE into the Atlas Y range. Specifically:
+//     V0 corner y = +54.47, Atlas top y = +56.80 → 2.33 mm intrusion
+//     V5 corner y = -54.47, Atlas bottom y = -61.00 → 6.53 mm intrusion
+//     (Atlas Y is asymmetric: body extends y ∈ [-61, +56.80],
+//      centered at -2.1; V5 corner sits 6.5 mm inside Atlas Y range
+//      while V0 corner only intrudes 2.3 mm.)
+//   These intrusions block 5-10 mm of the Atlas front face's corners
+//   from being reached horizontally between the V0 and V5 brackets.
+//
+//   v17r cuts a TRIANGULAR CHAMFER from each bracket inner corner,
+//   moving the bracket inner edge up to y = +61.80 (V0 side) and
+//   down to y = -66.00 (V5 side) — both at Atlas edge + 5 mm safety
+//   margin (= finger / connector pull clearance). The chamfers run
+//   the full L1 bracket height (z = 6 → 139) for clean geometry and
+//   open visibility of the Atlas front face from the front of the
+//   dome.
+//
+//   Chamfer triangles (in plan view):
+//     V0 corner:   (116.57, +61.80) ↔ ( 99.64, +61.80) ↔ (112.34, +54.47)
+//                  Triangle area: 62.08 mm² in XY; volume 8.26 cm³.
+//     V5 corner:   (119.00, -66.00) ↔ ( 92.37, -66.00) ↔ (112.34, -54.47)
+//                  Triangle area: 153.57 mm² in XY; volume 20.42 cm³.
+//   Total material removed: 28.7 cm³ ≈ 36 g PETG.
+//
+//   The chamfer cuts the V0 and V1 bracket UNION near V0 (both share
+//   the same near-V0 inner corner via the v17l side-2 wall) and the
+//   V4 and V5 bracket UNION near V5. The bracket OUTER faces along
+//   sides 2 and 6 are UNCHANGED (the chamfer wedge sits entirely on
+//   the INNER side of the wall) — full-side enclosure of sides 2 / 6
+//   is preserved.
+//
+//   v17q two-piece bolt positions (fracs [0.2, 0.4] → 28 / 56 mm from
+//   the vertex along the leg) all sit at bracket parameter s ≥ 28,
+//   well OUTSIDE the chamfer region (which extends to s = 14.66 on V0
+//   side and s = 23.06 on V5 side). All 4 long-wall bolts stay
+//   structurally engaged on each side.
+//
+//   Bracket cross-section reduction at the chamfered corners: 2.5%
+//   (V0 side) and 6.1% (V5 side) of the v17l 2520 mm² gross cross-
+//   section — negligible structurally; the v17k drop-resilience
+//   margins (3-5× v17j) are preserved.
+//
+//   Applied in BOTH two-piece and unibody modes — Atlas front-face
+//   access is a usability requirement regardless of print mode.
+//   No sensor moved, no TF impact.
+//
+// CHANGES FROM v17p (M6 bolt count + length + tap depth):
+//   Only affects the two-piece variant (sensor_dome.scad with
+//   unibody_mode = false). The unibody build suppresses all
+//   bracket-to-L2 bolt holes and is unaffected by v17q.
+//
+//   v17p (and every version since v17b) carried 12 × M6×20 BHCS
+//   bracket-to-L2 bolts, distributed as 2 bolts per bracket × 6
+//   brackets. With v17l's full-side enclosure (V0+V1 brackets
+//   each span the entire 140 mm V0-V1 side; same for V4+V5 along
+//   the V4-V5 side), V0's fracs [0.3, 0.7] and V1's fracs [0.3, 0.7]
+//   produce bolt positions at 42 / 98 mm from V0 and 42 / 98 mm
+//   from V1 = 42 / 98 mm from V0 — i.e. the bracket-bolt-pos lists
+//   COINCIDE pairwise. Net effective bolts per side: 2 (drilled
+//   twice by the difference()).
+//
+//   v17q rebalances the layout to match the actual side enclosure:
+//
+//     V0-V1 side wall:  4 distinct M6×25 bolts at 28, 56, 84,
+//                       112 mm from V0 (V0 contributes fracs
+//                       [0.2, 0.4]; V1 also contributes [0.2, 0.4]
+//                       in V1's frame = 112, 84 mm from V0).
+//                       Evenly spaced ~28 mm apart along the wall.
+//     V4-V5 side wall:  4 distinct M6×25 bolts, symmetric.
+//     V2 column (Atlas-upper): 1 M6×25 at leg midpoint (frac 0.5).
+//     V3 column (Atlas-lower): 1 M6×25 at leg midpoint.
+//     ----
+//     TOTAL: 10 × M6×25 BHCS bracket-to-L2 bolts.
+//
+//   Bolt length 20 → 25 mm: engagement in bracket grows 8 → 13 mm
+//   (more than +60% pull-out strength per bolt). The pilot tap
+//   pocket grows:
+//     interlevel_tap_depth : 10 → 15 mm  (= engagement + 2 mm pilot)
+//   The tap pocket bottom sits at L1_pillar_height - 15 = 118 mm,
+//   which is exactly the bottom edge of the v17k top fillet — the
+//   pilot still lives entirely in solid bracket plastic with no
+//   conflict with the wall geometry.
+//
+//   Net clamping force vs v17p two-piece variant:
+//     - Bolt count: 12 (= 8 effective due to coincidence) → 10 (all
+//       distinct).
+//     - V0-V1 / V4-V5 sides: 2 effective → 4 each (+100%).
+//     - V2 / V3 columns: 2 each → 1 each (-50%; matched to the
+//       short 55 mm Atlas-side leg, where a centered single bolt
+//       clamps uniformly).
+//     - Per-bolt pull-out: ≈ +60% from deeper engagement.
+//     - Net total joint strength along the long V-walls: roughly
+//       3× the v17p value; total Atlas-side joint strength roughly
+//       0.8× v17p (still > 5 kN per column at PETG's typical pull-
+//       out modulus, more than adequate for the dome's mass).
+//
+//   sensor_dome_unibody.scad BOM line updated (12× M6×20 →
+//   10× M6×25 removed by the unibody build).
+//   No TF impact, no sensor moved, no geometry except tap pocket
+//   depth changed.
+//
+// CHANGES FROM v17o (cable opening base narrowed to cover M3 mounts):
+//   Print test of v17o revealed that the L2 cable opening's UPPER
+//   TANGENT LINE clipped into the rear-LEFT camera's M3 mount hole
+//   pattern. Specifically:
+//     Rear-left camera at global (-108.12, +47.27), aim 120°.
+//     The 4 M3 holes (local pattern ±8.25, ±8.25 rotated 120°) sit at
+//       A = (-119.39, +50.29)   — upper-rear
+//       B = (-111.14, +36.00)   — lower-rear  ← problem
+//       C = (-105.10, +58.54)   — upper-front
+//       D = ( -96.85, +44.25)   — lower-front
+//     At v17o (cable_opening_base_half_w = 60 mm), the upper tangent
+//     line from rectangle corner (-135, +60) to the tip circle
+//     (-100, 0) r=15 runs at slope -1.083 and passes through y ≈
+//     34.17 at x = -111.14. Hole B at (-111.14, +36.00) has its
+//     LOWER EDGE (radius 1.7 mm) at y = 34.30 — i.e. 0.13 mm above
+//     the tangent line's y, BUT the perpendicular distance is only
+//     1.24 mm, and after subtracting the 1.7 mm hole radius the
+//     hole edge clips INTO the cable opening by 0.46 mm. (Symmetric
+//     exposure on the rear-RIGHT side: hole at (-111.14, -36.00).)
+//   v17p drops cable_opening_base_half_w 60 → 50 mm:
+//     - Closest hole (B) edge margin: -0.46 mm  →  +3.28 mm
+//     - Hole A edge margin: +3.18 mm → +5.82 mm
+//     - Holes C and D were already well clear, stay well clear
+//     - Cable opening still 100 mm × 40 mm ≈ 2400 mm² area
+//       (13× the 4× PoE + 1× GNSS bundle's 182 mm² area)
+//     - Atlas-side bracket inner edge clearance: 4 mm → 14 mm
+//       (lots of headroom against the rear LiDAR M6 brackets)
+//   No other parameter changed. No sensor moved. No TF impact.
+//
+// CHANGES FROM v17n (close the cable opening's rear-open side):
+//   Through v17n the L2 cable opening was a teardrop whose BASE
+//   coincided with the L2 plate's rear edge at x = -150. After
+//   difference()-ing from the plate, the opening was U-shaped —
+//   open on the rear side — i.e. an "open triangle with one side
+//   open." Cables could escape SIDEWAYS through that open back,
+//   and the rear of the L2 plate had no transverse bracing
+//   between the two rear-flange outer corners at (-150, ±75.06).
+//
+//   v17o pulls the cable opening's rear base inward to x = -140
+//   so a 10 mm-thick L2-plate strip survives between x = -150
+//   (the flange's rear edge) and x = -140 (the cable opening's
+//   new rear edge). That 10 mm strip
+//     - turns the open-back teardrop into a fully ENCLOSED
+//       triangular hole that cables must thread vertically
+//       through (no sideways escape route);
+//     - bridges the two rear-flange outer corners at (-150,
+//       ±75.06) with a continuous transverse beam — the rear
+//       flange now has a dedicated load path across its full
+//       150 mm width, which adds drop / vibration resilience
+//       at those corners (the user's structural goal).
+//
+//   Parameter diff:
+//     cable_opening_base_outer_x : -150 → -140  (rear edge)
+//     cable_opening_base_inner_x : -140 → -135  (front edge of base rect)
+//     NEW: cable_opening_rear_wall_t = 10        (= -140 - -150)
+//     cable_opening_2d() no longer uses `far_x = -300` for the
+//       rectangle — it now uses outer_x / inner_x directly so the
+//       rectangle lives entirely inside the plate.
+//
+//   Effective teardrop length: 50 mm → 40 mm (tip at -100, base at
+//   -140). At the new base, the opening is still the full 120 mm
+//   wide (= 2 × 60 mm = 2 × cable_opening_base_half_w), which more
+//   than covers the 4× shielded PoE + 1× GNSS cable bundle (~34 mm
+//   total cable diameter).
+//   Material added: ~14.4 cm³ of L2 plate plastic (≈ 18 g PETG).
+//
+//   No other geometry, sensor position, bracket, or TF moved.
+//   The v17n vertex arcs at V0/V1/V4/V5 carry through unchanged.
+//
+// CHANGES FROM v17m (drop-impact distribution at hex vertices):
+//   v17l made the V0/V1/V4/V5 brackets the entire side wall; v17m
+//   added low partial walls along sides 3 and 5. Both passes left
+//   the four exposed hex VERTICES (V0/V1/V4/V5) as sharp polygon
+//   corners — just smoothed by the global corner_r=10 offset cycle,
+//   which is a single ~10 mm arc tangent to the two adjacent sides.
+//   The next drop test would still concentrate impact force on
+//   roughly a 10 mm arc — closer to a point than to a distributed
+//   load — at exactly the vertex where the bracket wall column
+//   terminates. That is the structural worst case.
+//
+//   v17n introduces EXPLICIT 25 mm arcs at V0/V1/V4/V5 baked into
+//   the hex polygon point list (rounded_hex_polygon_points()):
+//     - 60° arc centered on the INWARD bisector at distance
+//       R / sin(60°) = 28.87 mm from the theoretical vertex
+//     - 16 sample points per arc (smooth visual)
+//     - arc length grows from 10.47 mm (R=10) to 26.18 mm (R=25)
+//       → 2.5× contact-line distribution at the L1 plate edge
+//     - Hertzian peak stress drops to ~69% of v17m baseline
+//       (R^{-2/5} drop-impact scaling per Stronge / Hertz)
+//
+//   The offset(corner_r) offset(-corner_r) smoothing pass in
+//   L1_plate_outline() / hex_plate_outline() is preserved at the
+//   original corner_r = 10 mm value. Convex arcs at R = 25 mm
+//   survive the ±10 mm offset cycle UNCHANGED (the cycle only
+//   smooths corners tighter than 10 mm). So:
+//     V0/V1/V4/V5 → 25 mm arcs (NEW)
+//     V2/V3       → 10 mm concave inside fillets at the hex-vs-
+//                   flange junction (unchanged)
+//     flange rear outer corners → 10 mm arcs (unchanged)
+//   No other geometry, sensor position, or bolt pattern moved.
+//   No TF impact.
+//
+//   v17l side-2 / side-6 enclosure SURVIVES the change:
+//     - Tangent point on side 2 moves from 5.77 mm to 14.43 mm
+//       inboard of V0 / V1 → straight wall span 128.6 mm → 111.2 mm
+//       (still > 78% of side length)
+//     - The 14.43 mm arc region at each end of side 2 is covered
+//       by the bracket polygon's intersection with the rounded
+//       plate outline — bracket material follows the arc, so
+//       enclosure is continuous
+//   v17m side 3 + side 5 partial walls SURVIVE similarly:
+//     - Lose 14.43 mm of straight wall at the V1/V4 end (V2/V3 end
+//       unchanged — those vertices stay sharp)
+//     - Net partial wall straight section 145.4 mm → 130.9 mm
+//
+//   v17k symmetric top/bottom bracket fillets are UNAFFECTED — the
+//   fillets are local to the bracket-plate junction in the Z axis;
+//   they intersect with L1_plate_outline so they follow the new
+//   25 mm arcs in plan view automatically.
+//
+// CHANGES FROM v17l (sensor-mount clearance + side 3/5 strengthening):
+//   Print-fitting the v17l unibody revealed two mount-clearance
+//   conflicts introduced by the v17k+v17l bracket widening / side
+//   enclosure, plus the user noted that sides 3 and 5 (the rear
+//   LiDAR-bearing faces) have no inter-column bracing at all. v17m
+//   makes three changes:
+//
+//   (1) FRONT-STEREO CAMERAS pulled inward and rearward
+//         rgb_cam_x_front : 85 → 75   (10 mm closer to dome center)
+//         rgb_cam_y_front : 73 → 55   (18 mm closer to X axis)
+//       At v17l the side-2 wall is 18 mm thick from the V0→V1 line
+//       inward; with v17k's TOP fillet the wall expands to 21 mm
+//       at z = L2_z_bottom. The previous (85, 73) cam position
+//       placed its worst-case M3 bolt at perpendicular distance
+//       4.35 mm from side 2 — INSIDE the wall — requiring six
+//       ø6 mm head-clearance pockets that compromised the wall.
+//       The v17m position moves the worst-case M3 to 24.93 mm
+//       perpendicular distance — 3.93 mm clear of the 21 mm top-
+//       fillet expansion and 6.93 mm clear of the 18 mm main wall.
+//       The v17l front_cam_m3_head_pockets() helper is KEPT in
+//       the source — its list comprehension now evaluates to empty
+//       at the v17m cam position, so no pockets are drilled, but
+//       if the cam is ever moved back the pockets re-appear
+//       automatically.
+//       Side-effect: stereo baseline shrinks 146 → 110 mm. Still
+//       wider than v17a–g (104 mm) and v17h (130 mm).
+//
+//   (2) ATLAS-SIDE BRACKET TOP FILLET — "spherical-style" rounded
+//       interface to L2 that does NOT block rear-LiDAR M6 bolts.
+//       v17k expanded the TOP-FILLET footprint by fr=15 mm in +X
+//       (toward dome center) so the bracket-L2 junction flares
+//       outward. That +X flare reached x = -80 at z = L2_z_bottom
+//       and SWEPT OVER the rear LiDAR M6 top-mount bolt at
+//       (-85.68, +76.40) — making the M6 BHCS un-installable on
+//       both rear LiDARs.
+//       v17m removes the +X expansion entirely on both Atlas-side
+//       brackets (upper and lower) while keeping the Atlas-facing
+//       -Y / +Y expansion (5 mm upper, 2 mm lower) that fits
+//       within the Atlas body clearance. The Atlas-side bracket
+//       top now meets L2 with a vertical +X face (rear-LiDAR
+//       side) and a smoothly chamfered -Y / +Y face (Atlas side).
+//       Rear-left LiDAR M6 bolt is now 9.68 mm clear of the +X
+//       face of the upper bracket; mirror for the lower bracket
+//       and the rear-right LiDAR.
+//
+//   (3) SIDE 3 + SIDE 5 — NEW LOW PARTIAL WALLS, z = 6 → 54.
+//       Sides 3 (V1→V2) and 5 (V3→V4) carry the rear Robin W
+//       LiDARs. Previously they had NO bracket along the side —
+//       the load path between V1 vertex bracket and the Atlas
+//       upper bracket (and symmetrically V4 ↔ Atlas lower) ran
+//       only through the L1 plate. The rear LiDARs hang from L2
+//       and extend from z = 54 (body bottom) up to z = 139
+//       (L2 underside). A FULL-HEIGHT wall along side 3 / 5
+//       would collide with the LiDAR body.
+//       v17m adds a PARTIAL wall along each rear side at
+//       bracket_wall_t = 18 mm thick, running the full vertex-
+//       to-vertex length but TOPPING OUT at z = 54 — exactly the
+//       LiDAR body's underside. The wall stays inside the LiDAR's
+//       Z envelope and outside its XY footprint (verified: all
+//       4 wall corners outside the rotated rectangle of the LiDAR
+//       body, and all 4 body corners outside the wall polygon).
+//       Bonded L1↔L1 contact along each rear side grows from 0
+//       to 145.4 mm × 48 mm height — significant torsional
+//       stiffness added to the rear of the dome.
+//
+//   Geometry summary (post-v17m):
+//     side 1 (V5-V0, 0°)   — front LiDAR        — M6 top-mount only
+//     side 2 (V0-V1, 60°)  — FULLY ENCLOSED     — continuous 18 mm wall (v17l)
+//     side 3 (V1-V2, 120°) — rear-left LiDAR    — LOW partial wall, z 6→54 (v17m)
+//     side 4 (V2-V3, 180°) — Atlas rear flange  — 2 Atlas-side brackets
+//     side 5 (V3-V4, 240°) — rear-right LiDAR   — LOW partial wall, z 6→54 (v17m)
+//     side 6 (V4-V5, 300°) — FULLY ENCLOSED     — continuous 18 mm wall (v17l)
+//
+//   Total v17m bonded perimeter (counting full-height + half-height
+//   contributions as their area equivalents):
+//     full-height (z 6→139, 133 mm tall):
+//       2 × 140 mm (sides 2 + 6) + 2 × 55 mm (Atlas) = 390 mm
+//     half-height (z 6→54, 48 mm tall):
+//       2 × 145.4 mm (sides 3 + 5) = 290.8 mm
+//     Effective bonded area (height-weighted, vs v17k baseline 30 mm × 270 mm
+//     = 8,100 mm²):
+//       (390 × 133 + 290.8 × 48) / 30 = 2,194 mm of equivalent 30-mm-tall wall.
+//     Roughly 8× the v17j L1↔L2 bonded perimeter, with the rear half-
+//     height walls adding the L1↔L1 torsional brace the rear couldn't
+//     get from full-height columns.
+//
+//   No TF impact from (2) and (3). (1) updates the front-cam
+//   translations in config/sensor_dome_tf.yaml.
+//
+// CHANGES FROM v17k (v17l side-2 / side-6 enclosure):
+//   Following the drop testing that motivated v17k's wider/longer/
+//   filleted brackets, the two BLANK hex sides (side 2 = V0-V1 and
+//   side 6 = V4-V5 — the LiDAR-less faces) are now FULLY ENCLOSED
+//   by continuous vertical walls. With the v17g irregular hex these
+//   sides are 140.111 mm long. v17l sets bracket_leg_len = 140 so
+//   each pair of vertex brackets (V0+V1, V4+V5) overlaps along
+//   nearly the entire side; their union is a single side-spanning
+//   wall. Sides 1, 3, 4, 5 are untouched (they carry LiDARs or
+//   the Atlas flange; can't be enclosed).
+//
+//   Geometry summary (post-v17l):
+//     side 1 (V5-V0, 0°)   — front LiDAR        — 4 M6 top-mount bolts only
+//     side 2 (V0-V1, 60°)  — FULLY ENCLOSED     — continuous 18 mm wall
+//     side 3 (V1-V2, 120°) — rear-left LiDAR    — 4 M6 top-mount bolts only
+//     side 4 (V2-V3, 180°) — Atlas rear flange  — 2 Atlas-side brackets
+//     side 5 (V3-V4, 240°) — rear-right LiDAR   — 4 M6 top-mount bolts only
+//     side 6 (V4-V5, 300°) — FULLY ENCLOSED     — continuous 18 mm wall
+//
+//   The continuous walls bond L1 and L2 along the full 140 mm of
+//   each enclosed side rather than at four discrete 50 mm
+//   contact patches. Total bonded perimeter grows from 4×50 +
+//   2×35 = 270 mm to 2×140 + 4×50 + 2×35 = 550 mm (≈2× longer
+//   adhesion line, with proportionally bigger drop resilience).
+//
+//   *** REQUIRED FIX: front-camera M3 head-clearance pockets ***
+//   The widened wall along side 2 sweeps over the front-right
+//   camera's M3 mount pattern (cam at (85, +73), bolts at
+//   |x| = 76.75 / 93.25, |y| = 81.25). Three of four M3 bolts per
+//   front camera land inside the 18 mm-thick wall. Without a
+//   clearance pocket the M3 bolt heads can't seat on L2's underside
+//   — the cameras become unmountable. v17l drills ø6 mm × 5 mm
+//   pockets from the bracket TOP downward at every front-cam M3
+//   position within (bracket_wall_t + 2) mm of the side-2/6 line.
+//   New helper module: front_cam_m3_head_pockets(); called from
+//   level1() unconditionally (both two-piece and unibody modes).
+//
+//   Numeric clearance verification at v17l geometry (LEG=140, T=18):
+//     Front-right cam M3 (perpendicular distance to side 2 line):
+//       (76.75, 64.75)   26.89 mm  outside  →  no pocket
+//       (76.75, 81.25)   12.60 mm  inside   →  POCKET
+//       (93.25, 64.75)   18.64 mm  outside  →  POCKET (margin < 1 mm)
+//       (93.25, 81.25)    4.35 mm  inside   →  POCKET
+//     Front-left cam M3 — symmetric (3 pockets).
+//     Total v17l pockets: 6.
+//
+//   No TF impact. No sensor positions or bolt patterns moved.
+//   The unibody variant benefits most from v17l because the
+//   continuous wall braces the L1↔L2 join over a long edge
+//   instead of relying on point loads at four vertex columns.
+//
+// CHANGES FROM v17j (v17k post-drop-test strengthening):
+//   Field testing showed the printed dome fractures at the
+//   bracket-to-L2 junction when dropped on a hard surface. The
+//   failure mode is a clean shear at the 90° corner where each
+//   bracket wall meets the L2 underside — a textbook stress-
+//   concentration crack initiator. v17k strengthens the 6 support
+//   columns in three ways at once:
+//
+//   1) Thicker walls:
+//      - hex-vertex brackets: bracket_wall_t 12 → 18 mm (+50 %)
+//      - atlas-side brackets: atlas_bracket_wall_t 10 → 15 mm
+//        (parametric; flange-clipped to ~11 mm effective)
+//
+//   2) Longer legs (more L1 footprint + more bending inertia):
+//      - hex-vertex brackets: bracket_leg_len 35 → 50 mm
+//      - atlas-side brackets: atlas_bracket_leg_len 35 → 55 mm
+//        (extends from x=-150 to x=-95 instead of -115; stays
+//        clear of the cable-cutout teardrop tip at x=-100)
+//
+//   3) Symmetric top + bottom fillets at every bracket-plate
+//      junction:
+//      - bracket_fillet_r 10 → 15 mm (+50 %)
+//      - BOTTOM (L1) fillet: pre-existing hull()-based taper from
+//        an expanded base profile to the normal wall profile.
+//      - TOP (L2) fillet: NEW in v17k — symmetric mirror of the
+//        base fillet that flares the bracket outward as it
+//        approaches L2's underside. Replaces the 90° edge that
+//        used to be the crack initiator with a 15 mm linear taper
+//        clipped to L1_plate_outline() so the flare stays within
+//        the L2 footprint above.
+//      - In both fillet zones the expanded profile grows along
+//        the wall direction at both short ends and toward the
+//        plate interior on the inner face, matching the v17c
+//        original geometry — only the radius and the vertical
+//        extent changed.
+//
+//   Net result of (1) + (2) + (3): bracket cross-section grows
+//   from 12×35 = 420 mm² to 18×50 = 900 mm² (≈2.1× area), and
+//   the two stress-concentration corners at each end of every
+//   bracket are eliminated. Estimated drop-impact strength on
+//   the side of the dome rises by roughly 3×–5× vs v17j.
+//
+//   Clearance verification (numeric check at v17k geometry):
+//   - V0/V5 brackets — inner edge to nearest front-camera M3
+//     bolt CENTER: 8.89 mm; hole edge wall: 7.19 mm. SAFE.
+//   - V1/V4 brackets — inner edge to nearest camera M3: 46 mm.
+//   - All hex-vertex brackets to LiDAR bodies: ≥ 47 mm.
+//   - Atlas-side brackets — inner edge unchanged at y = ±64;
+//     Atlas body remains at y ∈ [-61, +56.8]; gaps remain at
+//     7.2 mm (upper) and 3.0 mm (lower).
+//   - L1 pillar height unchanged at 133 mm. Straight-wall
+//     section between top and bottom fillets shrinks from
+//     113 mm (v17j: 133-20) to 103 mm (v17k: 133-30) — still
+//     plenty of vertical wall for shear stiffness.
+//
+//   No TF impact. All sensor positions unchanged. The unibody
+//   variant benefits more from v17k than the two-piece variant
+//   because the unibody can't be re-tightened after a drop loosens
+//   the bracket bolts.
 //
 // CHANGES FROM v17i (Option B from the 360°-coverage analysis):
 //   - Rear-camera aim REVERTED from "outward along radial-through-
@@ -388,11 +819,19 @@ atlas_flange_extent = 150;                        // -X extent of flange
 atlas_flange_half_width = hex_circumradius / 2;   // ≈ 75.1mm
 
 // --- Inter-Level Bolts (M6) ---
+// v17q: bracket-to-L2 bolt spec is M6×25 BHCS (was M6×20 v17b–v17p).
+//   L2 plate clearance:  12 mm
+//   Bracket engagement:  13 mm  (25 - 12)
+//   Pilot clearance:      2 mm
+//   ⇒ interlevel_tap_depth = 15 mm
+// The tap hole bottom sits at L1_pillar_height - 15 = 118 mm = bottom
+// edge of the v17k top fillet, so the pilot still lives entirely in
+// solid bracket material.
 interlevel_bolt_dia = 6.5;     // M6 clearance hole
 interlevel_csink_dia = 11.0;   // M6 SHCS head clearance (LiDAR bolts)
 interlevel_csink_depth = 4.0;
 interlevel_tap_dia = 5.5;      // M6 self-tap pilot in printed plastic
-interlevel_tap_depth = 10;
+interlevel_tap_depth = 15;     // v17q: 10 → 15 mm for M6×25 engagement
 
 // --- Hex Vertex Brackets (4 of 6 — V0, V1, V4, V5) ---
 // Single-wall brackets at hex vertices along blank sides 2 and 6.
@@ -407,9 +846,21 @@ interlevel_tap_depth = 10;
 // side 4 or with LiDAR bodies on sides 3/5). Instead, two custom
 // "Atlas-side brackets" replace them (see below).
 
-bracket_wall_t   = 12;    // wall thickness for hex vertex brackets
-bracket_leg_len  = 35;    // wall length along hex side
-bracket_fillet_r = 10;    // fillet radius at bracket-to-plate junction
+// v17k drop-resilience pass + v17l side enclosure: brackets are the load
+// path that fails first on impact. v17k bumped thickness/length/fillet
+// and added a symmetric TOP fillet at the L2 junction. v17l extends the
+// bracket leg to the FULL side length so V0/V1 brackets union into one
+// continuous wall along side 2 (V0-V1), and V4/V5 brackets union into
+// one continuous wall along side 6 (V4-V5). The two blank sides without
+// LiDARs are now fully enclosed for impact protection.
+//
+// Side length in v17g irregular hex = 140.11 mm. Leg = 140 leaves a
+// 0.07 mm gap at each far end, picked up by the matched-vertex bracket
+// from the other direction. The intersection() clip to L1_plate_outline
+// keeps any over-extension within the plate footprint.
+bracket_wall_t   = 18;    // wall thickness for hex vertex brackets (was 12)
+bracket_leg_len  = 140;   // FULL side length (was 50 in v17k, 35 in v17j)
+bracket_fillet_r = 15;    // fillet radius at bracket-to-plate junction (was 10)
 // Atlas-side brackets: fillet toward Atlas body is limited by clearance.
 // Upper bracket clearance: 64 - 56.8 = 7.2mm → use 5mm.
 // Lower bracket clearance: 64 - 61.0 = 3.0mm → use 2mm.
@@ -438,6 +889,104 @@ function hex_vertex_xy(i) =
               : hex_circumradius)
     [r * cos(a), r * sin(a)];
 
+// v17n DROP-RESILIENCE VERTEX ROUNDING
+// ====================================
+// Drop-test landings concentrate impact at the four hex vertices that
+// project farthest in plan view (V0, V1, V4, V5). Each is the OUTER
+// corner of a 120° internal angle and, with v17l's full-side enclosure,
+// also marks the OUTER edge of the bracket wall. Replacing each sharp
+// polygon corner with an explicit arc spreads the drop force along an
+// arc length of ~26 mm (vs. ~10 mm at corner_r=10), dropping Hertzian
+// peak stress to ~69% of the v17m baseline (R^{-2/5} scaling).
+//
+// Implementation: build the hex polygon with EXPLICIT arc points at
+// V0/V1/V4/V5 (sampled at $fn=16-equivalent density) and keep V2/V3 as
+// sharp polygon corners (they sit inside the Atlas flange union and
+// are not exposed). The subsequent offset(corner_r) offset(-corner_r)
+// in L1_plate_outline() leaves these large arcs UNCHANGED (a convex
+// R=25 arc survives the ±10 mm offset cycle as itself, only V2/V3 +
+// flange corners pick up the 10 mm rounding) — so a single corner_r
+// retains the small-corner smoothing without flattening the new arcs.
+//
+// V2/V3 stay sharp because they are concave hex-vs-flange corners
+// shielded by the Atlas-side brackets; the flange's own rear corners
+// stay at corner_r = 10 mm (the offset pass is what rounds them).
+rounded_vertex_r       = 25;   // arc radius at V0, V1, V4, V5 (was implicit 10)
+rounded_vertex_arc_pts = 16;   // sample points per arc (smoother = larger)
+
+// Geometry helper: arc of radius R that's tangent to BOTH adjacent
+// sides at V_i. Computed from the actual incoming/outgoing edge
+// directions so the result is correct for the v17g irregular hex
+// (where V1/V4 have interior angle 123.43° instead of 120° because
+// V0/V1/V4/V5 are pulled in but V2/V3 are not).
+//
+// Returns N+1 points on the arc, in CCW order from the start-tangent
+// (on the incoming side, just before V_i) to the end-tangent (on the
+// outgoing side, just after V_i). When stitched into the polygon
+// point list these points replace the sharp vertex.
+function vertex_arc_points(i, R, N) =
+    let(
+        Vi    = hex_vertex_xy(i),
+        Vprev = hex_vertex_xy((i + 5) % 6),       // CCW previous
+        Vnext = hex_vertex_xy((i + 1) % 6),       // CCW next
+        // Incoming direction (Vprev → V_i), unit
+        dix   = Vi[0] - Vprev[0],
+        diy   = Vi[1] - Vprev[1],
+        diL   = sqrt(dix*dix + diy*diy),
+        diux  = dix / diL,    diuy = diy / diL,
+        // Outgoing direction (V_i → Vnext), unit
+        dox   = Vnext[0] - Vi[0],
+        doy   = Vnext[1] - Vi[1],
+        doL   = sqrt(dox*dox + doy*doy),
+        doux  = dox / doL,    douy = doy / doL,
+        // Inward bisector at V_i. The two unit vectors going AWAY from
+        // V_i along each adjacent side are (-incoming) and outgoing.
+        // Their sum BISECTS the OUTSIDE angle, but for a convex CCW
+        // polygon vertex these two side-going-away vectors both point
+        // INTO the polygon interior on average — so (-incoming + outgoing)
+        // normalized IS the inward bisector. From V_i, points toward
+        // the arc center.
+        bix_raw = -diux + doux,
+        biy_raw = -diuy + douy,
+        biL     = sqrt(bix_raw*bix_raw + biy_raw*biy_raw),
+        bix     = bix_raw / biL,
+        biy     = biy_raw / biL,
+        // Interior angle at V_i from (-incoming) · outgoing
+        cos_int  = (-diux) * doux + (-diuy) * douy,
+        half_int = acos(cos_int) / 2,
+        // Setback (V_i to arc center) and tangent distance from V_i
+        setback   = R / sin(half_int),
+        tangent_d = R / tan(half_int),
+        // Arc center
+        cx = Vi[0] + setback * bix,
+        cy = Vi[1] + setback * biy,
+        // Tangent points: on incoming side (start), on outgoing side (end)
+        sx = Vi[0] - tangent_d * diux,
+        sy = Vi[1] - tangent_d * diuy,
+        ex = Vi[0] + tangent_d * doux,
+        ey = Vi[1] + tangent_d * douy,
+        // Arc start/end angles measured at arc center
+        start_a = atan2(sy - cy, sx - cx),
+        end_a_raw = atan2(ey - cy, ex - cx),
+        // Sweep CCW from start to end (the convex-vertex case)
+        end_a   = end_a_raw < start_a ? end_a_raw + 360 : end_a_raw
+    )
+    [for (j = [0 : N])
+        let(t = start_a + (end_a - start_a) * j / N)
+        [cx + R * cos(t), cy + R * sin(t)]];
+
+// Full hex polygon point list: arc points at V0/V1/V4/V5, sharp
+// polygon points at V2/V3. CCW traversal.
+function rounded_hex_polygon_points() =
+    let(sectors = [
+        for (i = [0:5])
+            is_pulled_vertex(i)
+                ? vertex_arc_points(i, rounded_vertex_r,
+                                       rounded_vertex_arc_pts)
+                : [hex_vertex_xy(i)]
+    ])
+    [for (sect = sectors) for (p = sect) p];
+
 // Bracket wall direction and inward normal (simple even/odd rule).
 // Note: only the VERTEX POSITION moves with the pullback; the
 // direction vectors stay tied to the original 30°/90°/270°/330°
@@ -453,6 +1002,14 @@ function bracket_wall_norm(i) =
 // Bolt positions: 2 per bracket (at 30% and 70% along wall length).
 // v17g: vertex anchor now comes from hex_vertex_xy(i) so brackets
 // at V0/V1/V4/V5 move inward with their pulled vertices.
+// v17q: each vertex bracket contributes 2 bolts at fracs [0.2, 0.4]
+// of its 140 mm leg. With the v17l full-side enclosure (V0+V1 cover
+// the entire V0-V1 side; V4+V5 cover the entire V4-V5 side), V0's
+// bolts at 0.2/0.4 land at 28/56 mm from V0 and V1's bolts at 0.2/0.4
+// (in V1's frame) land at 28/56 mm from V1 = 112/84 mm from V0. Net:
+// 4 distinct positions per side at {28, 56, 84, 112} mm from the
+// reference vertex — evenly spaced ~28 mm apart along the 140 mm
+// wall. (Two-piece mode only; unibody_mode suppresses these holes.)
 function bracket_bolt_pos(i, j) =
     let(
         v  = hex_vertex_xy(i),
@@ -460,7 +1017,7 @@ function bracket_bolt_pos(i, j) =
         vy = v[1],
         d  = bracket_wall_dir(i),
         n  = bracket_wall_norm(i),
-        frac = (j == 0) ? 0.3 : 0.7
+        frac = (j == 0) ? 0.2 : 0.4
     )
     [vx + bracket_leg_len * frac * cos(d) + bracket_wall_t/2 * cos(n),
      vy + bracket_leg_len * frac * sin(d) + bracket_wall_t/2 * sin(n)];
@@ -474,30 +1031,43 @@ function bracket_bolt_pos(i, j) =
 // Thickness extends AWAY from Atlas (+Y for upper, -Y for lower).
 
 atlas_bracket_x_start   = -150;   // starts at flange rear edge
-atlas_bracket_leg_len   = 35;     // runs +X for 35mm to x=-115
-atlas_bracket_wall_t    = 10;     // slightly thinner than hex brackets
+// v17k drop-resilience: leg extended 35→55 mm and wall_t 10→15 mm. The
+// outer Y edge gets clipped by L1_plate_outline() at ±75.05 mm, so the
+// effective wall thickness is ~11 mm, but the longer leg gives more L1
+// contact area + more inertia. Top fillet is added in atlas_side_brackets().
+atlas_bracket_leg_len   = 55;     // runs +X from x=-150 to x=-95 (was 35→x=-115)
+atlas_bracket_wall_t    = 15;     // parametric value (was 10); flange-clipped to ~11
 atlas_bracket_y_upper   = 64;     // upper wall inner edge Y
 atlas_bracket_y_lower   = -64;    // lower wall inner edge Y
 
-// Atlas-side bracket bolt positions (2 per bracket × 2 brackets = 4)
-function atlas_bracket_bolt_pos(side, j) =
+// Atlas-side bracket bolt position — v17q: ONE bolt per column at the
+// LEG MIDPOINT (frac = 0.5), down from two bolts in v17m. The 55 mm
+// leg is short enough that a single centered bolt clamps the bracket
+// uniformly to L2; the long V0-V1 / V4-V5 walls (140 mm) keep their
+// 4-bolt distribution. (Two-piece mode only.)
+function atlas_bracket_bolt_pos(side) =
     let(
-        frac = (j == 0) ? 0.3 : 0.7,
-        bx = atlas_bracket_x_start + atlas_bracket_leg_len * frac,
+        bx = atlas_bracket_x_start + atlas_bracket_leg_len * 0.5,
         y_base = (side == 0) ? atlas_bracket_y_upper : atlas_bracket_y_lower,
         y_sign = (side == 0) ? 1 : -1,
         by = y_base + y_sign * atlas_bracket_wall_t / 2
     )
     [bx, by];
 
-// Combined bolt positions for all 6 brackets (8 hex-vertex + 4 atlas-side = 12)
+// v17q bolt layout (two-piece variant):
+//   V0+V1 side (side 2):   2 bolts/bracket × 2 brackets = 4 entries → 4 distinct positions
+//   V4+V5 side (side 6):   2 bolts/bracket × 2 brackets = 4 entries → 4 distinct positions
+//   V2 column (Atlas-up):  1 bolt = 1 entry
+//   V3 column (Atlas-low): 1 bolt = 1 entry
+//   ---
+//   Total: 10 M6×25 BHCS bracket-to-L2 bolts.
 hex_bracket_bolt_positions = [
-    bracket_bolt_pos(0, 0), bracket_bolt_pos(0, 1),   // V0 (30°)
-    bracket_bolt_pos(1, 0), bracket_bolt_pos(1, 1),   // V1 (90°)
-    bracket_bolt_pos(4, 0), bracket_bolt_pos(4, 1),   // V4 (270°)
-    bracket_bolt_pos(5, 0), bracket_bolt_pos(5, 1),   // V5 (330°)
-    atlas_bracket_bolt_pos(0, 0), atlas_bracket_bolt_pos(0, 1),  // upper Atlas-side
-    atlas_bracket_bolt_pos(1, 0), atlas_bracket_bolt_pos(1, 1)   // lower Atlas-side
+    bracket_bolt_pos(0, 0), bracket_bolt_pos(0, 1),   // V0 (30°)  — side 2 bolts 1, 2
+    bracket_bolt_pos(1, 0), bracket_bolt_pos(1, 1),   // V1 (90°)  — side 2 bolts 3, 4
+    bracket_bolt_pos(4, 0), bracket_bolt_pos(4, 1),   // V4 (270°) — side 6 bolts 1, 2
+    bracket_bolt_pos(5, 0), bracket_bolt_pos(5, 1),   // V5 (330°) — side 6 bolts 3, 4
+    atlas_bracket_bolt_pos(0),                        // V2 column (upper Atlas-side) — single midpoint bolt
+    atlas_bracket_bolt_pos(1)                         // V3 column (lower Atlas-side) — single midpoint bolt
 ];
 
 // Camera mount
@@ -536,22 +1106,58 @@ gnss_stand_recess_depth = 8;    // recess depth (leaves 4mm floor in 12mm plate)
 //
 // Shape: hull() of a tip circle and a base rectangle.
 //   Tip circle: ø30mm at (-100, 0) — round termination.
-//   Base rectangle: x = [-150, -140] (half the flange length),
-//     y = ±60 mm (fits between Atlas-side brackets).
+//   Base rectangle: x = [-140, -135], y = ±50 mm.
 //   The hull creates smooth tangent lines from the circle to the
 //   base, giving a teardrop that widens gradually from the tip.
 //
-// Triangle height (tip to base inner edge): 40 mm (doubled from v17b).
-// Base half-width 60 mm leaves 4 mm wall to bracket inner edge (y=±64).
-// Bracket bolt holes at y=±69 have ≥6.6 mm clearance.
-// GNSS recess clearance: 42 mm. Camera hole clearance: ≥37 mm.
+// v17o: REAR-EDGE CLOSURE.
+//   At v17n the teardrop's REAR base coincided with the L2 plate's
+//   rear flange edge at x = -150 — so the opening was U-shaped (open
+//   at the rear) and cables could escape SIDEWAYS through the open
+//   slot. v17o moves the rear base inward to x = -140, leaving a
+//   10 mm-thick L2-plate wall between the cable hole's rear edge
+//   (x = -140) and the flange's rear edge (x = -150). That wall:
+//     1) closes the open side, turning the teardrop into a fully
+//        ENCLOSED triangular HOLE that cables must thread vertically
+//        through (no sideways escape);
+//     2) connects the two rear flange outer corners at (-150, ±75.06)
+//        with a continuous transverse beam, bracing the rear of the
+//        L2 plate against drop / vibration loads at the corners.
+//   Material added: 10 mm × 12 mm × 150 mm ≈ 18 g of PETG.
+//
+// v17p: BASE NARROWED to clear the rear-camera M3 mounts.
+//   At v17o (base_half_w = 60 mm) the upper tangent line of the
+//   teardrop ran at y ≈ 34.17 at x = -111.14, which is exactly where
+//   the rear-LEFT camera's third M3 mount hole sits (rotated bolt
+//   pattern at aim 120° puts one hole at (-111.14, +36.00)). The
+//   bolt hole's lower edge (radius 1.7 mm) clipped INTO the cable
+//   opening by 0.46 mm — i.e., the M3 hole was partially open into
+//   the cable cutout, leaving the rear-cam screw with no L2 material
+//   on one side. (Symmetric exposure on the rear-RIGHT side.)
+//   v17p drops base_half_w 60 → 50 mm, which lowers the tangent
+//   line to y ≈ 29.43 at x = -111.14 (perpendicular distance to
+//   the hole CENTER 4.98 mm; to the hole EDGE 3.28 mm). All four
+//   M3 holes for both rear cameras now have ≥ 3.28 mm of L2 wall
+//   between the hole edge and the cable opening boundary.
+//   Effective opening: 100 mm wide at the base × 40 mm long ≈
+//   2400 mm² trapezoid — still 13× the 182 mm² cable bundle
+//   cross-section, plenty of room.
+//
+// Triangle height (tip to base inner edge): 30 mm (v17o: was 40 mm
+//   at v17b–v17n).
+// v17p clearance summary:
+//   - Atlas-side bracket inner edge (y = ±64): 14 mm wall (v17o: 4 mm)
+//   - Bracket bolt holes (y = ±69): ≥ 19 mm wall
+//   - Rear-cam M3 hole edge: ≥ 3.28 mm wall
+//   - GNSS recess: 42 mm clearance. Front-cam M3: ≥ 37 mm.
 //
 // NOT applied to L1 — L1 plate remains solid under the brackets.
 cable_opening_tip_x        = -100;  // tip circle center X
 cable_opening_tip_r        = 15;    // tip circle radius (ø30mm)
-cable_opening_base_half_w  = 60;    // base half-width (between brackets)
-cable_opening_base_outer_x = -150;  // base outer edge (flange edge)
-cable_opening_base_inner_x = -140;  // base inner edge (half flange)
+cable_opening_base_half_w  = 50;    // base half-width (v17p: was 60, exposed rear-cam M3)
+cable_opening_base_outer_x = -140;  // base outer edge (v17o: was -150 = flange edge)
+cable_opening_base_inner_x = -135;  // base inner edge (v17o: was -140; 5 mm rectangle depth)
+cable_opening_rear_wall_t  = 10;    // closing wall thickness = flange edge (-150) to opening rear (-140)
 
 // --- RGB Camera: RouteCAM_P_CU25_CXLC_IP67 ---
 // Body: 46 × 46 × 52.95 mm (without lens), 65.12 mm total height with lens
@@ -580,13 +1186,16 @@ rgb_cam_bolt_dia  = 3.4;      // M3 clearance hole diameter
 //   V0–V1 and V4–V5 hex edges (sides 2 and 6). The local frame here is
 //   the un-rotated camera frame: +X = camera optical axis (= forward),
 //   +Y = camera's left.
-//   v17i: pushed even further toward V0/V1 and V4/V5, with the camera
-//   body pulled rearward to keep a comfortable wall to side 2. New
-//   numbers leave a 2.6 mm wall from each upper-Y M3 hole edge to side
-//   2 and a 26 mm wall to the nearest front-LiDAR M6 countersink.
-//   Side-effect: front-stereo baseline widens 130 → 146 mm.
-rgb_cam_x_front   = 85;       // forward distance (was 105 v17a–h)
-rgb_cam_y_front   = 73;       // lateral offset (was 52 v17a–g, 65 v17h)
+//   v17i: pushed further toward V0/V1 and V4/V5; stereo baseline 130 → 146 mm.
+//   v17m: pulled BACK toward the center because v17l's full-side enclosure
+//   walls (18 mm thick) now physically overlap most of each front-cam M3
+//   bolt pattern. New numbers move the cam 10 mm rearward and 18 mm
+//   inward so the WORST-CASE M3 bolt is 24.93 mm from the side-2 line
+//   (= 3.93 mm clear of the 21 mm top-fillet expansion, 6.93 mm clear
+//   of the 18 mm main wall). Stereo baseline shrinks 146 → 110 mm but
+//   is still wider than v17a–g (104 mm) and v17h (130 mm).
+rgb_cam_x_front   = 75;       // forward distance (v17a–h: 105; v17i–l: 85)
+rgb_cam_y_front   = 55;       // lateral offset (v17a–g: 52; v17h: 65; v17i–l: 73)
 
 //   REAR pair (cameras facing 120° / 240°) — pulled rearward in the
 //   LiDAR-relative local frame, which in global coords pulls them
@@ -662,20 +1271,26 @@ module atlas_slot_2d(d) {
 // v17g — irregular hexagon plate outline (L2 and base shape for L1).
 // Vertices at 30°, 90°, 150°, 210°, 270°, 330°. V0/V1/V4/V5 are
 // pulled inward by hex_vertex_pullback; V2/V3 stay at the original
-// circumradius. corner_r rounding is preserved via offset+offset.
+// circumradius.
+// v17n: V0/V1/V4/V5 are now sampled as explicit 25 mm arcs in the
+// polygon point list (see rounded_hex_polygon_points). The offset+
+// offset pass still smooths the V2/V3 sharp corners and any flange-
+// edge corners by corner_r=10, but a convex 25 mm arc survives the
+// ±10 mm offset cycle unchanged.
 module hex_plate_outline() {
     offset(r=corner_r) offset(r=-corner_r)
-        polygon([for (i = [0:5]) hex_vertex_xy(i)]);
+        polygon(rounded_hex_polygon_points());
 }
 
 // L1 plate: irregular hex + rectangular flange at side 4 for Atlas
 // rear bolts. v17g: the hex is now the irregular outline (V0/V1/V4/V5
 // pulled inward); side 4 (between V2 and V3) is unchanged, so the
 // flange Y-span ±atlas_flange_half_width still matches V2/V3 cleanly.
+// v17n: hex polygon carries pre-rounded V0/V1/V4/V5 arcs.
 module L1_plate_outline() {
     offset(r=corner_r) offset(r=-corner_r)
     union() {
-        polygon([for (i = [0:5]) hex_vertex_xy(i)]);
+        polygon(rounded_hex_polygon_points());
         // Flange: rectangle extending side 4 in -X direction
         translate([-atlas_flange_extent, -atlas_flange_half_width])
             square([atlas_flange_extent - hex_inradius + 1,
@@ -785,16 +1400,42 @@ module hex_brackets() {
                 }
         }
 
-        // Main wall: from fillet top to full pillar height.
-        // Also clipped to plate outline so no part of the wall
-        // hangs beyond the rounded plate corners.
+        // Main wall: from base-fillet top to top-fillet bottom.
+        // v17k: shortened by bracket_fillet_r on the upper end to make
+        // room for the symmetric top fillet below. Still clipped to plate
+        // outline so no part of the wall hangs beyond the rounded plate
+        // corners.
         intersection() {
             translate([0, 0, plate_thickness + bracket_fillet_r])
-                linear_extrude(L1_pillar_height - bracket_fillet_r + 0.01)
+                linear_extrude(L1_pillar_height - 2*bracket_fillet_r + 0.01)
                     L1_plate_outline();
             translate([vx, vy, plate_thickness + bracket_fillet_r])
-                linear_extrude(L1_pillar_height - bracket_fillet_r)
+                linear_extrude(L1_pillar_height - 2*bracket_fillet_r)
                     hex_bracket_wall_profile(i);
+        }
+
+        // v17k TOP FILLET — mirror of the base fillet but inverted in z.
+        // The bracket flares outward as it approaches L2's underside, so
+        // the bracket-to-L2 junction is a smooth taper rather than a
+        // sharp 90° step. This is the load path that breaks first when
+        // the dome is dropped on its side; the taper distributes shear
+        // stress over the fillet height instead of concentrating it at
+        // a single edge. Clipped to L1_plate_outline so the flare stays
+        // within the plate footprint above (L2 has the same outline).
+        intersection() {
+            translate([0, 0, plate_thickness + L1_pillar_height - bracket_fillet_r])
+                linear_extrude(bracket_fillet_r + 0.01)
+                    L1_plate_outline();
+            translate([vx, vy, plate_thickness + L1_pillar_height - bracket_fillet_r])
+                hull() {
+                    // narrow at the bottom (joins main wall)
+                    linear_extrude(0.01)
+                        hex_bracket_wall_profile(i);
+                    // expanded at the top (fuses with L2 underside)
+                    translate([0, 0, bracket_fillet_r])
+                        linear_extrude(0.01)
+                            hex_bracket_fillet_profile(i);
+                }
         }
     }
 }
@@ -837,15 +1478,46 @@ module atlas_side_brackets() {
                         square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
             }
     }
-    // Main wall above fillet — clipped to plate outline
+    // Main wall: between base fillet and top fillet (v17k).
     intersection() {
         translate([0, 0, plate_thickness + fr])
-            linear_extrude(L1_pillar_height - fr + 0.01)
+            linear_extrude(L1_pillar_height - 2*fr + 0.01)
                 L1_plate_outline();
         translate([atlas_bracket_x_start, atlas_bracket_y_upper,
                    plate_thickness + fr])
-            linear_extrude(L1_pillar_height - fr)
+            linear_extrude(L1_pillar_height - 2*fr)
                 square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
+    }
+    // v17m TOP FILLET (upper bracket) — "spherical" rounded interface
+    // to L2 that does NOT expand in +X.
+    //
+    // v17k flared the top in +x (toward dome center) by fr=15 mm. That
+    // 15 mm reach pushed the bracket footprint at z=L2_z_bottom out to
+    // x=-80, sweeping over the rear-LEFT Robin W M6 top-mount bolt at
+    // (-85.68, +76.40). The bolt was inside both the X and Y range of
+    // the top-fillet expansion, making the bolt un-installable.
+    //
+    // v17m removes the +X expansion entirely while keeping the -Y
+    // (Atlas-facing) expansion. The bracket-to-L2 transition smooths
+    // INWARD toward the Atlas body (where there's room) but stays
+    // VERTICAL on the LiDAR-facing (+X) face. Result: the rear-left
+    // LiDAR M6 bolt is now 9.68 mm clear of the bracket footprint at
+    // z=L2_z_bottom.
+    intersection() {
+        translate([0, 0, plate_thickness + L1_pillar_height - fr])
+            linear_extrude(fr + 0.01)
+                L1_plate_outline();
+        translate([atlas_bracket_x_start, atlas_bracket_y_upper,
+                   plate_thickness + L1_pillar_height - fr])
+            hull() {
+                linear_extrude(0.01)
+                    square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
+                translate([0, 0, fr])
+                    linear_extrude(0.01)
+                        translate([0, -atlas_fillet_inner_upper])
+                            square([atlas_bracket_leg_len,     // v17m: no +fr (no +X expansion)
+                                    atlas_bracket_wall_t + atlas_fillet_inner_upper]);
+            }
     }
 
     // ---- Lower bracket (-Y side of Atlas) ----
@@ -869,17 +1541,193 @@ module atlas_side_brackets() {
                         square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
             }
     }
-    // Main wall above fillet — clipped to plate outline
+    // Main wall: between base fillet and top fillet (v17k).
     intersection() {
         translate([0, 0, plate_thickness + fr])
-            linear_extrude(L1_pillar_height - fr + 0.01)
+            linear_extrude(L1_pillar_height - 2*fr + 0.01)
                 L1_plate_outline();
         translate([atlas_bracket_x_start,
                    atlas_bracket_y_lower - atlas_bracket_wall_t,
                    plate_thickness + fr])
-            linear_extrude(L1_pillar_height - fr)
+            linear_extrude(L1_pillar_height - 2*fr)
                 square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
     }
+    // v17m TOP FILLET (lower bracket) — symmetric to upper. Removes the
+    // +X flare that swept over the rear-RIGHT Robin W M6 bolt at
+    // (-85.68, -76.40). Keeps the +Y (Atlas-facing) expansion at
+    // atlas_fillet_inner_lower=2 mm (tight 3 mm Atlas clearance on the
+    // lower side).
+    intersection() {
+        translate([0, 0, plate_thickness + L1_pillar_height - fr])
+            linear_extrude(fr + 0.01)
+                L1_plate_outline();
+        translate([atlas_bracket_x_start,
+                   atlas_bracket_y_lower - atlas_bracket_wall_t,
+                   plate_thickness + L1_pillar_height - fr])
+            hull() {
+                linear_extrude(0.01)
+                    square([atlas_bracket_leg_len, atlas_bracket_wall_t]);
+                translate([0, 0, fr])
+                    linear_extrude(0.01)
+                        square([atlas_bracket_leg_len,         // v17m: no +fr (no +X expansion)
+                                atlas_bracket_wall_t + atlas_fillet_inner_lower]);
+            }
+    }
+}
+
+// =============== v17m SIDE 3 + SIDE 5 PARTIAL WALLS =================
+// Sides 3 (V1→V2) and 5 (V3→V4) carry the rear LiDARs. The LiDAR
+// bodies hang from L2's underside and extend DOWN to z = 54 mm
+// (= L2_z_bottom 139 − robin_body_h 85). Anything above z = 54 mm
+// in the LiDAR's XY footprint blocks the body; the rear LiDARs in
+// particular overhang past sides 3 and 5 in plan view (two body
+// corners poke past the outer edges by ~5–11 mm), so a wall extending
+// to L2 along these sides would collide with the LiDAR.
+//
+// v17m strengthens the LiDAR-bearing sides anyway, by adding a LOW
+// wall along each side from z = plate_thickness (= 6) up to the
+// LiDAR body bottom z (= 54). The wall is bracket_wall_t = 18 mm
+// thick, extending INWARD from the side 3 / 5 line, and runs the
+// full vertex-to-vertex length. This:
+//
+//   1. Bonds L1 to itself along the rear LiDAR sides over 48 mm of
+//      vertical face — a torsion-resistant bottom plate that braces
+//      the V1/V4 vertex brackets against the Atlas-side brackets
+//      without ever rising into the LiDAR's body envelope.
+//
+//   2. Replaces the structurally unattractive option of adding V2 /
+//      V3 vertex brackets that would extend INWARD toward the L2
+//      center to reach past the Atlas body — a configuration that
+//      would have collided with the Atlas rear flange + the cable-
+//      cutout teardrop.
+//
+// Footprint verification (rear-left side 3, V1=(0,140.11), V2=(-130,75.06)):
+//   wall polygon corners:
+//     V1            = (  0.00, 140.11)
+//     V2            = (-130.00,  75.06)
+//     V2 + 18·n_in  = (-121.95,  58.97)
+//     V1 + 18·n_in  = (  +8.05, 124.02)
+//   inward normal n_in = (+0.447, -0.894)  (rotate side-3 dir +90° CCW)
+//
+//   rear-left Robin W body corners at angle 120° (z=54 to z=139):
+//     (-112.06, +89.28), (-21.30, +141.68),
+//     ( -58.70,  -3.12), ( +32.06,  +49.28)
+//   None of the body corners are inside the wall polygon; none of
+//   the wall corners are inside the body's rotated rectangle.
+//   Z range non-overlap: wall ends at z=54, body starts at z=54.
+//
+// Side 5 is the mirror about X.
+module side_3_5_partial_walls() {
+    z_start = plate_thickness;            // 6  (L1 top)
+    lidar_body_bottom_z = L2_z_bottom - robin_body_h;  // 139 − 85 = 54
+    height = lidar_body_bottom_z - z_start;            // 48 mm
+
+    // [start_vertex_index, end_vertex_index] for each partial-wall side.
+    // Hex vertex order is CCW starting at 30°; sides 3 and 5 in our
+    // convention run V1→V2 and V3→V4. Rotating the side direction by
+    // +90° CCW gives the INWARD normal (toward the hex interior) for
+    // CCW polygon traversal.
+    partial_sides = [[1, 2], [3, 4]];
+
+    for (s = partial_sides) {
+        v_s = hex_vertex_xy(s[0]);
+        v_e = hex_vertex_xy(s[1]);
+        dx  = v_e[0] - v_s[0];
+        dy  = v_e[1] - v_s[1];
+        L   = sqrt(dx*dx + dy*dy);
+        ux  = dx / L;     uy = dy / L;        // unit along side
+        nx  = -uy;        ny = ux;            // inward normal (CCW polygon)
+        t   = bracket_wall_t;                 // 18 mm wall
+
+        intersection() {
+            // Clip to L1 plate outline so corner sliver outside the
+            // plate edge is removed.
+            translate([0, 0, z_start])
+                linear_extrude(height + 0.01)
+                    L1_plate_outline();
+            // Wall polygon, extruded from z_start to lidar bottom.
+            translate([0, 0, z_start])
+                linear_extrude(height)
+                    polygon([
+                        [v_s[0],          v_s[1]         ],
+                        [v_e[0],          v_e[1]         ],
+                        [v_e[0] + t * nx, v_e[1] + t * ny],
+                        [v_s[0] + t * nx, v_s[1] + t * ny]
+                    ]);
+        }
+    }
+}
+
+// =============== v17r FRONT-ACCESS CHAMFER =========================
+// User-requested in v17r: open the V0-V5 (front) side of the dome wider
+// so the Atlas INS X-side (front) face is fully accessible for plugging
+// the front antenna connectors.
+//
+// Diagnosis: with v17l's full-side enclosure (V0/V1 brackets forming
+// the side-2 wall, V4/V5 brackets forming the side-6 wall), the bracket
+// inner corners near V0 and V5 intrude into the Atlas Y range:
+//   V0 bracket inner corner P3 = (112.34, +54.47); Atlas top y = +56.80
+//     → 2.33 mm intrusion at the +Y corner of the Atlas front face
+//   V5 bracket inner corner P3 = (112.34, -54.47); Atlas bottom y = -61
+//     → 6.53 mm intrusion at the -Y corner (Atlas is asymmetric in Y;
+//        the body extends from y = -61 to y = +56.80, centered at -2.1)
+//
+// v17r cuts triangular chamfer wedges from both corners across the full
+// L1 bracket height (z = 6 → 139), so the bracket inner edge stays clear
+// of the Atlas Y range with a 5 mm safety margin (= finger / connector
+// clearance):
+//
+//   V0 chamfer triangle (CCW):
+//     ( 116.57, +61.80)   on V0 short edge near V0
+//     (  99.64, +61.80)   on V0 inner edge inboard along d
+//     ( 112.34, +54.47)   V0 bracket inner corner P3
+//   Area 62.08 mm² in XY × 133 mm bracket height = 8.26 cm³
+//
+//   V5 chamfer triangle (CCW):
+//     ( 119.00, -66.00)   on V5 short edge near V5
+//     (  92.37, -66.00)   on V5 inner edge inboard along d
+//     ( 112.34, -54.47)   V5 bracket inner corner P3
+//   Area 153.57 mm² in XY × 133 mm bracket height = 20.42 cm³
+//   (larger than V0 because Atlas bottom is 9 mm closer to V5 than
+//    Atlas top is to V0.)
+//
+// Total: 28.7 cm³ ≈ 36 g PETG removed. Bracket cross-section reduction:
+// 2.5% (V0) and 6.1% (V5) — minor structurally given the v17l 2520 mm²
+// gross cross-section.
+//
+// Side-2 / side-6 enclosure SURVIVES — the chamfers only cut INNER
+// material; the bracket OUTER face along side 2 / side 6 (= the
+// dome's structural shell) is untouched. The v17q M6×25 bolt
+// positions (at fracs [0.2, 0.4] along the wall, = 28 / 56 mm from
+// the vertex) are at bracket parameter s > 14.67, OUTSIDE the
+// chamfer region (which extends only to s = 14.66 on V0 side and
+// s = 23.06 on V5 side — both bolt holes safely OUTBOARD of the
+// chamfer cut on their respective walls).
+module front_access_chamfer() {
+    // Z range: full L1 bracket height. Cut starts above the L1 plate
+    // (z=6, plate top) so the L1 plate is not pierced, and ends at L2's
+    // underside (z=139) so the L2 plate is also unaffected.
+    z_start = plate_thickness;
+    z_height = L1_pillar_height;
+
+    // V0 chamfer triangle
+    v0_chamfer = [
+        [116.57, +61.80],   // on V0 bracket short edge
+        [ 99.64, +61.80],   // on V0 bracket inner edge
+        [112.34, +54.47]    // V0 bracket inner corner (= V1 far inner corner)
+    ];
+    // V5 chamfer triangle
+    v5_chamfer = [
+        [119.00, -66.00],   // on V5 bracket short edge
+        [ 92.37, -66.00],   // on V5 bracket inner edge
+        [112.34, -54.47]    // V5 bracket inner corner (= V4 far inner corner)
+    ];
+
+    translate([0, 0, z_start])
+        linear_extrude(z_height + 0.5) {
+            polygon(v0_chamfer);
+            polygon(v5_chamfer);
+        }
 }
 
 // =============== TAP HOLES (all 12 brackets) ====================
@@ -892,25 +1740,73 @@ module all_bracket_tap_holes() {
     }
 }
 
+// =============== v17l FRONT-CAM M3 HEAD-CLEARANCE POCKETS =========
+// Side-2 (V0→V1) and side-6 (V4→V5) walls now span the full vertex-
+// to-vertex length to fully enclose the LiDAR-less faces of the dome
+// for impact protection. The widened walls cover the X,Y region where
+// the front-stereo cameras' M3 mount holes punch through L2. Without
+// intervention the M3 bolt heads (≈ø5.7 mm SHCS / BHCS) would collide
+// with the bracket top at z = L2_z_bottom, making the cameras
+// impossible to install.
+//
+// Fix: drill a ø6 mm × 5 mm pocket from the bracket TOP downward at
+// every front-camera M3 bolt position whose perpendicular distance to
+// the nearest enclosed-side line is less than (bracket_wall_t + 2).
+//
+// Side 2 (V0,V1) line in normalized form:  0.5004*x + 0.8660*y - 121.34 = 0
+// Side 6 (V4,V5) line is the X-axis mirror: 0.5004*x - 0.8660*y - 121.34 = 0
+m3_pocket_dia   = 6.0;   // bolt-head clearance diameter
+m3_pocket_depth = 5.0;   // depth from bracket top
+
+function _perp_side2(p) = abs(0.5004*p[0] + 0.8660*p[1] - 121.34);
+function _perp_side6(p) = abs(0.5004*p[0] - 0.8660*p[1] - 121.34);
+
+// Walk the (now-extended) rgb_cam_layout, find the front cameras
+// (aim_deg == 0), and emit a pocket position for every M3 mount hole
+// whose perpendicular distance to side 2 or side 6 is below the
+// (wall_t + safety) threshold.
+front_cam_m3_pocket_positions = [
+    for (cam = rgb_cam_layout)
+        if (cam[2] == 0)                              // front cameras only
+            for (off = rgb_cam_bolt_offsets)
+                let(p = [cam[0] + off[0], cam[1] + off[1]],
+                    d_min = min(_perp_side2(p), _perp_side6(p)))
+                if (d_min < bracket_wall_t + 2)
+                    p
+];
+
+module front_cam_m3_head_pockets() {
+    for (p = front_cam_m3_pocket_positions) {
+        translate([p[0], p[1],
+                   plate_thickness + L1_pillar_height - m3_pocket_depth])
+            cylinder(d=m3_pocket_dia, h=m3_pocket_depth + 0.5, $fn=32);
+    }
+}
+
 // =============== CABLE OPENING (triangle cutout on side 4) ========
 // 2D polygon for the cable opening. Oversized triangle — the plate
 // outline clips it automatically via difference().
 
 module cable_opening_2d() {
     // Teardrop: hull of tip circle + base rectangle.
-    // The hull produces smooth tangent lines from the circle
-    // to the base corners, with a round termination at the tip.
-    // The base rectangle extends past the plate boundary so the
-    // plate outline clips it to the correct shape via difference().
-    far_x = -300;  // well beyond plate/flange boundary
+    // The hull produces smooth tangent lines from the circle to the
+    // base corners, with a round termination at the tip.
+    //
+    // v17o: the base rectangle now lives ENTIRELY INSIDE the L2 plate
+    // (outer edge at cable_opening_base_outer_x = -140, INNER edge at
+    // -135), so the resulting opening DOES NOT touch the plate's rear
+    // edge at x=-150. The 10 mm L2-plate strip between x=-150 and
+    // x=-140 becomes the closing wall that turns the U-shaped slot
+    // into an enclosed triangular hole.
     hw = cable_opening_base_half_w;
+    rect_x_extent = cable_opening_base_inner_x - cable_opening_base_outer_x;
     hull() {
         // Tip circle
         translate([cable_opening_tip_x, 0])
             circle(r=cable_opening_tip_r, $fn=64);
-        // Base rectangle (extends to plate edge and beyond)
-        translate([far_x, -hw])
-            square([abs(far_x) - abs(cable_opening_base_inner_x), 2*hw]);
+        // Base rectangle (now fully inside the plate)
+        translate([cable_opening_base_outer_x, -hw])
+            square([rect_x_extent, 2*hw]);
     }
 }
 
@@ -968,6 +1864,11 @@ module level1() {
             hex_brackets();
             // 2 Atlas-side brackets (replacing V2, V3)
             atlas_side_brackets();
+            // v17m: low partial walls along the rear LiDAR-bearing
+            // sides 3 (V1→V2) and 5 (V3→V4), z = 6 → 54 only, so
+            // the rear LiDAR bodies (z = 54 → 139) have clearance
+            // above them.
+            side_3_5_partial_walls();
         }
 
         // Atlas M4 holes + counterbore from bottom.
@@ -1005,6 +1906,19 @@ module level1() {
         // prints as one piece, there are no bolts to install through
         // the bracket tops, so the holes would just be stress risers.
         if (!unibody_mode) all_bracket_tap_holes();
+
+        // v17l: M3 bolt-head clearance pockets in the side-2 / side-6
+        // enclosure walls. Always drilled regardless of unibody_mode
+        // because the front-stereo camera M3 holes punch through L2
+        // at positions that fall inside the new wall material; without
+        // the pockets the M3 bolt heads cannot seat on L2's underside.
+        front_cam_m3_head_pockets();
+
+        // v17r: open the V0-V5 (front) side for Atlas INS front-face
+        // access. Cuts triangular wedges from the V0 and V5 bracket
+        // inner corners. Applied in BOTH two-piece and unibody modes
+        // — Atlas connector access is needed regardless of print mode.
+        front_access_chamfer();
 
         // Wiring slots
         for (angle = [0, 90, 180, 270]) {

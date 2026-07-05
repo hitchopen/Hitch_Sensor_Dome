@@ -223,12 +223,14 @@ static_transforms:
 # =============================================================
 
   # --- Camera: Front-Right (0°, +Y offset) ---
-  # Faces +X (forward), offset +52mm in Y (left).
+  # v17m: pulled inward to (0.075, 0.055) to clear the v17l 18 mm
+  # side-2 enclosure wall (worst-case M3 bolt now 24.93 mm from
+  # side-2 line, vs 4.35 mm before). Faces +X (forward).
   - frame_id: "imu_link"
     child_frame_id: "cam_front_right_link"
     translation:
-      x:  0.085000
-      y:  0.073000
+      x:  0.075000
+      y:  0.055000
       z:  0.126500
     rotation:
       x:  0.000000
@@ -237,12 +239,13 @@ static_transforms:
       w:  1.000000
 
   # --- Camera: Front-Left (0°, -Y offset) ---
-  # Faces +X (forward), offset -52mm in Y (right).
+  # v17m: pulled inward to (0.075, -0.055). Stereo baseline now 110 mm
+  # (down from 146 mm at v17l; up from 104 mm at v17a–g).
   - frame_id: "imu_link"
     child_frame_id: "cam_front_left_link"
     translation:
-      x:  0.085000
-      y: -0.073000
+      x:  0.075000
+      y: -0.055000
       z:  0.126500
     rotation:
       x:  0.000000
@@ -381,7 +384,7 @@ static_transforms:
       w:  1.000000
 
 # =============================================================
-# Summary Table (v17j FINAL)
+# Summary Table (v17m — front cams pulled in for v17l wall clearance)
 #
 # Sensor                       X (m)     Y (m)     Z (m)    Yaw (°)
 # -------------------------  --------  --------  --------  --------
@@ -389,15 +392,15 @@ static_transforms:
 # lidar_front                 0.0800    0.0000    0.1145      0
 # lidar_rear_left            -0.0400    0.0693    0.1145    120
 # lidar_rear_right           -0.0400   -0.0693    0.1145    240
-# cam_front_right             0.0850    0.0730    0.1265      0
-# cam_front_left              0.0850   -0.0730    0.1265      0
+# cam_front_right             0.0750    0.0550    0.1265      0   (v17m: 0.085→0.075, 0.073→0.055)
+# cam_front_left              0.0750   -0.0550    0.1265      0   (v17m: same)
 # cam_rear_left              -0.1081    0.0473    0.1265    120     (LiDAR-radial outward)
 # cam_rear_right             -0.1081   -0.0473    0.1265    240     (LiDAR-radial outward)
 # gnss_antenna_primary        0.0000    0.0000    0.2730      0
 # gnss_antenna_secondary       (FILL IN — dual antenna)        —
 #
 # All roll = 0, pitch = 0.
-# Front stereo baseline: 0.1460 m (146 mm).
+# Front stereo baseline: 0.1100 m (110 mm).
 # Rear pair symmetric about X axis.
 # 4-camera horizontal coverage: full 360° (front 134° + rear-L 53°–187°
 #   + rear-R 173°–307° = complete with overlap at the joins).
