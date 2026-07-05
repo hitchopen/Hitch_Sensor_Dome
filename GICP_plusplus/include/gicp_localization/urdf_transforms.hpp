@@ -1,22 +1,27 @@
 #pragma once
 
+// URDF static-transform helper for gicp_localization. This is a direct port of
+// GLIM's glim/util/urdf_transforms.hpp so both pipelines resolve aux-LiDAR
+// extrinsics from the SAME av24.urdf with identical math (rpy = Rz*Ry*Rx,
+// fixed joints only) -- and neither needs a live /tf_static publisher to merge
+// multiple LiDARs in offline replay.
+
 #include <string>
+#include <vector>
+#include <utility>
 #include <unordered_map>
-#include <fstream>
 #include <sstream>
-#include <cmath>
 #include <stdexcept>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
-#include <spdlog/spdlog.h>
 
-namespace glim {
+namespace gicp_localization {
 
-/// Parse a URDF file and return a map from child_link_name -> (parent_link_name, T_parent_child).
-/// Only fixed joints are considered.
+/// Parse a URDF file and return a map child_link_name -> (parent_link_name, T_parent_child).
+/// Only fixed joints are considered. Throws std::runtime_error on parse failure.
 inline std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>> parse_urdf_transforms(const std::string& urdf_path) {
   std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>> transforms;
 
@@ -26,12 +31,11 @@ inline std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>
   }
 
   xmlNodePtr root = xmlDocGetRootElement(doc);
-  for (xmlNodePtr joint = root->children; joint; joint = joint->next) {
+  for (xmlNodePtr joint = root ? root->children : nullptr; joint; joint = joint->next) {
     if (joint->type != XML_ELEMENT_NODE || xmlStrcmp(joint->name, BAD_CAST "joint") != 0) {
       continue;
     }
 
-    // Get joint type
     xmlChar* type_attr = xmlGetProp(joint, BAD_CAST "type");
     std::string joint_type = type_attr ? reinterpret_cast<const char*>(type_attr) : "";
     xmlFree(type_attr);
@@ -71,41 +75,43 @@ inline std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>
       Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
       T.translation() = Eigen::Vector3d(x, y, z);
       T.linear() = (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
-                     Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
-                     Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
-                      .toRotationMatrix();
+                    Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+                    Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
+                       .toRotationMatrix();
       transforms[child_link] = {parent_link, T};
     }
   }
 
   xmlFreeDoc(doc);
-  xmlCleanupParser();
+  // NOTE: no xmlCleanupParser() here. That call tears down libxml2's
+  // PROCESS-GLOBAL state and is only safe once, at process exit, when no
+  // other thread can still be using libxml2. This function can run from the
+  // scan callback (resolveBaseLidarExtrinsicOffline), where the global
+  // teardown could race any other in-process libxml2 user.
   return transforms;
 }
 
-/// Compute the transform T_from_to between two frames in a URDF by walking the kinematic tree.
-/// Both frames must share a common ancestor.
+/// Compute T_from_to between two frames by walking the kinematic tree to their
+/// common ancestor. Throws std::runtime_error if no common ancestor exists.
 inline Eigen::Isometry3d compute_transform(
   const std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>>& transforms,
   const std::string& from_frame,
   const std::string& to_frame) {
-  // Build chain from a frame to the root
   auto chain_to_root = [&](const std::string& frame) {
     std::vector<std::pair<std::string, Eigen::Isometry3d>> chain;
     std::string current = frame;
     while (transforms.count(current)) {
-      const auto& [parent, T_parent_child] = transforms.at(current);
-      chain.push_back({current, T_parent_child});
-      current = parent;
+      const auto& entry = transforms.at(current);
+      chain.push_back({current, entry.second});
+      current = entry.first;
     }
-    chain.push_back({current, Eigen::Isometry3d::Identity()});  // root
+    chain.push_back({current, Eigen::Isometry3d::Identity()});
     return chain;
   };
 
   auto from_chain = chain_to_root(from_frame);
   auto to_chain = chain_to_root(to_frame);
 
-  // Find common ancestor
   std::unordered_map<std::string, size_t> from_set;
   for (size_t i = 0; i < from_chain.size(); i++) {
     from_set[from_chain[i].first] = i;
@@ -127,8 +133,6 @@ inline Eigen::Isometry3d compute_transform(
 
   size_t from_idx = from_set[ancestor];
 
-  // T_root_from = T_root_p1 * T_p1_p2 * ... * T_pN_from
-  // We compute T_ancestor_from and T_ancestor_to, then T_from_to = T_ancestor_from^-1 * T_ancestor_to
   Eigen::Isometry3d T_ancestor_from = Eigen::Isometry3d::Identity();
   for (size_t i = from_idx; i > 0; i--) {
     T_ancestor_from = T_ancestor_from * from_chain[i - 1].second;
@@ -142,4 +146,4 @@ inline Eigen::Isometry3d compute_transform(
   return T_ancestor_from.inverse() * T_ancestor_to;
 }
 
-}  // namespace glim
+}  // namespace gicp_localization

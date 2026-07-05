@@ -1,0 +1,40 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    pose_input_topic: "/atlas/pose_filtered"
+    imu_input_topic: "/atlas/imu_calibrated"
+    pose_input_reliability: "reliable"
+    pose_input_qos_depth: 100
+
+    # auto: P1-like IMU stamps use the P1 clock mapper; ROS-epoch arrival
+    # stamps use the bounded burst retimer.
+    imu_stamp_mode: "auto"
+    p1_like_threshold_sec: 100000000.0
+    nominal_imu_period_sec: 0.01
+    imu_arrival_retime_lookahead: 128
+    imu_flush_timeout_sec: 0.5
+    imu_input_reliability: "best_effort"
+    imu_input_qos_depth: 100
+    p1_clock_bin_seconds: 60.0
+    imu_p1_sidecar_path: ""
+    imu_p1_sidecar_match_tolerance_sec: 0.02
+
+    # Hitch Sensor Dome frames (config/sensor_dome_tf.yaml): imu_link is the
+    # Atlas Duo Center of Navigation, the body frame the dome's TF tree and
+    # GLIM++ maps are anchored to.
+    imu_frame_id: "imu_link"
+    body_frame_id: "imu_link"
+    odom_frame_id: "map"
+
+    # Local ENU map origin (lat_deg, lon_deg, alt_m). PLACEHOLDER from an
+    # earlier deployment — set this to your deployment datum before mapping.
+    # The GLIM++ map, the seed odometry, and GICP++ must all share this one
+    # datum or their frames silently disagree.
+    local_enu_origin: "39.58227391,-86.74232215,260.4"
+    local_enu_origin_ttl_path: ""
+    summary_output_path: ""
+
+    rtk_max_var_xy: 0.001
+    rtk_max_var_z: 0.005
+    publish_gnss_pose: true

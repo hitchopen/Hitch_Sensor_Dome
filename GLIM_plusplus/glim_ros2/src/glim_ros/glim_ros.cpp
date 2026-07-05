@@ -36,7 +36,7 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
-#include <glim_ros/urdf_transforms.hpp>
+#include <glim/util/urdf_transforms.hpp>
 
 namespace glim {
 
@@ -89,6 +89,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
+
+  // Multi-LiDAR concatenation. Live glim_ros must merge the auxiliary
+  // (rear-left / rear-right Robin W) clouds into the primary front-lidar
+  // frame just like the offline glim_rosbag tool does; otherwise live
+  // mapping would silently use only the front LiDAR.
+  aux_concat = glim_ros::load_aux_sensors_from_config(config_sensors);
 
   // Override T_lidar_imu from URDF if configured
   const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
@@ -198,28 +204,19 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // ROS-related
   using std::placeholders::_1;
-  const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
-  const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
-  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
-  // Subscribers
-  rclcpp::SensorDataQoS default_imu_qos;
-  default_imu_qos.get_rmw_qos_profile().depth = 1000;
-  auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
-  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
-
-  qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-#ifdef BUILD_WITH_CV_BRIDGE
-  qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
-  image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
-#endif
+  // Online (live subscription) mapping passway. GLIM builds maps OFFLINE only
+  // (glim_rosbag / glim_pcap_rosbag feed the callbacks directly and drive
+  // timer_callback() manually), so by default we create NO live subscriptions
+  // and NO wall timer. Set glim_ros/enable_online_mapping=true to restore the
+  // legacy live path.
+  this->online_mapping_enabled_ = config_ros.param<bool>("glim_ros", "enable_online_mapping", false);
 
   // Hitch Sensor Dome fork: external INS init with RTK-fixed gating.
   //
   // GLIM's initial state is anchored to the Atlas Duo's INS pose, but
   // accepting that pose requires confirming the INS itself is reliable.
-  // We subscribe to:
+  // Inputs:
   //
   //   - ins_pose_topic (default /pose) — geometry_msgs/PoseStamped from
   //     fusion_engine_driver. Carries orientation + position; no velocity.
@@ -228,16 +225,17 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   //   - ins_fix_topic  (default /gps/fix) — sensor_msgs/NavSatFix, the
   //     gate signal: status.status, position_covariance.
   //
-  // Gate logic lives in ins_pose_callback / ins_odom_callback above. A
-  // periodic timer (ins_init_timeout_tick) prints a bold RED warning
-  // every 10 s while the gate is still blocking, naming the most-recent
-  // rejection reason so the operator can act.
-  const std::string ins_pose_topic =
-    config_ros.param<std::string>("glim_ros", "ins_pose_topic", "/pose");
-  const std::string ins_odom_topic =
-    config_ros.param<std::string>("glim_ros", "ins_odom_topic", "");
-  const std::string ins_fix_topic =
-    config_ros.param<std::string>("glim_ros", "ins_fix_topic",  "/gps/fix");
+  // Gate logic lives in ins_pose_callback / ins_odom_callback. These
+  // parameters are parsed in BOTH modes: the online path subscribes live
+  // below, while the offline drivers (glim_rosbag / glim_pcap_rosbag) read
+  // the same topics from the bag and call ins_*_callback() directly, so
+  // the INS init gate and the RTK-gated GNSS factor bridge behave
+  // identically in replay. (B4 fix: this block used to be online-only,
+  // which silently disabled INS init and starved gnss_global of factors in
+  // the offline-only workflow.)
+  ins_pose_topic_ = config_ros.param<std::string>("glim_ros", "ins_pose_topic", "/pose");
+  ins_odom_topic_ = config_ros.param<std::string>("glim_ros", "ins_odom_topic", "");
+  ins_fix_topic_  = config_ros.param<std::string>("glim_ros", "ins_fix_topic",  "/gps/fix");
 
   // Gate thresholds — overridable from config_ros.json.
   ins_require_rtk_fixed_       = config_ros.param<bool>(  "glim_ros", "ins_require_rtk_fixed",       true);
@@ -247,12 +245,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ins_min_quat_dot_            = config_ros.param<double>("glim_ros", "ins_min_quat_dot",            0.999);
   ins_init_timeout_s_          = config_ros.param<double>("glim_ros", "ins_init_timeout_s",          60.0);
 
-  // Dual-antenna RTK heading mode — auto-detected from
-  // sensor_dome_tf.yaml by the launch file and forwarded as ROS params.
-  // When enabled we tighten the init gate (orientation locks faster
-  // and more precisely with dual-antenna heading). The session-long
-  // factor bridge stamps the corresponding orientation covariance on
-  // every published message — see try_publish_gnss_factor below.
+  // Dual-antenna RTK heading mode. When enabled we tighten the init gate
+  // (orientation locks faster and more precisely with dual-antenna
+  // heading). The session-long factor bridge stamps the corresponding
+  // orientation covariance on every published message — see
+  // try_publish_gnss_factor below. NOTE: read from config_ros.json
+  // ("glim_ros" section), the single source of truth in both modes.
   dual_antenna_enabled_       = config_ros.param<bool>(  "glim_ros", "dual_antenna_enabled",            false);
   dual_antenna_baseline_m_    = config_ros.param<double>("glim_ros", "dual_antenna_baseline_m",         0.0);
   dual_antenna_heading_sigma_rad_ =
@@ -278,30 +276,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       "config/sensor_dome_tf.yaml to enable dual-antenna heading.");
   }
 
-  rclcpp::QoS ins_qos(20);
-  ins_qos.reliable();
-
-  if (!ins_fix_topic.empty()) {
-    ins_fix_sub = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-      ins_fix_topic, ins_qos,
-      std::bind(&GlimROS::ins_fix_callback, this, _1));
-    spdlog::info("Hitch fork: subscribed to NavSatFix topic '{}' (gate signal)", ins_fix_topic);
-  } else {
-    spdlog::warn("Hitch fork: ins_fix_topic is empty — RTK gate cannot run; INS pose will be rejected.");
-  }
-  if (!ins_pose_topic.empty()) {
-    ins_pose_sub = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-      ins_pose_topic, ins_qos,
-      std::bind(&GlimROS::ins_pose_callback, this, _1));
-    spdlog::info("Hitch fork: subscribed to INS PoseStamped topic '{}'", ins_pose_topic);
-  }
-  if (!ins_odom_topic.empty()) {
-    ins_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
-      ins_odom_topic, ins_qos,
-      std::bind(&GlimROS::ins_odom_callback, this, _1));
-    spdlog::info("Hitch fork: subscribed to INS Odometry topic '{}'", ins_odom_topic);
-  }
-
   spdlog::info(
     "Hitch fork: RTK gate — require_rtk_fixed={}, max_pos_stddev={:.2f} m, "
     "window={} samples, max_jitter={:.3f} m, min_quat_dot={:.4f}, timeout={:.0f} s",
@@ -309,38 +283,35 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     ins_min_pose_window_samples_, ins_max_pose_jitter_trans_,
     ins_min_quat_dot_, ins_init_timeout_s_);
 
-  ins_wait_started_ = this->now();
-  ins_last_warn_    = ins_wait_started_;
-  ins_init_timeout_timer = this->create_wall_timer(
-    std::chrono::seconds(2),
-    [this]() { ins_init_timeout_tick(); });
-
   // ---- GNSS factor bridge (post-init, RTK-gated republisher) ----
-  // Reads the same NavSatFix subscription set up above (kept alive
-  // post-init). Each accepted /pose / /odom is republished on
-  // gnss_factor_topic as PoseWithCovarianceStamped, gated by RTK-class
-  // status + covariance. libgnss_global.so subscribes to that topic
+  // Each accepted /pose / /odom is evaluated against the most recent
+  // NavSatFix and republished on gnss_factor_topic as
+  // PoseWithCovarianceStamped. libgnss_global.so consumes that topic
   // (configured in glim_ext/config/config_gnss_global.json) and turns
-  // each message into a soft prior factor in the global graph.
-  const std::string gnss_factor_topic =
+  // each message into a soft prior factor in the global graph. The
+  // publisher exists in both modes; in offline replay
+  // try_publish_gnss_factor additionally hands accepted samples straight
+  // to the extension subscription (no live subscribers exist offline).
+  gnss_factor_topic_ =
     config_ros.param<std::string>("glim_ros", "gnss_factor_topic", "/gnss/pose_rtk_only");
   gnss_factor_require_rtk_fixed_ =
     config_ros.param<bool>(  "glim_ros", "gnss_factor_require_rtk_fixed",   true);
   gnss_factor_max_position_stddev_ =
     config_ros.param<double>("glim_ros", "gnss_factor_max_position_stddev", 0.10);
 
-  if (!gnss_factor_topic.empty()) {
+  if (!gnss_factor_topic_.empty()) {
     gnss_pose_pub_ = this->create_publisher<
-      geometry_msgs::msg::PoseWithCovarianceStamped>(gnss_factor_topic, 50);
+      geometry_msgs::msg::PoseWithCovarianceStamped>(gnss_factor_topic_, 50);
     spdlog::info(
       "Hitch fork: GNSS factor bridge — publishing on '{}' "
       "(require_rtk_fixed={}, max_pos_stddev={:.2f} m)",
-      gnss_factor_topic, gnss_factor_require_rtk_fixed_,
+      gnss_factor_topic_, gnss_factor_require_rtk_fixed_,
       gnss_factor_max_position_stddev_);
 
     // Periodic status log — every 10 s reports accepted / rejected counts
     // so the operator can see whether the bridge is doing useful work
-    // mid-session (e.g., expected to drop to zero in tunnels).
+    // mid-session (e.g., expected to drop to zero in tunnels). Serviced by
+    // spin_some() in the offline drivers, by the executor when live.
     gnss_factor_log_timer_ = this->create_wall_timer(
       std::chrono::seconds(10), [this]() {
         const int p = gnss_factors_published_.load();
@@ -354,13 +325,89 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     spdlog::info("Hitch fork: gnss_factor_topic empty — bridge disabled");
   }
 
-  for (const auto& sub : this->extension_subscriptions()) {
-    spdlog::debug("subscribe to {}", sub->topic);
-    sub->create_subscriber(*this);
-  }
+  if (this->online_mapping_enabled_) {
+    const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
+    const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
+    const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
-  // Start timer
-  timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+    // Subscribers
+    rclcpp::SensorDataQoS default_imu_qos;
+    default_imu_qos.get_rmw_qos_profile().depth = 1000;
+    auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
+    imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+
+    qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
+    // Route the primary cloud through points_callback_live() so buffered aux
+    // clouds are merged in before odometry sees the scan (parity with offline).
+    points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
+
+    // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
+    // merged into the primary scan on arrival of a primary cloud.
+    if (aux_concat.enabled) {
+      auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
+      for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
+        const std::string aux_topic = aux_concat.aux_sensors[i].topic;
+        auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+          aux_topic, aux_qos,
+          [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
+        aux_points_subs.push_back(sub);
+        spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
+      }
+    }
+#ifdef BUILD_WITH_CV_BRIDGE
+    qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
+    image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
+#endif
+
+    // Hitch Sensor Dome fork: live subscriptions for the INS init gate +
+    // GNSS factor bridge (parameters parsed above, in both modes). A
+    // periodic timer (ins_init_timeout_tick) prints a bold RED warning
+    // every 10 s while the gate is still blocking, naming the most-recent
+    // rejection reason so the operator can act.
+    rclcpp::QoS ins_qos(20);
+    ins_qos.reliable();
+
+    if (!ins_fix_topic_.empty()) {
+      ins_fix_sub = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+        ins_fix_topic_, ins_qos,
+        std::bind(&GlimROS::ins_fix_callback, this, _1));
+      spdlog::info("Hitch fork: subscribed to NavSatFix topic '{}' (gate signal)", ins_fix_topic_);
+    } else {
+      spdlog::warn("Hitch fork: ins_fix_topic is empty — RTK gate cannot run; INS pose will be rejected.");
+    }
+    if (!ins_pose_topic_.empty()) {
+      ins_pose_sub = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        ins_pose_topic_, ins_qos,
+        std::bind(&GlimROS::ins_pose_callback, this, _1));
+      spdlog::info("Hitch fork: subscribed to INS PoseStamped topic '{}'", ins_pose_topic_);
+    }
+    if (!ins_odom_topic_.empty()) {
+      ins_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
+        ins_odom_topic_, ins_qos,
+        std::bind(&GlimROS::ins_odom_callback, this, _1));
+      spdlog::info("Hitch fork: subscribed to INS Odometry topic '{}'", ins_odom_topic_);
+    }
+
+    ins_wait_started_ = this->now();
+    ins_last_warn_    = ins_wait_started_;
+    ins_init_timeout_timer = this->create_wall_timer(
+      std::chrono::seconds(2),
+      [this]() { ins_init_timeout_tick(); });
+
+    for (const auto& sub : this->extension_subscriptions()) {
+      spdlog::debug("subscribe to {}", sub->topic);
+      sub->create_subscriber(*this);
+    }
+
+    // Start timer
+    timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+    spdlog::warn("ONLINE GLIM mapping ENABLED (glim_ros/enable_online_mapping=true) -- live subscriptions created");
+  } else {
+    spdlog::info(
+      "online GLIM mapping DISABLED -- no live subscriptions or wall timer created. "
+      "Build maps offline with glim_rosbag / glim_pcap_rosbag.");
+  }
 
   spdlog::debug("initialized");
 }
@@ -870,13 +917,56 @@ void GlimROS::try_publish_gnss_factor(
   if (dual_antenna_enabled_ && dual_antenna_heading_sigma_rad_ > 0.0) {
     // Indices in a 6×6 row-major covariance: [3,3]=roll, [4,4]=pitch,
     // [5,5]=yaw — i.e., 3*6+3=21, 4*6+4=28, 5*6+5=35.
-    out.pose.covariance[21] = 1.0;   // roll  σ² ≈ 1 rad² (loose)
-    out.pose.covariance[28] = 1.0;   // pitch σ² ≈ 1 rad² (loose)
-    out.pose.covariance[35] =
-      dual_antenna_heading_sigma_rad_ * dual_antenna_heading_sigma_rad_;
+    //
+    // P5 gate fix: do NOT clobber a source-reported orientation
+    // covariance. When the Odometry source populates rpy covariance
+    // (pose_cov[35] > 0), keep it — gnss_global's per-sample yaw-quality
+    // gate (orientation_prior_max_yaw_sigma_deg) tests exactly that
+    // value, and unconditionally overwriting it with the constant
+    // baseline-derived σ² made the gate unable to ever fire (a degraded
+    // heading sample looked permanently healthy). Only stamp the
+    // baseline-derived constant when the source carried no orientation
+    // covariance at all (the PoseStamped path — geometry_msgs/PoseStamped
+    // has no covariance field).
+    const bool source_has_yaw_cov = pose_cov[35] > 1e-12;
+    if (!source_has_yaw_cov) {
+      out.pose.covariance[21] = 1.0;   // roll  σ² ≈ 1 rad² (loose)
+      out.pose.covariance[28] = 1.0;   // pitch σ² ≈ 1 rad² (loose)
+      out.pose.covariance[35] =
+        dual_antenna_heading_sigma_rad_ * dual_antenna_heading_sigma_rad_;
+    }
   }
 
   gnss_pose_pub_->publish(out);
+
+  // Offline mapping (glim_rosbag / glim_pcap_rosbag): extension modules
+  // never get live subscribers (create_subscriber() only runs in the
+  // online path), so hand the accepted sample straight to any extension
+  // subscription listening on gnss_factor_topic — this is how
+  // libgnss_global.so receives its factors in replay. Online, the
+  // publish above reaches the module's live subscriber; inserting here
+  // as well would double-count.
+  if (!online_mapping_enabled_) {
+    static const std::string kBridgeMsgType = "geometry_msgs/msg/PoseWithCovarianceStamped";
+    rclcpp::Serialization<geometry_msgs::msg::PoseWithCovarianceStamped> serializer;
+    rclcpp::SerializedMessage serialized;
+    bool serialized_done = false;
+    for (const auto& sub : extension_subscriptions()) {
+      if (sub->topic != gnss_factor_topic_) continue;
+      if (!sub->msg_type.empty() && sub->msg_type != kBridgeMsgType) {
+        spdlog::warn(
+          "GNSS factor bridge: extension subscription on '{}' expects '{}' but the bridge "
+          "publishes '{}' — sample not delivered (check gnss_msg_type in config_gnss_global.json)",
+          sub->topic, sub->msg_type, kBridgeMsgType);
+        continue;
+      }
+      if (!serialized_done) {
+        serializer.serialize_message(&out, &serialized);
+        serialized_done = true;
+      }
+      sub->insert_message_instance(serialized, kBridgeMsgType);
+    }
+  }
   gnss_factors_published_.fetch_add(1);
 }
 
@@ -945,7 +1035,15 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
     GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
   }
 
-  auto cv_image = cv_bridge::toCvCopy(msg, "bgr8");
+  cv_bridge::CvImagePtr cv_image;
+  try {
+    cv_image = cv_bridge::toCvCopy(msg, "bgr8");
+  } catch (const std::exception& e) {
+    // malformed frame (e.g. truncated capture assembly) -- skip, don't abort.
+    // (Port of airacingtech glim_ros2@8b454f8.)
+    spdlog::warn("dropping malformed image ({}x{}, {} bytes): {}", msg->width, msg->height, msg->data.size(), e.what());
+    return;
+  }
 
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
   odometry_estimation->insert_image(stamp, cv_image->image);
@@ -958,14 +1056,58 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 }
 #endif
 
-size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
+  std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+  if (aux_index >= aux_concat.aux_sensors.size()) {
+    return;
+  }
+  auto& aux = aux_concat.aux_sensors[aux_index];
+  aux.buffer.push_back(msg);
+  while (aux.buffer.size() > aux.buffer_size) {
+    aux.buffer.pop_front();
+  }
+}
+
+void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  // Merge buffered auxiliary clouds into the primary scan (front + rear-left +
+  // rear-right -> primary front-lidar frame), then hand the result to the
+  // estimator. The mutex
+  // guards the aux buffers, which merge_clouds() reads via find_nearest().
+  if (aux_concat.enabled && !aux_concat.aux_sensors.empty()) {
+    // Primary point count BEFORE merge: lidar_concat appends aux bytes after the
+    // primary, so these are the first points in the merged cloud. Pass it as the
+    // epoch-rebase anchor so a multi-LiDAR sweep is not shifted late when an aux
+    // scan started before the primary.
+    const int primary_count = static_cast<int>(msg->width * msg->height);
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
+    {
+      std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+      // frame_diag_log wired through (review fix): without it the live node
+      // silently used the default `false` even when config_sensors.json
+      // enabled the per-frame CONCAT DEBUG evidence.
+      merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold,
+                                      aux_concat.require_all_aux, aux_concat.max_consecutive_aux_merge_failures,
+                                      &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure,
+                                      aux_concat.frame_diag_log);
+    }
+    // nullptr = strict merge skipped this scan (require_all_aux); drop it.
+    if (!merged) {
+      return;
+    }
+    points_callback(merged, primary_count);
+  } else {
+    points_callback(msg);
+  }
+}
+
+size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
   }
 
-  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field);
+  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count);
   if (raw_points == nullptr) {
     spdlog::warn("failed to extract points from message");
     return 0;
@@ -992,8 +1134,18 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
   odometry_estimation->insert_frame(preprocessed);
 
-  const size_t workload = odometry_estimation->workload();
-  spdlog::debug("workload={}", workload);
+  // Throttle offline bag playback on the SLOWEST stage, not just odometry.
+  // glim_rosbag uses this return value to pace playback; reporting only the
+  // odometry workload lets a fast front-end drain its queue while the bag keeps
+  // flooding sub/global mapping, whose input queues (frames/submaps WITH points)
+  // then grow unbounded and OOM. Take the max across all stages so playback
+  // waits for the slowest. (Port of airacingtech glim_ros2@8b454f8.)
+  size_t workload = odometry_estimation->workload();
+  const size_t sub_wl = sub_mapping ? static_cast<size_t>(sub_mapping->workload()) : 0;
+  const size_t global_wl = global_mapping ? static_cast<size_t>(global_mapping->workload()) : 0;
+  if (sub_wl > workload) workload = sub_wl;
+  if (global_wl > workload) workload = global_wl;
+  spdlog::debug("workload={} (odom={} sub={} global={})", workload, odometry_estimation->workload(), sub_wl, global_wl);
 
   return workload;
 }
@@ -1069,7 +1221,32 @@ void GlimROS::wait(bool auto_quit) {
 }
 
 void GlimROS::save(const std::string& path) {
-  if (global_mapping) global_mapping->save(path);
+  if (global_mapping) {
+    // TODO(follow-up refactor): replace this needs_wait() quiescence-inference
+    // flush with an explicit ExtensionModule::flush_at_end_of_sequence() hook
+    // (a join()-equivalent for extensions, mirroring the core async stages).
+    // An EOS signal lets the GNSS backend drain synchronously to completion and
+    // resolves the "waiting for more GNSS" vs "permanently un-bracketable"
+    // ambiguity directly -- removing pending_associable_ and the timeout below.
+    // Ideally upstreamed to koide3 (its extensions share this latent save-race).
+    //
+    // Flush extension backends (e.g. gnss_global) that produce factors on their
+    // own threads and deliver them only via on_smoother_update(). Wait until no
+    // extension reports pending work, so their FINAL position/heading factors
+    // are queued before we serialize. global_mapping->save() then runs a final
+    // optimize() -- which fires on_smoother_update() and injects those queued
+    // factors into the graph -- so they actually reach graph.bin / trajectories.
+    // Bounded so a perpetually-busy extension can't hang the save.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (needs_wait() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (needs_wait()) {
+      spdlog::warn("save(): extension still reports pending work after flush timeout; some final factors may be missing");
+    }
+
+    global_mapping->save(path);
+  }
   for (auto& module : extension_modules) {
     module->at_exit(path);
   }

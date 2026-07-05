@@ -4,6 +4,8 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <vector>
 #include <rclcpp/rclcpp.hpp>
 
 #include <Eigen/Core>
@@ -19,6 +21,8 @@
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #endif
+
+#include <glim_ros/lidar_concat.hpp>
 
 namespace glim {
 class TimeKeeper;
@@ -77,12 +81,36 @@ public:
 #ifdef BUILD_WITH_CV_BRIDGE
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg);
 #endif
-  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  // `epoch_anchor_count` (-1 = single sensor / unused) is the primary scan's
+  // point count in a concatenated multi-LiDAR cloud; forwarded to
+  // extract_raw_points() so the epoch-axis rebase anchors on the primary scan's
+  // earliest time rather than the global merged minimum. See points_callback_live().
+  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count = -1);
+
+  // Live subscription entry point for the primary LiDAR. Merges any buffered
+  // auxiliary clouds into the primary (matching the offline glim_rosbag /
+  // glim_pcap_rosbag path) and then forwards the result to points_callback().
+  void points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  // Buffers an auxiliary LiDAR cloud for later time-matched merging.
+  void aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index);
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
+
+  // True only when the live subscription-based mapping passway is enabled
+  // (glim_ros/enable_online_mapping). Default false: GLIM maps offline only.
+  bool online_mapping_enabled() const { return online_mapping_enabled_; }
+
+  // Topics for the INS init gate / GNSS factor bridge, parsed from
+  // config_ros.json in the constructor (both modes). Exposed so the offline
+  // drivers (glim_rosbag / glim_pcap_rosbag) can pull the same topics from
+  // the bag and feed ins_*_callback() directly — live subscriptions to them
+  // only exist when online mapping is enabled.
+  const std::string& ins_pose_topic() const { return ins_pose_topic_; }
+  const std::string& ins_odom_topic() const { return ins_odom_topic_; }
+  const std::string& ins_fix_topic() const { return ins_fix_topic_; }
 
 private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
@@ -106,6 +134,7 @@ private:
   std::vector<std::shared_ptr<GenericTopicSubscription>> extension_subs;
 
   // ROS-related
+  bool online_mapping_enabled_ = false;
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
@@ -120,6 +149,12 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr ins_pose_sub;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr ins_odom_sub;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr ins_fix_sub;
+  // Topic names (config_ros.json, "glim_ros" section) — parsed in both
+  // modes; see the public accessors above.
+  std::string ins_pose_topic_;
+  std::string ins_odom_topic_;
+  std::string ins_fix_topic_;
+  std::string gnss_factor_topic_;
   rclcpp::TimerBase::SharedPtr ins_init_timeout_timer;
   std::atomic_bool ins_init_applied{false};
 
@@ -177,6 +212,14 @@ private:
   std::atomic<int> yaw_sigma_samples_{0};
   std::atomic<int> yaw_sigma_violations_{0};
   std::atomic_bool yaw_sigma_warned_{false};
+
+  // Multi-LiDAR concatenation (primary front lidar + auxiliary rear-left/right).
+  // aux_concat holds the per-sensor buffers; aux_buffers_mutex guards them
+  // because the auxiliary subscription callbacks and points_callback_live()
+  // (which reads the buffers via merge_clouds) may run on different threads.
+  glim_ros::AuxConcatConfig aux_concat;
+  std::mutex aux_buffers_mutex;
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_points_subs;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

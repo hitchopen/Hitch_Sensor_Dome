@@ -19,25 +19,26 @@ This document is a **complete change log** between GICP++ and upstream `vectr-uc
 11. [What was removed from upstream](#11-what-was-removed-from-upstream)
 12. [What was NOT changed](#12-what-was-not-changed)
 13. [File-by-file diff summary](#13-file-by-file-diff-summary)
-14. [Credits and license](#credits-and-license)
+14. [2026-07 P1–P5 improvements — confidence-weighted gating, delta observer, merge evidence](#14-2026-07-p1p5-improvements)
+15. [Credits and license](#credits-and-license)
 
 ## 1. Hardware retargeting
 
-Topic, frame, and URDF defaults throughout the configs are switched from the upstream AV-24 / Luminar reference deployment to the Hitch Sensor Dome (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM).
+Topic, frame, and URDF defaults throughout the configs target the Hitch Sensor Dome (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM), matching [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml).
 
-| Surface | Upstream / inherited | Hitch dome |
-|---------|---------------------|------------|
-| Primary LiDAR topic | `/luminar_front/points` | `/robin_w_front/points` |
-| Aux LiDAR topics | `/luminar_left/points`, `/luminar_right/points` | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
-| IMU topic | `/gps_na/imu` | `/imu/data` |
-| GT odom topic | `/localization/global/odom` | `/odom_rtk_only` (via §3 republisher) |
-| `base_frame` | `novatel_a` | `base_link` (see §9) |
-| `imu_frame` | `novatel_a` | `imu_link` (Atlas Duo CoN) |
-| `lidar_frame` | `luminar_front` | `lidar_front_link` |
-| Aux LiDAR frames | `luminar_left`, `luminar_right` | `lidar_rear_left_link`, `lidar_rear_right_link` |
-| URDF auto-discovery | walks up for `av24.urdf` | walks up for `GLIM_plusplus/config/sensor_dome.urdf` |
-| `sensor_type` | `luminar` | `velodyne` (Robin W in coordinate_mode:=3 publishes float32 relative `time` — identical to Velodyne convention) |
-| LUMINAR-specific timestamp branches | present (uint64 raw bits handling) | removed; falls back to Velodyne float-seconds path |
+| Surface | Hitch Sensor Dome setting |
+|---------|---------------------------|
+| Primary LiDAR topic | `/robin_w_front/points` |
+| Aux LiDAR topics | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
+| IMU topic | `/imu/data` (fusion_engine_driver, Atlas Duo) |
+| GT odom topic | `/odom_rtk_only` (via §3 republisher) |
+| `base_frame` | `base_link` (see §9) |
+| `imu_frame` | `imu_link` (Atlas Duo CoN) |
+| `lidar_frame` | `lidar_front_link` |
+| Aux LiDAR frames | `lidar_rear_left_link`, `lidar_rear_right_link` |
+| URDF auto-discovery | walks up for `GLIM_plusplus/config/sensor_dome.urdf` |
+| `sensor_type` | `velodyne` (Robin W in coordinate_mode:=3 publishes float32 relative `time` — identical to Velodyne convention) |
+| Absolute-epoch (uint64 ns) timestamp branches | present (`sensor_type: "luminar"`) but unused — Robin W takes the Velodyne float-seconds path |
 
 Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py), [`include/dlio/dlio.h`](include/dlio/dlio.h), [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h), [`src/localization.cc`](src/localization.cc).
 
@@ -60,8 +61,9 @@ The base [`cfg/localization.yaml`](cfg/localization.yaml) carries **race-mode** 
 | `gicp/correspondenceRandomness` | `20` | `30` | Safe uses more NN samples for more stable covariances. |
 | `yawrate_attenuation/enable` | `true` | `false` | Race protects against corner slides; safe gives GICP full authority. |
 | `calib/motion_sigma_max` | `0.10` m/s² | `0.05` m/s² | Safe insists on a quieter window for higher-quality bias estimate. |
-| `gt_recovery/min_consecutive_failures` | `3` (recommended) | `1` | Race avoids snap on transient corners; safe restores upstream behavior. |
-| `verbose`, `debug/enable_pub`, `debug/enable_jump_log`, `debug/verbose_scan_log` | `false` | `true` | Race kills per-scan publisher overhead. Safe turns the firehose on. |
+| `gt_recovery/min_consecutive_failures` | `5` (shipped; raised from 3 in the P2 turn-error fixes) | `1` | Race avoids snap on transient corners; safe restores upstream behavior. |
+| `verbose`, `debug/enable_jump_log` | `false` | `true` | Race kills the noisiest per-scan logging; safe turns the firehose on. |
+| `debug/enable_pub`, `debug/verbose_scan_log` | `true` (evidence-first defaults, §14 — the scorecard consumes them; ~14 MB/36 min) | `true` | Disable in race mode only for resource-constrained live deployment. |
 
 Each mode also gets its own systemd unit:
 
@@ -187,7 +189,7 @@ Two new bold-yellow one-shot warnings to surface common operator-side misconfigu
 
 Healthy state prints a single confirmation INFO line.
 
-**(b) IMU never arrived.** The upstream-inherited check now suggests `/imu/data` (the Atlas Duo default) instead of the upstream's AV-24 specific `/gps_na/imu` typo example.
+**(b) IMU never arrived.** The upstream-inherited check suggests `/imu/data` (the Atlas Duo default) in its typo example.
 
 Files touched: [`src/localization.cc`](src/localization.cc) (gt_odom timer at ~line 490; IMU topic warn around line 450).
 
@@ -224,10 +226,17 @@ Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`../recording/
 
 A small set of upstream additions that don't apply on the Hitch dome were removed to keep the code base tight:
 
-- **`SensorType::LUMINAR`** enum value and all per-sensor LUMINAR branches in the deskewer, conversion loop, and `shiftCloudTimestamps`. The enum is back to upstream-stock `{ OUSTER, VELODYNE, HESAI, LIVOX, UNKNOWN }`.
-- **`is_luminar_` dead member** in `localization.h` (declared but never used).
-- **`luminar_uint64` parameter** on `shiftCloudTimestamps` — signature simplified to match upstream.
-- **AV-24-specific comment strings and topic name hints** throughout the code (`/gps_na/imu`, `novatel_a`, `gps_bottom`, `imu_bottom`, `luminar_front`, etc.).
+- **`SensorType::LUMINAR`** enum value and its per-sensor branches were
+  removed in the original retarget — and then RESTORED by the 2026-07 P1–P5
+  improvements (§14), whose deskew/merge code paths reference them. The enum
+  is now `{ OUSTER, VELODYNE, HESAI, LIVOX, LUMINAR, UNKNOWN }` and
+  `sensor_type: "luminar"` parses (uint64 epoch-ns per-point timestamps);
+  the value is unused on the dome (Robin W uses the `velodyne` branch).
+- **`is_luminar_` dead member** in `localization.h` (declared but never used) — still removed.
+- **`luminar_uint64` parameter** on `shiftCloudTimestamps` — removed in the
+  retarget, re-introduced with §14 (it selects the absolute-epoch no-shift
+  path).
+- **Earlier-deployment comment strings and topic name hints** throughout the code (`/gps_na/imu`, `novatel_a`, `gps_bottom`, `imu_bottom`, etc.).
 - **VECTR copyright headers** are RETAINED on files that originated there — that's legal attribution, not project text.
 
 ## 12. What was NOT changed
@@ -252,8 +261,8 @@ Important — so adopters can rely on the existing DLIO body of work and literat
 | [`launch/gicp_localization-race.service`](launch/gicp_localization-race.service) | NEW | systemd unit, SCHED_FIFO + CPU affinity, `Conflicts=safe` |
 | [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service) | NEW | systemd unit, default scheduling, `Conflicts=race` |
 | [`src/nav_sat_gated_odom.cc`](src/nav_sat_gated_odom.cc) | NEW | RTK-gated INS odometry republisher (§3) |
-| [`src/localization.cc`](src/localization.cc) | MODIFIED | Sensor scrub + warm-start + yaw-rate attenuation + motion gate + gt_odom health + Luminar branch removal |
-| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum restored to upstream-stock |
+| [`src/localization.cc`](src/localization.cc) | MODIFIED | Sensor scrub + warm-start + yaw-rate attenuation + motion gate + gt_odom health + §14 P1–P5 improvements (incl. LUMINAR branches) |
+| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum: LUMINAR re-added for §14 (dome still uses `velodyne`) |
 | [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h) | MODIFIED | New member fields for yaw-rate attenuation + motion gate + gt_odom timer |
 | [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py) | NEW | GLIM++ submap → single PCD bridge (§4) |
 | [`scripts/convert_ply_to_pcd.py`](scripts/convert_ply_to_pcd.py) | UNCHANGED | Legacy single-file PLY→PCD; still shipped for fallback |
@@ -262,8 +271,74 @@ Important — so adopters can rely on the existing DLIO body of work and literat
 | `scripts/debug_pose_inspector.py`, `scripts/plot_*.py`, `scripts/profile_*.py` | UNCHANGED | Generic diagnostic / plotting; not vehicle-specific |
 | `include/nano_gicp/*`, `src/nano_gicp/*` | UNCHANGED | Vendored nano_gicp / nanoflann |
 | [`CMakeLists.txt`](CMakeLists.txt) | MODIFIED | Add `nav_sat_gated_odom` executable + install rule |
-| [`package.xml`](package.xml) | UNCHANGED | Package name stays `gicp_localization` for ROS / colcon compatibility |
+| [`package.xml`](package.xml) | MODIFIED | Adds `libxml2` (URDF parsing for offline extrinsics); package name stays `gicp_localization` for ROS / colcon compatibility |
 | [`README.md`](README.md) | REWRITTEN | This file |
+
+
+## 14. 2026-07 P1–P5 improvements
+
+Added 2026-07-05 (the P1–P5 turn-error campaign, plus review fixes); every
+dome adaptation above (warm-start, yaw-rate-adaptive gains, motion-variance
+gate, race/safe modes, `base_link` split, Robin W sensor handling) is
+preserved. The campaign diagnosed a family of turn-localization errors from
+cross-run replays; `scripts/analyze_scan_debug_log.py` scores any replay log
+against the locked pre-fix baseline.
+
+**What came in (mechanisms):**
+
+- **P1 — confidence-weighted GICP gating.** Per-map rolling-median fitness
+  ratios (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`) replace
+  absolute thresholds that go stale across maps; hessian degeneracy now does
+  **partial updates** (full-6D solution remapping on the vehicle-re-centered,
+  unit-scaled hessian — coupled rot/trans null directions included) instead of
+  binary rejects; a **yaw-consistency veto** keeps IMU yaw on low-confidence
+  matches. New statuses `ok_partial` / `rejected_fitness_ratio`.
+  `seedBaseline` ships **0.0 (off)** here — measure the Robin W per-map floor
+  with `scripts/analyze_scan_debug_log.py` before setting it.
+- **P2 — state continuity.** Rejected scans seed the next IMU prior from the
+  *current* propagated velocity (stale-velocity corner-cutting bug); GT-snap
+  recovery resolves linear/angular twist sources independently (gyro backfill +
+  GT finite-differencing; never zeroes a moving vehicle);
+  `gt_recovery/min_consecutive_failures` default 5.
+- **P3 — delta-form observer + single bias point.** The observer applies GICP
+  as the time-free delta `T_meas · T_prior⁻¹` to the current state (kills the
+  yaw-rate-proportional lag from the 0.1–0.3 s measurement latency); IMU biases
+  are subtracted once, at buffering. **Composes with** the Hitch yaw-rate gain
+  attenuation (§6): the attenuation now scales the P2-bounded `dt_eff`
+  corrections.
+- **P4 — merge/scan evidence.** Per-frame debug topics (`fitness_ratio`,
+  `degen_*`, `yaw_veto`, `merged_aux_count`, `aux<i>_merge_dt_s`,
+  `aux<i>_points`, `scan_time_span_s`), the same fields in `SCAN DEBUG`,
+  per-aux clock-offset stats (warns at |mean| > 20 ms), concat buffer 200,
+  and the **turnkey scorecard** `scripts/analyze_scan_debug_log.py`
+  (acceptance/streaks, gicp_ms percentiles, fitness floor + suggested ratio
+  thresholds, gt_err yaw-rate buckets, concat coverage).
+- **URDF-first extrinsics** (`urdf_transforms.hpp`, libxml2 dep) and the
+  single-IMU allowlist guard (Hitch default `/imu/data`; frame-match check
+  left OFF until the Atlas Duo driver's `header.frame_id` is verified).
+- **Evidence-first defaults:** `debug/enable_pub` and `verbose_scan_log` are
+  ON (and the `verbose:false` WARN clamp now spares the SCAN DEBUG lines).
+
+**Robin W notes.** `localization/sensor_type: "velodyne"` stays the correct
+decoder — Robin W in `coordinate_mode:=3` emits FLOAT32 seconds-since-sweep
+per point. The absolute-epoch machinery (UINT8[8] epoch-ns decoding,
+absolute-time concat pass-through, timestamp diagnostics) is **inert** on
+this platform and kept intact for sensors that need it. Aux scans merged by
+`lidar_concat` are FLOAT32-relative and DO get rebased by the inter-scan dt
+(`lidar_concat` remains disabled by default here until 3× Robin W PTP sync
+is validated; the strict-merge guard + per-frame evidence are ready when it
+is enabled).
+
+**Also included:** the Atlas `adapter` package at the repo root (optional
+alternative ingestion, see
+[`../adapter/README_HITCH_PORT.md`](../adapter/README_HITCH_PORT.md) —
+including the P2 fix that populates `twist.angular` on INS odometry, which
+the snap recovery wants from whatever GT source you use).
+
+**Not yet re-validated on this platform:** the P1 ratio thresholds and
+`hessianCondMax` (calibrated on an earlier vehicle's data), the dense GLIM
+map profile, and everything needs a Robin W replay + scorecard pass. Run one
+bag through, read the scorecard's suggested thresholds, then tune.
 
 ## Credits and license
 

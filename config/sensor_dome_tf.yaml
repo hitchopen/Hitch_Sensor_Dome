@@ -1,5 +1,5 @@
 # =============================================================
-# ROS2 Static TF Transforms — Sensor Dome v17j (FINAL)
+# ROS2 Static TF Transforms — Sensor Dome v17m
 #
 # All transforms: parent (imu_link) -> child (sensor_link)
 # Translation in meters, rotation as quaternion (x, y, z, w)
@@ -218,16 +218,16 @@ static_transforms:
 #     roll=-π/2, pitch=0, yaw=-π/2
 #     quaternion: (x=-0.5, y=0.5, z=-0.5, w=0.5)
 #
-# Front stereo pair: both face +X (0°), baseline = 104.0 mm.
+# Front stereo pair: both face +X (0°), baseline = 110.0 mm.
 # Rear pair: symmetric about X axis (120° and 240°).
 # =============================================================
 
-  # --- Camera: Front-Right (0°, +Y offset) ---
+  # --- Camera: Front-Left (0°, +Y offset) ---
   # v17m: pulled inward to (0.075, 0.055) to clear the v17l 18 mm
   # side-2 enclosure wall (worst-case M3 bolt now 24.93 mm from
   # side-2 line, vs 4.35 mm before). Faces +X (forward).
   - frame_id: "imu_link"
-    child_frame_id: "cam_front_right_link"
+    child_frame_id: "cam_front_left_link"
     translation:
       x:  0.075000
       y:  0.055000
@@ -238,11 +238,24 @@ static_transforms:
       z:  0.000000
       w:  1.000000
 
-  # --- Camera: Front-Left (0°, -Y offset) ---
+  # Optical frame for ROS image consumers: +Z optical axis, +X right, +Y down.
+  - frame_id: "cam_front_left_link"
+    child_frame_id: "cam_front_left_optical_frame"
+    translation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+    rotation:
+      x: -0.500000
+      y:  0.500000
+      z: -0.500000
+      w:  0.500000
+
+  # --- Camera: Front-Right (0°, -Y offset) ---
   # v17m: pulled inward to (0.075, -0.055). Stereo baseline now 110 mm
   # (down from 146 mm at v17l; up from 104 mm at v17a–g).
   - frame_id: "imu_link"
-    child_frame_id: "cam_front_left_link"
+    child_frame_id: "cam_front_right_link"
     translation:
       x:  0.075000
       y: -0.055000
@@ -252,6 +265,19 @@ static_transforms:
       y:  0.000000
       z:  0.000000
       w:  1.000000
+
+  # Optical frame for ROS image consumers: +Z optical axis, +X right, +Y down.
+  - frame_id: "cam_front_right_link"
+    child_frame_id: "cam_front_right_optical_frame"
+    translation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+    rotation:
+      x: -0.500000
+      y:  0.500000
+      z: -0.500000
+      w:  0.500000
 
   # --- Camera: Rear-Left (v17j FINAL — yaw 120°, LiDAR-radial aim) ---
   # Position derived from local (95, +70) rotated by 120°. Aim
@@ -271,6 +297,19 @@ static_transforms:
       z:  0.866025
       w:  0.500000
 
+  # Optical frame for ROS image consumers: +Z optical axis, +X right, +Y down.
+  - frame_id: "cam_rear_left_link"
+    child_frame_id: "cam_rear_left_optical_frame"
+    translation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+    rotation:
+      x: -0.500000
+      y:  0.500000
+      z: -0.500000
+      w:  0.500000
+
   # --- Camera: Rear-Right (v17j FINAL — yaw 240°, LiDAR-radial aim) ---
   # X-axis mirror of cam_rear_left_link.
   - frame_id: "imu_link"
@@ -284,6 +323,19 @@ static_transforms:
       y:  0.000000
       z:  0.866025
       w: -0.500000
+
+  # Optical frame for ROS image consumers: +Z optical axis, +X right, +Y down.
+  - frame_id: "cam_rear_right_link"
+    child_frame_id: "cam_rear_right_optical_frame"
+    translation:
+      x:  0.000000
+      y:  0.000000
+      z:  0.000000
+    rotation:
+      x: -0.500000
+      y:  0.500000
+      z: -0.500000
+      w:  0.500000
 
 # =============================================================
 # GNSS Antenna Transforms (gnss_antenna2imu)
@@ -392,8 +444,8 @@ static_transforms:
 # lidar_front                 0.0800    0.0000    0.1145      0
 # lidar_rear_left            -0.0400    0.0693    0.1145    120
 # lidar_rear_right           -0.0400   -0.0693    0.1145    240
-# cam_front_right             0.0750    0.0550    0.1265      0   (v17m: 0.085→0.075, 0.073→0.055)
-# cam_front_left              0.0750   -0.0550    0.1265      0   (v17m: same)
+# cam_front_left              0.0750    0.0550    0.1265      0   (v17m: 0.085→0.075, 0.073→0.055)
+# cam_front_right             0.0750   -0.0550    0.1265      0   (v17m: same)
 # cam_rear_left              -0.1081    0.0473    0.1265    120     (LiDAR-radial outward)
 # cam_rear_right             -0.1081   -0.0473    0.1265    240     (LiDAR-radial outward)
 # gnss_antenna_primary        0.0000    0.0000    0.2730      0
@@ -406,9 +458,8 @@ static_transforms:
 #   + rear-R 173°–307° = complete with overlap at the joins).
 # Dual GNSS antenna: enabled when secondary translation norm > 0.05 m.
 #
-# v17j is the FINAL design — see v17j changelog block above for the
-# rationale behind giving up the axis-through-center property in favor
-# of full 360° coverage.
+# v17m keeps the v17j rear-camera yaw layout and adds the front-camera
+# clearance changes summarized above.
 # =============================================================
 
 # =============================================================

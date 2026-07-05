@@ -5,11 +5,11 @@
 #
 # Usage (invoked by sensor_recorder.py):
 #   ros2 launch sensor_dome static_tf.launch.py \
-#       tf_yaml:=/.../ROS2 config/sensor_dome_tf.yaml
+#       tf_yaml:=/.../config/sensor_dome_tf.yaml
 #
 # Standalone:
 #   ros2 launch ./static_tf.launch.py \
-#       tf_yaml:=$(realpath ../../ROS2\ config/sensor_dome_tf.yaml)
+#       tf_yaml:=$(realpath ../../config/sensor_dome_tf.yaml)
 # =============================================================
 
 from launch import LaunchDescription

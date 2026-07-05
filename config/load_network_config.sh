@@ -56,7 +56,7 @@ import os, sys, shlex
 try:
     import yaml
 except ImportError:
-    sys.stderr.write("[FATAL] python3 yaml module missing — `pip install pyyaml`\n")
+    sys.stderr.write("[FATAL] python3 yaml module missing — install `python3-yaml`\n")
     sys.exit(1)
 
 path = os.environ["NETCFG_FILE"]

@@ -82,8 +82,8 @@ lidars:
 # ─── e-con RouteCAM_P_CU25_CXLC_IP67 cameras ───────────────
 # IPs are set via the Aravis web UI / arv-tool-0.8.
 cameras:
-  - { name: "cam_front_right",  ip: "192.168.1.20" }
-  - { name: "cam_front_left",   ip: "192.168.1.21" }
+  - { name: "cam_front_left",   ip: "192.168.1.20" }
+  - { name: "cam_front_right",  ip: "192.168.1.21" }
   - { name: "cam_rear_left",    ip: "192.168.1.22" }
   - { name: "cam_rear_right",   ip: "192.168.1.23" }
 

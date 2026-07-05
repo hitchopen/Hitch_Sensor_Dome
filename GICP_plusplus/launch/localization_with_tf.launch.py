@@ -21,6 +21,7 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -197,7 +198,10 @@ def generate_launch_description():
                   f"— falling back to RACE defaults")
 
         params.append({'localization/lidar_frame': child_frame_value})
-        params.append({'localization/imu_only': LaunchConfiguration('imu_only')})
+        params.append({
+            'localization/imu_only': ParameterValue(
+                LaunchConfiguration('imu_only'), value_type=bool),
+        })
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
 

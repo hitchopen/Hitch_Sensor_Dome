@@ -44,6 +44,13 @@
   // points_qos             : QoS options for points topic subscription. See imu_qos for details.
   // image_qos              : QoS options for image topic subscription. See imu_qos for details.
   "glim_ros": {
+    // Online (live subscription) mapping passway. DISABLED: GLIM builds maps
+    // OFFLINE only -- run `glim_rosbag <bag>` or `glim_pcap_rosbag <pcap>`,
+    // which feed the IMU/points/GNSS callbacks directly and drive
+    // timer_callback() manually. When false the live node (glim_rosnode)
+    // refuses to run and no live ROS subscriptions / wall timer are created.
+    // Set true ONLY to restore the legacy live-sensor mapping path.
+    "enable_online_mapping": false,
     // Backend modules
     "enable_local_mapping": true,
     "enable_global_mapping": true,
@@ -79,6 +86,14 @@
     // gravity / scale / extrinsic mismatch surfaces in the GLIM viewer
     // before it corrupts the map. Disable it once the rig has been
     // characterized and the IMU validator reports clean for several runs.
+    // libgnss_global.so adds GNSS-position factors to the iSAM2 global graph
+    // whenever a usable RTK-FIXED sample arrives on the gnss topic configured
+    // in config_gnss_global.json. The primary trajectory comes from
+    // LiDAR + IMU odometry (config_odometry_gpu.json), so during GNSS-denied
+    // passages the GNSS factor stream simply goes silent and LiDAR+IMU alone
+    // drives mapping. Once RTK reacquires, the next GNSS factor pulls the
+    // post-dropout trajectory back into the global frame; iSAM2 smooths the
+    // dropout retroactively.
     "extension_modules": [
       "libmemory_monitor.so",
       "libstandard_viewer.so",
@@ -121,6 +136,9 @@
     // ins_max_pose_jitter_trans    — max translation drift (m) between samples.
     // ins_min_quat_dot             — min |q1·q2| between samples (0.999 ≈ 2.5°).
     // ins_init_timeout_s           — seconds before warning escalates to "TIMEOUT".
+    // NOTE (B4 fix): these settings apply in BOTH modes — offline replay
+    // (glim_rosbag / glim_pcap_rosbag reads the same topics from the bag
+    // and feeds the gate callbacks directly) and the optional live path.
     "ins_pose_topic": "/pose",
     "ins_odom_topic": "",
     "ins_fix_topic":  "/gps/fix",
@@ -130,6 +148,21 @@
     "ins_max_pose_jitter_trans": 0.05,
     "ins_min_quat_dot": 0.999,
     "ins_init_timeout_s": 60.0,
+    // GNSS factor bridge (post-init, RTK-gated republisher feeding
+    // libgnss_global.so — gnss_topic in config_gnss_global.json must match
+    // gnss_factor_topic). Offline, accepted samples are handed to the
+    // extension module directly as well as published.
+    "gnss_factor_topic": "/gnss/pose_rtk_only",
+    "gnss_factor_require_rtk_fixed": true,
+    "gnss_factor_max_position_stddev": 0.10,
+    // Dual-antenna RTK heading. Keep in sync with the secondary-antenna
+    // translation in config/sensor_dome_tf.yaml (repo root): baseline is
+    // the primary→secondary distance; heading σ ≈ 0.01 m RTK noise /
+    // baseline. The hitch_sensor_dome launch prints the exact values to
+    // paste here when it detects a configured secondary antenna.
+    "dual_antenna_enabled": false,
+    "dual_antenna_baseline_m": 0.0,
+    "dual_antenna_heading_sigma_rad": 0.0,
     // QoS — match recording/sensor_config.yaml so GLIM can subscribe
     // directly to the live drivers or replay an .mcap bag.
     "imu_qos": {

@@ -20,7 +20,7 @@
 
 ## 1. 面向 Hitch Sensor Dome 的传感器适配
 
-将 topic、frame、字段名从此前的 AV-24 部署（Luminar Iris + 自定义 IMU）切换到 Hitch Sensor Dome 参考配置（3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM）。
+topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM）。
 
 | 项目 | 原 | 现 |
 |------|-----|-----|
@@ -66,7 +66,7 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 
 将 `base_frame_id` 固定为 `imu_link`，使 GLIM 围绕 Atlas Duo 导航中心（CoN）建图，而不是某个具体车辆的 `base_link`。各下游车辆集成商再发布自己的静态 `imu_link → base_link` —— 这样建好的地图无需重跑 SLAM 即可在不同车辆平台上复用。
 
-这是相对上游的有意分歧：上游默认 `base_frame_id` 为空，会沿用 IMU frame 的名字（在 AV-24 上是 `gps_bot`，与车辆耦合）。
+这是相对上游的有意分歧：上游默认 `base_frame_id` 为空，会沿用 IMU frame 的名字（由驱动决定、与具体车辆耦合的字符串）。
 
 ## 3. 面向户外 / 车辆尺度的整体调参
 

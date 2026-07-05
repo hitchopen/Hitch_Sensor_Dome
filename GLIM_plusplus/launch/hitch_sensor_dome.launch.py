@@ -14,19 +14,23 @@
 #      in motion. Pure diagnostic; the actual fix is in the C++ side
 #      (see #4 below). Set skip_stationarity_check:=true to suppress.
 #
-#   3. The glim_rosnode binary, configured via:
-#        --ros-args -p config_path:=GLIM_plusplus/glim/config
-#                   -p ins_pose_topic:=/pose
-#      so all the tuning in GLIM_plusplus/glim/config/*.json and
-#      GLIM_plusplus/glim_ext/config/*.json applies and the C++ subscribes to the
-#      Atlas Duo's INS pose for initialization.
+#   3. NO GLIM node. GLIM maps OFFLINE ONLY (enable_online_mapping=false
+#      in glim/config/config_ros.json makes glim_rosnode refuse to run).
+#      Record the session (recording/), then build the map with:
+#        ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out>
+#      glim_rosbag feeds /imu/data, /robin_w_*/points, /pose, and /gps/fix
+#      from the bag into the same callbacks the live path would use, so
+#      INS init and the RTK-gated GNSS factor bridge behave identically.
+#      A launch-time diagnostic still runs dual-antenna detection and the
+#      orientation-prior consistency check (see _build_glim_node).
 #
-#   4. C++-side INS initialization (Hitch fork). The glim_ros2 wrapper
-#      subscribes to ins_pose_topic (default /pose) at startup. The first
-#      valid PoseStamped is forwarded to OdometryEstimationIMU::set_init_state(),
-#      which pins NaiveInitialStateEstimation's force_init pathway.
-#      GLIM's gravity-from-accelerometer calibration is NEVER invoked in
-#      this fork — it has been removed from initial_state_estimation.cpp.
+#   4. C++-side INS initialization (Hitch fork). In offline replay the
+#      first PoseStamped on ins_pose_topic (config_ros.json, default
+#      /pose) that passes the RTK gate is forwarded to
+#      OdometryEstimationIMU::set_init_state(), which pins
+#      NaiveInitialStateEstimation's force_init pathway. GLIM's
+#      gravity-from-accelerometer calibration is NEVER invoked in this
+#      fork — it has been removed from initial_state_estimation.cpp.
 #      See GLIM_plusplus/docs/moving_start_initialization.md for the full design.
 #
 #   5. Optional foxglove_bridge for live visualization
@@ -254,33 +258,43 @@ def _detect_dual_antenna(tf_yaml_path: str) -> tuple:
 
 
 def _build_glim_node(context, *args, **kwargs):
-    """Spawn glim_rosnode with the INS topic + RTK-gate parameters,
-    plus dual-antenna detection results.
+    """GLIM maps OFFLINE ONLY — no glim_rosnode is spawned (B4 fix).
 
-    The C++ wrapper subscribes to ins_pose_topic / ins_odom_topic and
-    consults ins_fix_topic (NavSatFix) as the RTK gate. Only after the
-    gate passes (RTK fix + cm-grade covariance + N consecutive stable
-    poses) does it call set_init_state and unblock the optimizer.
+    glim_rosnode hard-exits when glim_ros/enable_online_mapping is false
+    (the shipped default), so spawning it here only produced a dead node
+    at launch. This launch now provides the live-session support pieces
+    (static TFs, pre-flight check, foxglove); the map is built afterwards
+    with:
 
-    When dual_antenna_enabled is true, the wrapper auto-tightens the
-    init-gate stability threshold and shortens the timeout (orientation
-    converges much faster with RTK-fixed dual-antenna heading)."""
+        ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out>
+
+    glim_rosbag reads the INS init-gate / GNSS-factor-bridge settings from
+    glim/config/config_ros.json ("glim_ros" section) and feeds /pose +
+    /gps/fix from the bag itself. The ins_* / gnss_factor_* launch
+    arguments are NOT forwarded to GLIM (they never were — the C++ reads
+    config_ros.json, not ROS parameters); they are kept only as documented
+    defaults. Edit config_ros.json to change gate thresholds or topics.
+
+    What remains here is the dual-antenna detection + config consistency
+    check, kept as a launch-time diagnostic."""
     cfg = lambda name: LaunchConfiguration(name).perform(context)
     tf_yaml = cfg("tf_yaml")
     dual_enabled, baseline = _detect_dual_antenna(tf_yaml)
 
     if dual_enabled:
-        sys.stderr.write(
-            f"[launch] dual-antenna mode ENABLED (baseline = {baseline:.3f} m). "
-            f"GLIM++ init gates will auto-tighten.\n")
         # Heading σ ≈ 1 cm RTK noise / baseline, in radians.
-        # We expose this so the C++ side can use it for the orientation
-        # covariance it stamps on the factor-bridge messages.
         heading_sigma_rad = 0.01 / max(baseline, 0.05)
+        sys.stderr.write(
+            f"[launch] dual-antenna mode detected in sensor_dome_tf.yaml "
+            f"(baseline = {baseline:.3f} m, heading σ ≈ {heading_sigma_rad:.4f} rad).\n"
+            f"[launch]   Mirror this in glim/config/config_ros.json (glim_ros section):\n"
+            f"[launch]     \"dual_antenna_enabled\": true,\n"
+            f"[launch]     \"dual_antenna_baseline_m\": {baseline:.3f},\n"
+            f"[launch]     \"dual_antenna_heading_sigma_rad\": {heading_sigma_rad:.4f}\n"
+            f"[launch]   so offline mapping (glim_rosbag) picks it up.\n")
     else:
         sys.stderr.write(
             "[launch] single-antenna mode (no dual-antenna baseline configured)\n")
-        heading_sigma_rad = 0.0
 
     # Consistency check between sensor_dome_tf.yaml (antenna geometry)
     # and config_gnss_global.json (enable_orientation_prior). Warns
@@ -291,36 +305,12 @@ def _build_glim_node(context, *args, **kwargs):
     prior_on = _read_orientation_prior_flag(gnss_config_path)
     _warn_orientation_prior_mismatch(dual_enabled, prior_on, gnss_config_path)
 
-    return [
-        Node(
-            package="glim_ros",
-            executable="glim_rosnode",
-            name="glim_rosnode",
-            output="screen",
-            parameters=[{
-                "config_path":                  cfg("config_path"),
-                # Topics
-                "ins_pose_topic":               cfg("ins_pose_topic"),
-                "ins_odom_topic":               cfg("ins_odom_topic"),
-                "ins_fix_topic":                cfg("ins_fix_topic"),
-                # Gate thresholds
-                "ins_require_rtk_fixed":        cfg("ins_require_rtk_fixed").lower() == "true",
-                "ins_max_position_stddev":      float(cfg("ins_max_position_stddev")),
-                "ins_min_pose_window_samples":  int(cfg("ins_min_pose_window_samples")),
-                "ins_max_pose_jitter_trans":    float(cfg("ins_max_pose_jitter_trans")),
-                "ins_min_quat_dot":             float(cfg("ins_min_quat_dot")),
-                "ins_init_timeout_s":           float(cfg("ins_init_timeout_s")),
-                # GNSS factor bridge (RTK-gated, post-init)
-                "gnss_factor_topic":               cfg("gnss_factor_topic"),
-                "gnss_factor_require_rtk_fixed":   cfg("gnss_factor_require_rtk_fixed").lower() == "true",
-                "gnss_factor_max_position_stddev": float(cfg("gnss_factor_max_position_stddev")),
-                # Dual-antenna mode (auto-detected from sensor_dome_tf.yaml)
-                "dual_antenna_enabled":            dual_enabled,
-                "dual_antenna_baseline_m":         baseline,
-                "dual_antenna_heading_sigma_rad":  heading_sigma_rad,
-            }],
-        )
-    ]
+    sys.stderr.write(
+        "[launch] GLIM maps OFFLINE only — no glim_rosnode spawned. After the "
+        "session, build the map with:\n"
+        "[launch]   ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out_dir>\n")
+
+    return []
 
 
 def _maybe_foxglove(context, *args, **kwargs):

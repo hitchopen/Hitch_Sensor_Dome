@@ -12,7 +12,6 @@
 
 cmake_minimum_required(VERSION 3.12.4)
 project(gicp_localization)
-find_package(rosidl_default_generators REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -25,12 +24,16 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-
 find_package(PCL REQUIRED)
 find_package( Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
+find_package(LibXml2 REQUIRED)  # URDF parsing for offline aux-LiDAR extrinsics (lidar_concat)
+find_package(OpenMP REQUIRED)
 
-set(CMAKE_BUILD_TYPE "Release")
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
 set(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
@@ -60,12 +63,13 @@ add_library(nano_gicp STATIC
   src/nano_gicp/lsq_registration.cc
   src/nano_gicp/nano_gicp.cc
 )
-target_link_libraries(nano_gicp ${PCL_LIBRARIES} ${OpenMP_LIBS} nanoflann)
+target_link_libraries(nano_gicp ${PCL_LIBRARIES} OpenMP::OpenMP_CXX nanoflann)
 ament_target_dependencies(nano_gicp)
 
 # Localization Node
 add_executable(gicp_localization_node src/localization_node.cc src/localization.cc)
-target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp)
+target_include_directories(gicp_localization_node PRIVATE ${LIBXML2_INCLUDE_DIR})
+target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} OpenMP::OpenMP_CXX Threads::Threads nano_gicp ${LIBXML2_LIBRARIES})
 ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
 
 # nav_sat_gated_odom — Hitch Sensor Dome RTK-gating republisher.
@@ -74,11 +78,6 @@ ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "
 # reports RTK-fixed status with cm-grade covariance.
 add_executable(nav_sat_gated_odom src/nav_sat_gated_odom.cc)
 ament_target_dependencies(nav_sat_gated_odom rclcpp nav_msgs sensor_msgs)
-
-ament_export_include_directories(include)
-ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs pcl_ros)
-ament_package()
 
 # Binaries
 install( TARGETS gicp_localization_node nav_sat_gated_odom
@@ -92,17 +91,14 @@ install( PROGRAMS
 install( DIRECTORY cfg launch
          DESTINATION share/${PROJECT_NAME}
 )
-
-link_directories(${PCL_LIBRARY_DIRS})
-
-include(FindOpenMP)
-if(OPENMP_FOUND)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-else(OPENMP_FOUND)
-  message("ERROR: OpenMP could not be found.")
-endif(OPENMP_FOUND)
+# Install the vehicle URDF alongside the package share so the launch's walk-up
+# (share/gicp_localization/launch -> share/gicp_localization) resolves the URDF
+# in the colcon install tree, not just the source tree. OPTIONAL: the source-tree
+# walk-up / static fallback still apply if the file isn't present at install time.
+install( FILES ../GLIM_plusplus/config/sensor_dome.urdf
+         DESTINATION share/${PROJECT_NAME}
+         OPTIONAL
+)
 file(WRITE ${CMAKE_BINARY_DIR}/test_cpuid.cpp "#include <cpuid.h>")
 try_compile(HAS_CPUID ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/test_cpuid.cpp)
 file(REMOVE ${CMAKE_BINARY_DIR}/test_cpuid.cpp)
@@ -110,8 +106,8 @@ if(HAS_CPUID)
   add_compile_definitions(HAS_CPUID)
 endif()
 
-target_compile_options(gicp_localization_node PRIVATE ${OpenMP_FLAGS})
-
 # nav_sat_gated_odom doesn't use OpenMP, but compile with the same
 # warning hygiene as the rest of the package.
 target_compile_options(nav_sat_gated_odom PRIVATE -Wall -Wextra)
+
+ament_package()

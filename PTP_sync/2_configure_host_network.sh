@@ -49,15 +49,17 @@ source "$SCRIPT_DIR/../config/load_network_config.sh"
 ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
 HOST_IP="${HOST_IP:-$NETCFG_HOST_IP}"
 ROUTER_IP="${ROUTER_IP:-$NETCFG_ROUTER_IP}"
+ADD_ALIAS=0
 
 # ─── Parse arguments ─────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --eth)       ETH_IFACE="$2"; shift 2 ;;
-        --eth=*)     ETH_IFACE="${1#*=}"; shift ;;
-        --host-ip)   HOST_IP="$2"; shift 2 ;;
-        --host-ip=*) HOST_IP="${1#*=}"; shift ;;
-        *)           echo "Unknown arg: $1"; exit 1 ;;
+        --eth)               ETH_IFACE="$2"; shift 2 ;;
+        --eth=*)             ETH_IFACE="${1#*=}"; shift ;;
+        --host-ip)           HOST_IP="$2"; shift 2 ;;
+        --host-ip=*)         HOST_IP="${1#*=}"; shift ;;
+        --add-factory-alias) ADD_ALIAS=1; shift ;;
+        *)                   echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
@@ -111,10 +113,6 @@ ok "Saved /run/hitch_dome_net.env for script 3"
 # (./provision_robin_w_multiunit.sh) needs a host route into 172.168.1.0/24
 # during its run; it adds and removes the alias automatically. We do NOT
 # add it here unless --add-factory-alias is passed.
-ADD_ALIAS=0
-for a in "$@"; do
-    [ "$a" = "--add-factory-alias" ] && ADD_ALIAS=1
-done
 if [ "$ADD_ALIAS" = "1" ]; then
     info "Adding temporary 172.168.1.100/24 alias for factory-IP LiDAR access..."
     sudo ip addr add 172.168.1.100/24 dev "$ETH_IFACE" 2>/dev/null || \
@@ -135,32 +133,32 @@ verify_network() {
     info "Test 1/4: $ETH_IFACE link state"
     if ip link show "$ETH_IFACE" 2>/dev/null | grep -q "state UP"; then
         ok "  $ETH_IFACE is UP"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  $ETH_IFACE link is DOWN — cable / RUTM50 port?"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     info "Test 2/4: $HOST_IP assigned"
     if ip -4 -o addr show dev "$ETH_IFACE" | grep -q "$HOST_IP/24"; then
         ok "  $HOST_IP/24 present on $ETH_IFACE"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: $HOST_IP/24 not present on $ETH_IFACE"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
 
     info "Test 3/4: PTP timestamping mode"
     ok "  Mode = $PTP_TIMESTAMPING (written to /run/hitch_dome_net.env)"
-    ((PASS++))
+    PASS=$((PASS+1))
 
     info "Test 4/4: RUTM50 router reachable at $ROUTER_IP"
     if ping -c 2 -W 2 "$ROUTER_IP" &>/dev/null; then
         ok "  $ROUTER_IP responds to ping"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  $ROUTER_IP did not respond — check RUTM50 power / port / WAN-as-LAN config"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     echo ""

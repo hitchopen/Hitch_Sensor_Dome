@@ -59,12 +59,9 @@
   //   on each submap, pulling its yaw toward the heading carried in the
   //   incoming PoseWithCovarianceStamped / Odometry quaternion.
   //
-  //   Default is TRUE because the Hitch Sensor Dome ships as a
-  //   dual-antenna RTK platform — the Atlas Duo's two-antenna baseline
-  //   gives a drift-free heading, and the rotation prior is what feeds
-  //   that heading into GLIM's factor graph. The launch log prints
-  //   `dual-antenna mode ENABLED` once sensor_dome_tf.yaml's
-  //   gnss_antenna_secondary_link translation is non-zero.
+  //   Default is FALSE because the checked-in TF uses the single-antenna
+  //   sentinel for gnss_antenna_secondary_link. Flip this to true only
+  //   after installing and configuring the secondary antenna translation.
   //
   //   ⚠ SET TO FALSE for single-antenna installations. With only one
   //   antenna, the heading on /pose is gyro-integrated and drifting
@@ -96,11 +93,50 @@
       1e4,
       5e4
     ],
-    "enable_orientation_prior": true,
+    "enable_orientation_prior": false,
     "orientation_prior_inf_scale": [
       1e-6,
       1e-6,
       1e2
-    ]
+    ],
+    // P5#1 yaw-quality gate. The RTK filter feeding gnss_topic qualifies
+    // POSITION quality only; the dual-antenna HEADING can be degraded or
+    // unsolved while position stays RTK-FIXED (secondary-antenna outage,
+    // baseline multipath). Skip the heading prior when the message's reported
+    // yaw sigma (sqrt of pose.covariance[35]) exceeds this threshold; the
+    // position prior is still applied. On this platform cov[35] comes from
+    // the glim_ros GNSS factor bridge: pass-through of the Odometry source's
+    // rpy covariance when populated (set ins_odom_topic for that), else the
+    // constant baseline-derived sigma when dual_antenna_enabled — the gate
+    // only sees real per-sample quality with an Odometry source. Atlas
+    // dual-antenna heading is
+    // ~0.1-0.3 deg sigma when healthy, >1 deg degraded — 3.0 sits well clear
+    // of healthy while rejecting garbage that a 5.7-deg-sigma prior would
+    // otherwise ingest. <= 0 disables the gate; samples without populated
+    // yaw covariance pass (covariance-less publishers keep old behavior).
+    "orientation_prior_max_yaw_sigma_deg": 3.0,
+    // Software antenna -> IMU lever-arm compensation.
+    //
+    // Set to FALSE for tightly-coupled INS receivers (Point One Atlas,
+    // Novatel SPAN, Septentrio AsteRx-i, etc.) where the firmware already
+    // resolves antenna observations to a common chassis reference internally.
+    // Applying the correction here as well would double-compensate.
+    //
+    // Set to TRUE only for raw-GNSS publishers that report antenna-frame
+    // position. The lever arm is then read from the URDF using
+    // urdf_gnss_frame below.
+    //
+    // Current platform (Hitch Sensor Dome, Point One Atlas Duo): the Atlas
+    // firmware's LEVERARMCONFIG resolves antenna observations to its Center
+    // of Navigation, and the mapping graph body frame is that same point
+    // (config_sensors.json urdf_imu_frame = "imu_link"), so a software
+    // position lever-arm here would double-compensate. Leave false.
+    // (The IMU stream is body-axis-rotated but device-located per FusionEngine
+    // Spec 3.4.1 -- a separate, small accel lever-arm, not this one.)
+    "enable_lever_arm": false,
+    // URDF link name of the GNSS antenna. Only consulted when
+    // enable_lever_arm is true. Empty string means "no lever arm".
+    // Examples: "gnss_antenna_primary_link" (see config/sensor_dome_tf.yaml).
+    "urdf_gnss_frame": ""
   }
 }

@@ -28,6 +28,8 @@ find_package(GTSAM 4.2 REQUIRED)
 find_package(gtsam_points 1.2.0 REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(spdlog REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBXML2 REQUIRED libxml-2.0)
 
 if(BUILD_WITH_VIEWER)
   find_package(Iridescence REQUIRED)
@@ -102,6 +104,7 @@ target_include_directories(glim PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/json/include>
   $<INSTALL_INTERFACE:include/glim>
+  ${LIBXML2_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(glim
@@ -113,6 +116,7 @@ target_link_libraries(glim
   OpenMP::OpenMP_CXX
   spdlog::spdlog
   $<TARGET_NAME_IF_EXISTS:Iridescence::Iridescence>
+  ${LIBXML2_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
 if(BUILD_WITH_OPENCV)
@@ -259,8 +263,18 @@ if(DEFINED ENV{ROS_VERSION})
     # ROS2
     find_package(ament_cmake REQUIRED)
     install(DIRECTORY config DESTINATION share/glim)
-    ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
-    ament_export_libraries(${glim_LIBRARIES} ${GTSAM_LIBRARIES} fmt spdlog::spdlog)
+    # Install the platform URDF into the config dir so lidar_concat's
+    # resolve_urdf_path() finds it in the colcon install tree
+    # (config_path -> share/glim/config -> sensor_dome.urdf, matched by
+    # basename), not just the source tree. sensor_dome.urdf lives in
+    # GLIM_plusplus/config/ (one above this package); the configs reference
+    # it as "../../config/sensor_dome.urdf". NOT OPTIONAL: a silent miss
+    # here degrades lidar_concat to front-lidar-only at runtime (the AV-24
+    # port originally installed a nonexistent av24.urdf and OPTIONAL masked
+    # the failure).
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../config/sensor_dome.urdf DESTINATION share/glim/config)
+    ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${LIBXML2_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+    ament_export_libraries(${glim_LIBRARIES} ${GTSAM_LIBRARIES} fmt spdlog::spdlog ${LIBXML2_LIBRARIES})
     ament_export_targets(glim-targets HAS_LIBRARY_TARGET)
     ament_package(CONFIG_EXTRAS "cmake/glim-config.cmake.in")
   elseif($ENV{ROS_VERSION} EQUAL 1)

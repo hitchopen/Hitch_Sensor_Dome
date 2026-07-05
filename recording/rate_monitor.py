@@ -28,7 +28,7 @@ try:
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 except ImportError:  # pragma: no cover
     sys.exit("ERROR: rclpy / diagnostic_msgs not available. "
-             "Source ROS 2 Jazzy first: source /opt/ros/jazzy/setup.bash")
+             "Source ROS 2 first: source /opt/ros/$ROS_DISTRO/setup.bash")
 
 
 class RateMonitor(Node):

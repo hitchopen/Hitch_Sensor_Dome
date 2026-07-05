@@ -76,13 +76,13 @@
     "urdf_imu_frame": "imu_link",
     // Fallback T_lidar_imu — used only if urdf_path cannot be loaded.
     // Computed from sensor_dome_tf.yaml: front lidar lives at
-    // (+0.090, 0, +0.1415) m from imu_link with zero rotation. The
+    // (+0.080, 0, +0.1145) m from imu_link with zero rotation. The
     // T_lidar_imu transform that GLIM expects is the inverse —
     // translation negated, rotation identity.
     "T_lidar_imu": [
-      -0.090,
+      -0.080,
       0.000,
-      -0.1415,
+      -0.1145,
       0.0,
       0.0,
       0.0,
@@ -108,9 +108,9 @@
     // RouteCAM_P_CU25_CXLC_IP67: 1920×1200 global shutter, 158° DFOV.
     // The extrinsic below is the front-left camera relative to the front
     // lidar, derived from sensor_dome_tf.yaml:
-    //   cam_front_left  at (+0.105, -0.052, +0.1535) m from imu_link
-    //   lidar_front     at (+0.090,  0.000, +0.1415) m from imu_link
-    //   delta = (+0.015, -0.052, +0.012)  with rotation identity.
+    //   cam_front_left  at (+0.075, +0.055, +0.1265) m from imu_link
+    //   lidar_front     at (+0.080,  0.000, +0.1145) m from imu_link
+    //   delta = (-0.005, +0.055, +0.012)  with rotation identity.
     // Camera intrinsics here are placeholders — replace with the values
     // from your factory calibration card before using the visual front-end.
     "global_shutter_camera": true,
@@ -119,8 +119,8 @@
       1200
     ],
     "T_lidar_camera": [
-      0.015,
-      -0.052,
+      -0.005,
+      0.055,
       0.012,
       0.0,
       0.0,
@@ -158,6 +158,19 @@
     "aux_topics": ["/robin_w_rear_left/points", "/robin_w_rear_right/points"],
     "aux_frames": ["lidar_rear_left_link", "lidar_rear_right_link"],
     "urdf_path": "../../config/sensor_dome.urdf",
-    "primary_frame": "lidar_front_link"
+    "primary_frame": "lidar_front_link",
+    // --- P4 (2026-07): strict merge guard + per-frame evidence ---
+    // require_all_aux=false: build on whatever Robin W merged this scan.
+    // true = an incomplete merge SKIPS the scan (sync-validation mode); past
+    // max_consecutive_aux_merge_failures the tool aborts only if
+    // abort_on_merge_failure=true.
+    "require_all_aux": false,
+    "abort_on_merge_failure": true,
+    "max_consecutive_aux_merge_failures": 10,
+    // One parseable "CONCAT DEBUG | stamp=... merged=n/N dt<i>=...s pts<i>=...
+    // span=...s total_pts=..." INFO line per primary scan, plus per-aux signed
+    // header-offset stats every 512 merges (warns when |mean| > 20 ms — a
+    // constant clock offset the PTP sync should have removed; see PTP_sync/).
+    "frame_diag_log": true
   }
 }

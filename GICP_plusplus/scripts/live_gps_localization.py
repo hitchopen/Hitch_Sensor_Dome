@@ -8,7 +8,7 @@ trajectories and the same stats box produced by ``compare_gps_localization.py``.
 
 Usage::
 
-    source /opt/ros/humble/setup.bash
+    source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
     source ~/ros2_ws/install/setup.bash
     python3 live_gps_localization.py \
         --gps-topic /odom \

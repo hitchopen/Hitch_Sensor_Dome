@@ -113,7 +113,7 @@ def _samples_from_bag(bag_path: Path,
         from sensor_msgs.msg import Imu
     except ImportError as ex:
         sys.exit(f"ERROR: rosbag2_py / rclpy / sensor_msgs missing: {ex}\n"
-                 "       Source ROS 2 first: source /opt/ros/jazzy/setup.bash")
+                 "       Source ROS 2 first: source /opt/ros/$ROS_DISTRO/setup.bash")
 
     storage_options = rosbag2_py.StorageOptions(
         uri=str(bag_path), storage_id="mcap")
@@ -154,7 +154,7 @@ def _samples_from_live(topic: str, window_s: float) -> Iterable[Tuple[float, ...
         from sensor_msgs.msg import Imu
     except ImportError as ex:
         sys.exit(f"ERROR: rclpy / sensor_msgs missing: {ex}\n"
-                 "       Source ROS 2 first: source /opt/ros/jazzy/setup.bash")
+                 "       Source ROS 2 first: source /opt/ros/$ROS_DISTRO/setup.bash")
 
     rclpy.init()
     node = rclpy.create_node("glim_init_stationarity_check")

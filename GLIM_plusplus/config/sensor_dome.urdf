@@ -3,61 +3,85 @@
   <!-- Auto-generated from config/sensor_dome_tf.yaml — DO NOT EDIT BY HAND. Re-run GLIM/config/generate_sensor_dome_urdf.py to regenerate.-->
   <link name="imu_link"/>
   <link name="base_link"/>
-  <joint name="imu_to_base_link" type="fixed">
+  <joint name="imu_link_to_base_link" type="fixed">
     <parent link="imu_link"/>
     <child link="base_link"/>
     <origin xyz="0.000000 0.000000 0.000000" rpy="0.000000 0.000000 0.000000"/>
   </joint>
   <link name="lidar_front_link"/>
-  <joint name="imu_to_lidar_front_link" type="fixed">
+  <joint name="imu_link_to_lidar_front_link" type="fixed">
     <parent link="imu_link"/>
     <child link="lidar_front_link"/>
-    <origin xyz="0.090000 0.000000 0.141500" rpy="0.000000 0.000000 0.000000"/>
+    <origin xyz="0.080000 0.000000 0.114500" rpy="0.000000 0.000000 0.000000"/>
   </joint>
   <link name="lidar_rear_left_link"/>
-  <joint name="imu_to_lidar_rear_left_link" type="fixed">
+  <joint name="imu_link_to_lidar_rear_left_link" type="fixed">
     <parent link="imu_link"/>
     <child link="lidar_rear_left_link"/>
-    <origin xyz="-0.045000 0.077942 0.141500" rpy="0.000000 0.000000 2.094394"/>
+    <origin xyz="-0.040000 0.069282 0.114500" rpy="0.000000 0.000000 2.094394"/>
   </joint>
   <link name="lidar_rear_right_link"/>
-  <joint name="imu_to_lidar_rear_right_link" type="fixed">
+  <joint name="imu_link_to_lidar_rear_right_link" type="fixed">
     <parent link="imu_link"/>
     <child link="lidar_rear_right_link"/>
-    <origin xyz="-0.045000 -0.077942 0.141500" rpy="0.000000 -0.000000 -2.094394"/>
-  </joint>
-  <link name="cam_front_right_link"/>
-  <joint name="imu_to_cam_front_right_link" type="fixed">
-    <parent link="imu_link"/>
-    <child link="cam_front_right_link"/>
-    <origin xyz="0.105000 0.052000 0.153500" rpy="0.000000 0.000000 0.000000"/>
+    <origin xyz="-0.040000 -0.069282 0.114500" rpy="0.000000 -0.000000 -2.094394"/>
   </joint>
   <link name="cam_front_left_link"/>
-  <joint name="imu_to_cam_front_left_link" type="fixed">
+  <joint name="imu_link_to_cam_front_left_link" type="fixed">
     <parent link="imu_link"/>
     <child link="cam_front_left_link"/>
-    <origin xyz="0.105000 -0.052000 0.153500" rpy="0.000000 0.000000 0.000000"/>
+    <origin xyz="0.075000 0.055000 0.126500" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="cam_front_left_optical_frame"/>
+  <joint name="cam_front_left_link_to_cam_front_left_optical_frame" type="fixed">
+    <parent link="cam_front_left_link"/>
+    <child link="cam_front_left_optical_frame"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="-1.570796 0.000000 -1.570796"/>
+  </joint>
+  <link name="cam_front_right_link"/>
+  <joint name="imu_link_to_cam_front_right_link" type="fixed">
+    <parent link="imu_link"/>
+    <child link="cam_front_right_link"/>
+    <origin xyz="0.075000 -0.055000 0.126500" rpy="0.000000 0.000000 0.000000"/>
+  </joint>
+  <link name="cam_front_right_optical_frame"/>
+  <joint name="cam_front_right_link_to_cam_front_right_optical_frame" type="fixed">
+    <parent link="cam_front_right_link"/>
+    <child link="cam_front_right_optical_frame"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="-1.570796 0.000000 -1.570796"/>
   </joint>
   <link name="cam_rear_left_link"/>
-  <joint name="imu_to_cam_rear_left_link" type="fixed">
+  <joint name="imu_link_to_cam_rear_left_link" type="fixed">
     <parent link="imu_link"/>
     <child link="cam_rear_left_link"/>
-    <origin xyz="-0.097533 0.064933 0.153500" rpy="0.000000 0.000000 2.094394"/>
+    <origin xyz="-0.108122 0.047272 0.126500" rpy="0.000000 0.000000 2.094394"/>
+  </joint>
+  <link name="cam_rear_left_optical_frame"/>
+  <joint name="cam_rear_left_link_to_cam_rear_left_optical_frame" type="fixed">
+    <parent link="cam_rear_left_link"/>
+    <child link="cam_rear_left_optical_frame"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="-1.570796 0.000000 -1.570796"/>
   </joint>
   <link name="cam_rear_right_link"/>
-  <joint name="imu_to_cam_rear_right_link" type="fixed">
+  <joint name="imu_link_to_cam_rear_right_link" type="fixed">
     <parent link="imu_link"/>
     <child link="cam_rear_right_link"/>
-    <origin xyz="-0.097533 -0.064933 0.153500" rpy="0.000000 -0.000000 -2.094394"/>
+    <origin xyz="-0.108122 -0.047272 0.126500" rpy="0.000000 -0.000000 -2.094394"/>
+  </joint>
+  <link name="cam_rear_right_optical_frame"/>
+  <joint name="cam_rear_right_link_to_cam_rear_right_optical_frame" type="fixed">
+    <parent link="cam_rear_right_link"/>
+    <child link="cam_rear_right_optical_frame"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="-1.570796 0.000000 -1.570796"/>
   </joint>
   <link name="gnss_antenna_primary_link"/>
-  <joint name="imu_to_gnss_antenna_primary_link" type="fixed">
+  <joint name="imu_link_to_gnss_antenna_primary_link" type="fixed">
     <parent link="imu_link"/>
     <child link="gnss_antenna_primary_link"/>
-    <origin xyz="0.000000 0.000000 0.300000" rpy="0.000000 0.000000 0.000000"/>
+    <origin xyz="0.000000 0.000000 0.273000" rpy="0.000000 0.000000 0.000000"/>
   </joint>
   <link name="gnss_antenna_secondary_link"/>
-  <joint name="imu_to_gnss_antenna_secondary_link" type="fixed">
+  <joint name="imu_link_to_gnss_antenna_secondary_link" type="fixed">
     <parent link="imu_link"/>
     <child link="gnss_antenna_secondary_link"/>
     <origin xyz="0.000000 0.000000 0.000000" rpy="0.000000 0.000000 0.000000"/>

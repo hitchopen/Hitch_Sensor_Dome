@@ -1,9 +1,9 @@
 # 传感器记录系统：Point One Nav Atlas Duo + Seyond Robin W LiDAR + RouteCAM 摄像头
 
-在 Ubuntu 24.04 + ROS 2 Jazzy（可选 PREEMPT_RT 实时内核）上搭建的高性能 GNSS / IMU / LiDAR / 摄像头数据采集系统的安装与配置指南。
+在 Ubuntu 22.04 + ROS 2 Humble 或 Ubuntu 24.04 + ROS 2 Jazzy（可选 PREEMPT_RT 实时内核）上搭建的高性能 GNSS / IMU / LiDAR / 摄像头数据采集系统的安装与配置指南。
 
 **目标硬件：**
-- Ubuntu 24.04 LTS 工作站（在 Lenovo ThinkPad P1 Gen 6、Intel i9-13900H 上验证）
+- Ubuntu 22.04 或 24.04 LTS 工作站（在 Lenovo ThinkPad P1 Gen 6、Intel i9-13900H 上验证）
 - Point One Nav Atlas Duo（GNSS / INS，仅以太网）
 - 最多 3 台 Seyond Robin W 方向性 LiDAR
 - 4 台 e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision 摄像头（PoE、IEEE 1588 PTP、2MP 全局快门）
@@ -12,9 +12,9 @@
 
 | # | 脚本 | 功能 |
 |---|--------|--------|
-| 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt 依赖、RT 调度权限、内核调优、ROS 2 Jazzy |
+| 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt 依赖、RT 调度权限、内核调优、ROS 2 Humble/Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | 主机 NIC 静态 IP、硬件时间戳检测、RUTM50 可达性 |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd（TCP 上的 NMEA）、chrony、ptp4l grandmaster、phc2sys、fusion-engine-driver（TCP） |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd（TCP 上的 NMEA）、chrony、ptp4l grandmaster、phc2sys、fusion_engine_driver（TCP） |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave 启用 + Seyond ROS 2 驱动 |
 | 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave 启用 + Aravis（仅 Tier 2） |
 
@@ -26,11 +26,11 @@
 
 ## 第 1 节：安装 Ubuntu 实时内核与其他软件包
 
-本节安装主机所需的、与网络和 PTP 配置无关的内容：apt 依赖、实时调度权限、内核 `sysctl` 调优，以及 ROS 2 Jazzy。
+本节安装主机所需的、与网络和 PTP 配置无关的内容：apt 依赖、实时调度权限、内核 `sysctl` 调优，以及 ROS 2 Humble 或 Jazzy。
 
 ### 1.1 PREEMPT_RT 内核 —— 仅用于硬实时控制时才需要
 
-**仅采集数据并不需要 RT 内核。** 用于感知/定位数据采集 —— [`recording/`](../recording/) 工作流将 GNSS / IMU / LiDAR / 摄像头打包成 Foxglove 原生 MCAP 包，供后续建图、感知训练、SLAM 评估使用 —— 普通 Ubuntu 24.04 通用内核**已经够用**。通用内核下的 PTP 同步精度通常落在 RT 内核数值的 1–2 倍以内（第 3 节给出具体数值），仍远高于穹顶里任何传感器所能分辨的精度。
+**仅采集数据并不需要 RT 内核。** 用于感知/定位数据采集 —— [`recording/`](../recording/) 工作流将 GNSS / IMU / LiDAR / 摄像头打包成 Foxglove 原生 MCAP 包，供后续建图、感知训练、SLAM 评估使用 —— 普通 Ubuntu LTS 通用内核**已经够用**。通用内核下的 PTP 同步精度通常落在 RT 内核数值的 1–2 倍以内（第 3 节给出具体数值），仍远高于穹顶里任何传感器所能分辨的精度。
 
 只有当主机需要对传感器数据作出**有界延迟响应**时，RT 内核才真正有用：闭合实时控制环（转向、刹车、机械臂伺服）、运行确定性安全监控，或任何不能容忍毫秒级调度抖动的场景。如果你的应用是「先记录，再离线处理」，整段子节都可以跳过。
 
@@ -63,14 +63,19 @@ uname -a
 ```bash
 chmod +x 1_install_packages.sh
 ./1_install_packages.sh
+
+# Humble 主机：
+./1_install_packages.sh --ros-distro humble
 ```
+
+默认值是 `ROS_DISTRO=jazzy`。在 Ubuntu 22.04 主机上运行脚本 1、3、4、5 时，使用 `--ros-distro humble` 或先设置 `ROS_DISTRO=humble`。Ubuntu 24.04 主机使用 Jazzy。
 
 它会安装：
 
 - **apt 依赖：** `build-essential`、`cmake`、`git`、`linuxptp`、`chrony`、`gpsd`、`pps-tools`、`tcpdump`、`ethtool`、`libyaml-cpp-dev`、Python 相关工具。
 - **RT 调度组 + 限制：** 建立 `realtime` 组并加入当前用户，写入 `/etc/security/limits.d/99-realtime.conf`，授予该组 `rtprio 99` 和 `memlock unlimited`。无论是否运行 RT 内核，这些限制都是 PTP 守护进程以实时优先级运行的必要条件。
 - **内核 `sysctl` 调优：** 大 UDP 缓冲区（`net.core.rmem_max=32 MiB`）和 `vm.swappiness=10`，应对高带宽 LiDAR / 摄像头流。
-- **ROS 2 Jazzy：** desktop + 开发工具 + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools`。在 `~/.bashrc` 中 `source /opt/ros/jazzy/setup.bash`。
+- **ROS 2 Humble/Jazzy：** desktop + 开发工具 + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/默认存储插件。在 `~/.bashrc` 中 `source /opt/ros/$ROS_DISTRO/setup.bash`。
 - **`tcpdump` 权限位：** `cap_net_raw+ep`，让录制脚本无需 `sudo` 即可抓 UDP。
 
 脚本末尾的自检会验证：RT 内核标志、组成员资格、`sysctl` 值、ROS 2 安装。
@@ -131,8 +136,8 @@ Atlas Duo 自带独立的 DC 圆头电源输入，两种方案下都单独供电
 
 | 组件 | Tier 1（仅 RUTM50） | Tier 2（Planet 边界时钟） | 用于传感器融合是否够？ |
 |-----|--------------------|--------------------------|----------------------|
-| chrony GPS 校准的 `CLOCK_REALTIME` | < 100 ns | < 100 ns | 是（两者都够） |
-| NIC PHC via `phc2sys` | < 200 ns | < 200 ns | 是（两者都够） |
+| chrony GPS 校准的 `CLOCK_REALTIME` | ~10–100 ms（仅 NMEA） | ~10–100 ms（仅 NMEA） | 对带 Atlas GPS 时间戳的 ROS 消息足够 |
+| NIC PHC via `phc2sys` | 硬件时间戳可用时 < 1 µs | 硬件时间戳可用时 < 1 µs | 足够；软件时间戳模式下跳过 |
 | Robin W LiDAR PTP slave | 5–50 µs | 300–800 ns | 是（两者都够） |
 
 对 LiDAR-IMU 融合而言，5–50 µs 完全够 —— Robin W 单帧在 10–20 FPS 下持续 50–100 ms，跨传感器几微秒的偏差远小于一帧周期。第 3 行的显著改善只对摄像头/LiDAR 像素级时间对齐才有意义 —— 而那正是 Tier 2 的价值所在。
@@ -308,7 +313,7 @@ Point One Nav Atlas Duo 通过 TCP 输出 NMEA 用于规范主机 `CLOCK_REALTIM
 │  chrony ← SHM → CLOCK_REALTIME (~10–100 ms 到 GPS) │
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → 在以太网上 announce PTP        │
-│  fusion-engine-driver: TCP 30201 → /pose /imu /…   │
+│  fusion_engine_driver: TCP 30201 → /pose /imu /…   │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -336,8 +341,8 @@ chmod +x 3_setup_ins_to_pc_sync.sh
 - **chrony：** 用 gpsd SHM（仅 NMEA）规范 `CLOCK_REALTIME`。NTP 池保留作为备援。稳态预期精度约 10–100 ms。
 - **`ptp4l` grandmaster：** 在传感器 NIC 上 announce。由于主机时钟不再被规范到 < 100 ns 的 GPS 精度，脚本默认把 `clockClass` 设为 **13**（应用专用、锁到内部参考），而不是 6（锁到一级 GPS 参考）。跨传感器 PTP 同步仍然紧密；改成 13 只是诚实告诉 PTP 从机当前的绝对时间归属。
 - **`phc2sys`：** 把 `CLOCK_REALTIME` 复制到 NIC PHC（仅硬件时间戳时相关）。
-- **systemd：** enable 并启动 `gpsd`、`chrony`、`ptp4l-grandmaster`、`phc2sys-grandmaster`。整个链路无需重启即可生效。
-- **fusion-engine-driver：** 克隆并 `colcon build` Point One Nav ROS 2 驱动到 `~/ros2_ws/`。自动打 GCC 14 的 `<cstdint>` 补丁。驱动调用使用 `connection_type:=tcp` 加 Atlas Duo IP（不再使用 `connection_type:=tty`）。
+- **systemd：** enable 并启动 `gpsd`、`chrony`、`ptp4l-grandmaster`；只有 NIC 支持硬件时间戳时才启用 `phc2sys-grandmaster`。整个链路无需重启即可生效。
+- **fusion_engine_driver：** 克隆并 `colcon build` Point One Nav ROS 2 驱动到 `~/ros2_ws/`。自动打 GCC 14 的 `<cstdint>` 补丁。驱动调用使用 `connection_type:=tcp` 加 Atlas Duo IP（不再使用 `connection_type:=tty`）。
 - **Point One host tools：** 把 `p1-host-tools/` 克隆到 `$HOME`，`pip install fusion-engine-client[all]`。
 
 ### 3.2 手动验证
@@ -376,7 +381,9 @@ sudo journalctl -u phc2sys-grandmaster -f
 # offset 应 < 1000 ns
 
 # 服务状态
-sudo systemctl status gpsd chrony ptp4l-grandmaster phc2sys-grandmaster
+sudo systemctl status gpsd chrony ptp4l-grandmaster
+# 仅硬件时间戳：
+sudo systemctl status phc2sys-grandmaster
 ```
 
 ---
@@ -489,8 +496,8 @@ sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
 │   ├── robin_w_rear_left.pcap   # 所有时间戳均经 PTP 同步
 │   └── robin_w_rear_right.pcap
 ├── camera_pcap/
-│   ├── cam_front_right.pcap     # GigE Vision 原始包（带 PTP 时间戳）
-│   ├── cam_front_left.pcap
+│   ├── cam_front_left.pcap      # GigE Vision 原始包（带 PTP 时间戳）
+│   ├── cam_front_right.pcap
 │   ├── cam_rear_left.pcap
 │   └── cam_rear_right.pcap
 ├── p1nav/
@@ -506,7 +513,7 @@ sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
 ```yaml
 point_one_nav:
   connection_type: "tcp"
-  tcp_host: "192.168.1.30"
+  tcp_ip: "192.168.1.30"
   tcp_port: 30201
 
 lidars:
@@ -531,9 +538,9 @@ recording:
 
 ```bash
 # 终端 1 —— Point One Nav（TCP 上的 FusionEngine）
-ros2 run fusion-engine-driver fusion_engine_ros_driver --ros-args \
+ros2 run fusion_engine_driver fusion_engine_ros_driver --ros-args \
     -p connection_type:=tcp \
-    -p tcp_host:=192.168.1.30 \
+    -p tcp_ip:=192.168.1.30 \
     -p tcp_port:=30201
 
 # 终端 2 —— Seyond Robin W
@@ -647,7 +654,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 | 供电 | PoE (IEEE 802.3af) |
 | 时间同步 | IEEE 1588 PTP via GigE Vision |
 | 防护等级 | IP67 |
-| 穹顶布局 | 前向立体对（基线 104 mm）+ 后向对称对 |
+| 穹顶布局 | 前向立体对（基线 110 mm）+ 后向对称对 |
 
 ### C. NVIDIA GPU 与 RT 内核兼容性
 

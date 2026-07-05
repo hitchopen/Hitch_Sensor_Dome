@@ -37,6 +37,7 @@
 #   chmod +x 5_setup_camera_ptp.sh
 #   ./5_setup_camera_ptp.sh                             # use YAML defaults
 #   ./5_setup_camera_ptp.sh [--eth IFACE] [--ips IP1,IP2,IP3,IP4]
+#   ./5_setup_camera_ptp.sh --ros-distro humble
 #
 # Examples:
 #   ./5_setup_camera_ptp.sh
@@ -53,8 +54,8 @@ source "$SCRIPT_DIR/../config/load_network_config.sh"
 # ─── Configuration (env > CLI > YAML defaults) ───────────────
 ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
 CAM_IPS_STR="${CAM_IPS_STR:-$NETCFG_CAMERA_IPS}"
-CAM_NAMES=("cam_front_right" "cam_front_left" "cam_rear_left" "cam_rear_right")
-ROS_DISTRO="jazzy"
+CAM_NAMES=("cam_front_left" "cam_front_right" "cam_rear_left" "cam_rear_right")
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 WS_DIR="$HOME/ros2_ws"
 
 # ─── Parse arguments ─────────────────────────────────────────
@@ -64,6 +65,8 @@ while [[ $# -gt 0 ]]; do
         --eth=*)  ETH_IFACE="${1#*=}"; shift ;;
         --ips)    CAM_IPS_STR="$2"; shift 2 ;;
         --ips=*)  CAM_IPS_STR="${1#*=}"; shift ;;
+        --ros-distro)   ROS_DISTRO="$2"; shift 2 ;;
+        --ros-distro=*) ROS_DISTRO="${1#*=}"; shift ;;
         *)        echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -75,9 +78,28 @@ info()  { echo -e "\n\033[1;34m[INFO]\033[0m $*"; }
 warn()  { echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
+validate_ros_distro() {
+    case "$ROS_DISTRO" in
+        humble|jazzy) ;;
+        *) fail "Unsupported ROS_DISTRO='$ROS_DISTRO'. Use 'humble' or 'jazzy'." ;;
+    esac
+}
+source_ros_setup() {
+    [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ] || \
+        fail "ROS 2 $ROS_DISTRO not found at /opt/ros/${ROS_DISTRO}/setup.bash"
+    set +u
+    # shellcheck disable=SC1091
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"
+    local rc=$?
+    set -u
+    return "$rc"
+}
+
+validate_ros_distro
 
 # =============================================================
 info "Section 5: PTP sync — PC to Cameras"
+info "  ROS distro: $ROS_DISTRO"
 info "  Ethernet: $ETH_IFACE"
 info "  Camera IPs: ${CAM_IPS[*]}"
 echo ""
@@ -95,6 +117,7 @@ fi
 info "Installing Aravis GigE Vision library..."
 sudo apt install -y \
     aravis-tools \
+    aravis-tools-cli \
     libaravis-dev \
     gir1.2-aravis-0.8 \
     libgstreamer1.0-dev \
@@ -104,13 +127,19 @@ ok "Aravis installed."
 
 # ─── 3. Install ROS 2 camera packages ───────────────────────
 info "Installing ROS 2 camera packages..."
-source /opt/ros/${ROS_DISTRO}/setup.bash
+source_ros_setup
 sudo apt install -y \
     ros-${ROS_DISTRO}-image-transport \
     ros-${ROS_DISTRO}-camera-info-manager \
     ros-${ROS_DISTRO}-image-pipeline \
     ros-${ROS_DISTRO}-camera-calibration \
     ros-${ROS_DISTRO}-cv-bridge
+if sudo apt install -y ros-${ROS_DISTRO}-camera-aravis2; then
+    ok "camera_aravis2 package installed."
+else
+    warn "ros-${ROS_DISTRO}-camera-aravis2 was not available from apt."
+    warn "Install camera_aravis2 from source before launching RouteCAM nodes."
+fi
 ok "ROS 2 camera packages installed."
 
 # ─── 4. Configure network for GigE Vision ───────────────────
@@ -232,20 +261,20 @@ verify_camera_sync() {
     info "Test 1/7: PTP grandmaster status"
     if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
         ok "  ptp4l-grandmaster is running"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: ptp4l-grandmaster not running — run Section 3 first"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
 
     # ── Test 2: Aravis tools installed ──
     info "Test 2/7: Aravis GigE Vision library"
     if command -v arv-tool-0.8 &>/dev/null; then
         ok "  arv-tool-0.8 available"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
-        echo "  FAIL: arv-tool-0.8 not found — apt install aravis-tools"
-        ((FAIL++))
+        echo "  FAIL: arv-tool-0.8 not found — apt install aravis-tools-cli"
+        FAIL=$((FAIL+1))
     fi
 
     # ── Test 3: Camera network reachability ──
@@ -257,17 +286,17 @@ verify_camera_sync() {
         name="${CAM_NAMES[$i]:-cam_$i}"
         if ping -c1 -W2 "$ip" &>/dev/null; then
             ok "  $name @ $ip reachable"
-            ((LIVE_COUNT++))
+            LIVE_COUNT=$((LIVE_COUNT+1))
             LIVE_IPS+=("$ip")
         else
             warn "  $name @ $ip not reachable"
         fi
     done
     if [ $LIVE_COUNT -gt 0 ]; then
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: No cameras reachable — check PoE switch and cables"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
     info "  $LIVE_COUNT / ${#CAM_IPS[@]} cameras online"
 
@@ -279,11 +308,11 @@ verify_camera_sync() {
             CAM_COUNT=$(echo "$DISCOVERED" | wc -l)
             ok "  Aravis discovered $CAM_COUNT device(s):"
             echo "$DISCOVERED" | sed 's/^/    /'
-            ((PASS++))
+            PASS=$((PASS+1))
         else
             warn "  Aravis found no GigE Vision devices"
             warn "  Cameras may need IP configuration or firewall rules"
-            ((WARN_COUNT++))
+            WARN_COUNT=$((WARN_COUNT+1))
         fi
     fi
 
@@ -315,27 +344,27 @@ verify_camera_sync() {
             if [ -n "$PTP_ENABLED" ]; then
                 if echo "$PTP_ENABLED" | grep -qi "true\|1"; then
                     ok "  Camera @ $ip: PTP enabled"
-                    ((PASS++))
+                    PASS=$((PASS+1))
                 else
                     warn "  Camera @ $ip: PTP = $PTP_ENABLED (may need enabling)"
-                    ((WARN_COUNT++))
+                    WARN_COUNT=$((WARN_COUNT+1))
                 fi
             else
                 warn "  Camera @ $ip: Could not read PTP status (feature name may differ)"
-                ((WARN_COUNT++))
+                WARN_COUNT=$((WARN_COUNT+1))
             fi
 
             if [ -n "$PTP_STATUS_VAL" ]; then
                 info "  Camera @ $ip: PTP clock status = $PTP_STATUS_VAL"
                 if echo "$PTP_STATUS_VAL" | grep -qi "slave\|locked"; then
                     ok "  Camera @ $ip: PTP is synchronized (slave/locked)"
-                    ((PASS++))
+                    PASS=$((PASS+1))
                 fi
             fi
         done
     else
         warn "  arv-tool-0.8 not available — skipping PTP check"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Test 6: Control-link sanity + streaming tool availability ──
@@ -348,37 +377,37 @@ verify_camera_sync() {
         if arv-tool-0.8 -a "$TEST_IP" control DeviceVendorName Width Height 2>/dev/null | \
                 grep -qiE "width|height|vendor"; then
             ok "  GenICam control link OK on $TEST_IP"
-            ((PASS++))
+            PASS=$((PASS+1))
         else
             warn "  GenICam read failed — camera may need stream configuration"
-            ((WARN_COUNT++))
+            WARN_COUNT=$((WARN_COUNT+1))
         fi
         if command -v arv-camera-test-0.8 &>/dev/null; then
             ok "  arv-camera-test-0.8 available (use: arv-camera-test-0.8 -n 1 <camera_name>)"
         else
-            warn "  arv-camera-test-0.8 not found — install the aravis-tools package"
-            ((WARN_COUNT++))
+            warn "  arv-camera-test-0.8 not found — install the aravis-tools-cli package"
+            WARN_COUNT=$((WARN_COUNT+1))
         fi
     else
         warn "  No cameras available for control-link test"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Test 7: ROS 2 camera packages ──
     info "Test 7/7: ROS 2 camera packages"
-    source /opt/ros/${ROS_DISTRO}/setup.bash 2>/dev/null || true
+    source_ros_setup || true
     local PKGS_OK=0
     for pkg in image_transport camera_info_manager cv_bridge; do
         if ros2 pkg list 2>/dev/null | grep -q "$pkg"; then
-            ((PKGS_OK++))
+            PKGS_OK=$((PKGS_OK+1))
         fi
     done
     if [ $PKGS_OK -ge 3 ]; then
         ok "  ROS 2 camera packages installed ($PKGS_OK/3)"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  Some ROS 2 camera packages missing ($PKGS_OK/3)"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Results ──

@@ -9,6 +9,13 @@
     "config_preprocess": "config_preprocess.json",
     "config_odometry": "config_odometry_gpu.json",
     "config_sub_mapping": "config_sub_mapping_gpu.json",
+    // P4#2 (2026-07) — DENSE LOCALIZATION-MAP profile, opt-in on
+    // the Hitch dome until Robin W mapping density/CPU is validated. Derive the
+    // dense variants from THIS platform's preprocess/sub-mapping configs before
+    // enabling (see GLIM_plusplus/README.md, "Dense localization-map profile"),
+    // then swap the two lines above to the *_dense_map.json files and
+    // re-baseline the GICP fitness floor with
+    // GICP_plusplus/scripts/analyze_scan_debug_log.py.
     "config_global_mapping": "config_global_mapping_gpu.json",
     "config_gnss": "config_gnss_global.json"
   }

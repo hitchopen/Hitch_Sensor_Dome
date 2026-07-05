@@ -12,16 +12,19 @@
 # The URDF tree is a star rooted at imu_link, with one fixed joint per
 # sensor frame in the YAML:
 #
-#     imu_link
+#       ├── cam_front_left_link
+#       │   └── cam_front_left_optical_frame
+#       ├── cam_front_right_link
+#       │   └── cam_front_right_optical_frame
+#       ├── cam_rear_left_link
+#       │   └── cam_rear_left_optical_frame
+#       ├── cam_rear_right_link
+#       │   └── cam_rear_right_optical_frame
 #       ├── base_link               (identity by default; vehicle body
 #       │                            frame for downstream consumers)
 #       ├── lidar_front_link        (yaw   0°)
 #       ├── lidar_rear_left_link    (yaw 120°)
 #       ├── lidar_rear_right_link   (yaw 240°)
-#       ├── cam_front_right_link
-#       ├── cam_front_left_link
-#       ├── cam_rear_left_link
-#       ├── cam_rear_right_link
 #       ├── gnss_antenna_primary_link
 #       └── gnss_antenna_secondary_link (optional)
 #
@@ -49,18 +52,13 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:
-    sys.exit("ERROR: pyyaml is required. Install with: pip install pyyaml")
+    sys.exit("ERROR: pyyaml is required. Install with: sudo apt install python3-yaml")
 
 HERE = Path(__file__).resolve().parent
 # The TF YAML lives in /config/ (top-level), per the consolidation that
-# happened after the recording/ module was added. Earlier versions of
-# the repo had it under "ROS2 config/" — both paths are checked.
+# happened after the recording/ module was added.
 _REPO = HERE.parent.parent
-_CANDIDATES = [
-    _REPO / "config" / "sensor_dome_tf.yaml",
-    _REPO / "ROS2 config" / "sensor_dome_tf.yaml",
-]
-TF_YAML = next((p for p in _CANDIDATES if p.exists()), _CANDIDATES[0])
+TF_YAML = _REPO / "config" / "sensor_dome_tf.yaml"
 OUT_URDF = HERE / "sensor_dome.urdf"
 
 
@@ -102,13 +100,38 @@ def main() -> int:
     if not transforms:
         sys.exit(f"ERROR: no 'static_transforms' entries in {TF_YAML}")
 
-    # Collect parents (should all be imu_link), children, and joints.
-    parents = {tf["frame_id"] for tf in transforms}
-    if parents != {"imu_link"}:
+    # Validate that every transform forms one tree rooted at imu_link.
+    # Camera optical frames are parented to their camera links, while the
+    # physical sensor frames remain direct imu_link children.
+    children = [tf["child_frame_id"] for tf in transforms]
+    duplicate_children = sorted({child for child in children if children.count(child) > 1})
+    if duplicate_children:
+        sys.exit(f"ERROR: duplicate child_frame_id entries: {duplicate_children}")
+
+    child_set = set(children)
+    parent_set = {tf["frame_id"] for tf in transforms}
+    unknown_parents = sorted(parent_set - child_set - {"imu_link"})
+    if unknown_parents:
         sys.exit(
-            f"ERROR: expected every static transform to be parented to "
-            f"imu_link; got {sorted(parents)}"
+            "ERROR: every non-root parent frame must also appear as a child "
+            f"frame; unknown parents: {unknown_parents}"
         )
+
+    children_by_parent = {}
+    for tf in transforms:
+        children_by_parent.setdefault(tf["frame_id"], []).append(tf["child_frame_id"])
+    reachable = set()
+    stack = ["imu_link"]
+    while stack:
+        parent = stack.pop()
+        for child in children_by_parent.get(parent, []):
+            if child in reachable:
+                continue
+            reachable.add(child)
+            stack.append(child)
+    disconnected = sorted(child_set - reachable)
+    if disconnected:
+        sys.exit(f"ERROR: transforms are not connected to imu_link: {disconnected}")
 
     # Build the URDF document.
     doc = minidom.Document()
@@ -128,22 +151,32 @@ def main() -> int:
         link.setAttribute("name", name)
         robot.appendChild(link)
 
-    add_link("imu_link")
+    links_added = set()
+
+    def add_link_once(name: str) -> None:
+        if name in links_added:
+            return
+        add_link(name)
+        links_added.add(name)
+
+    add_link_once("imu_link")
 
     for tf in transforms:
+        parent = tf["frame_id"]
         child = tf["child_frame_id"]
         t = tf["translation"]
         r = tf["rotation"]
         roll, pitch, yaw = quat_to_rpy(r["x"], r["y"], r["z"], r["w"])
 
-        add_link(child)
+        add_link_once(parent)
+        add_link_once(child)
 
         joint = doc.createElement("joint")
-        joint.setAttribute("name", f"imu_to_{child}")
+        joint.setAttribute("name", f"{parent}_to_{child}")
         joint.setAttribute("type", "fixed")
 
         parent_el = doc.createElement("parent")
-        parent_el.setAttribute("link", "imu_link")
+        parent_el.setAttribute("link", parent)
         joint.appendChild(parent_el)
 
         child_el = doc.createElement("child")

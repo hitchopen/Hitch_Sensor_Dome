@@ -42,6 +42,7 @@
 #   chmod +x 4_setup_lidar_ptp.sh
 #   ./4_setup_lidar_ptp.sh                              # use YAML defaults
 #   ./4_setup_lidar_ptp.sh [--eth IFACE] [--ips IP1,IP2,IP3]
+#   ./4_setup_lidar_ptp.sh --ros-distro humble
 #
 # Examples:
 #   ./4_setup_lidar_ptp.sh
@@ -59,7 +60,7 @@ source "$SCRIPT_DIR/../config/load_network_config.sh"
 # ─── Configuration (env > CLI > YAML defaults) ───────────────
 ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
 LIDAR_IPS_STR="${LIDAR_IPS_STR:-$NETCFG_LIDAR_IPS}"
-ROS_DISTRO="jazzy"
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 WS_DIR="$HOME/ros2_ws"
 
 # ─── Parse arguments ─────────────────────────────────────────
@@ -69,6 +70,8 @@ while [[ $# -gt 0 ]]; do
         --eth=*)  ETH_IFACE="${1#*=}"; shift ;;
         --ips)    LIDAR_IPS_STR="$2"; shift 2 ;;
         --ips=*)  LIDAR_IPS_STR="${1#*=}"; shift ;;
+        --ros-distro)   ROS_DISTRO="$2"; shift 2 ;;
+        --ros-distro=*) ROS_DISTRO="${1#*=}"; shift ;;
         *)        echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -80,9 +83,38 @@ info()  { echo -e "\n\033[1;34m[INFO]\033[0m $*"; }
 warn()  { echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
+validate_ros_distro() {
+    case "$ROS_DISTRO" in
+        humble|jazzy) ;;
+        *) fail "Unsupported ROS_DISTRO='$ROS_DISTRO'. Use 'humble' or 'jazzy'." ;;
+    esac
+}
+source_ros_setup() {
+    [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ] || \
+        fail "ROS 2 $ROS_DISTRO not found at /opt/ros/${ROS_DISTRO}/setup.bash"
+    set +u
+    # shellcheck disable=SC1091
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"
+    local rc=$?
+    set -u
+    return "$rc"
+}
+source_optional_setup() {
+    set +u
+    set +e
+    # shellcheck disable=SC1090
+    source "$1" 2>/dev/null
+    local rc=$?
+    set -e
+    set -u
+    return "$rc"
+}
+
+validate_ros_distro
 
 # =============================================================
 info "Section 4: PTP sync — PC to LiDARs"
+info "  ROS distro: $ROS_DISTRO"
 info "  Ethernet: $ETH_IFACE"
 info "  LiDAR IPs: ${LIDAR_IPS[*]}"
 echo ""
@@ -156,7 +188,7 @@ fi
 
 # ─── 4. Build Seyond ROS 2 driver ───────────────────────────
 info "Installing Seyond Robin W ROS 2 driver..."
-source /opt/ros/${ROS_DISTRO}/setup.bash
+source_ros_setup
 mkdir -p "$WS_DIR/src"
 cd "$WS_DIR/src"
 
@@ -168,7 +200,7 @@ cd seyond_ros_driver
 git submodule update --init --recursive
 
 info "Building Seyond driver (this may take a few minutes)..."
-source /opt/ros/${ROS_DISTRO}/setup.bash
+source_ros_setup
 ./build.bash
 
 # Add to .bashrc
@@ -179,7 +211,7 @@ ok "Seyond ROS 2 driver installed."
 
 # ─── 5. Verify ───────────────────────────────────────────────
 info "Verifying installation..."
-source "$WS_DIR/src/seyond_ros_driver/install/setup.bash" 2>/dev/null || true
+source_optional_setup "$WS_DIR/src/seyond_ros_driver/install/setup.bash" || true
 
 if ros2 pkg list 2>/dev/null | grep -q "seyond"; then
     ok "seyond ROS 2 package found"
@@ -189,8 +221,8 @@ fi
 
 # Check PTP slave status
 info "Checking PTP slave status (LiDARs should appear as slaves)..."
-sudo pmc -u -b 0 'GET PORT_DATA_SET' 2>/dev/null || \
-    warn "Could not query PTP — run: sudo pmc -u -b 0 'GET PORT_DATA_SET'"
+sudo pmc -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || \
+    warn "Could not query PTP peers — run: sudo pmc -u -b 1 'GET PORT_DATA_SET'"
 
 # =============================================================
 # 6. Self-Test: Verify Robin W PTP Sync Quality
@@ -206,10 +238,10 @@ verify_lidar_sync() {
     info "Test 1/6: PTP grandmaster status"
     if systemctl is-active --quiet ptp4l-grandmaster 2>/dev/null; then
         ok "  ptp4l-grandmaster is running"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: ptp4l-grandmaster not running"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
 
     # ── Test 2: LiDAR network reachability ──
@@ -218,16 +250,16 @@ verify_lidar_sync() {
     for ip in "${LIDAR_IPS[@]}"; do
         if ping -c1 -W2 "$ip" &>/dev/null; then
             ok "  Robin W @ $ip reachable"
-            ((LIVE_COUNT++))
+            LIVE_COUNT=$((LIVE_COUNT+1))
         else
             warn "  Robin W @ $ip not reachable"
         fi
     done
     if [ $LIVE_COUNT -gt 0 ]; then
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: No LiDARs reachable"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
     info "  $LIVE_COUNT / ${#LIDAR_IPS[@]} LiDARs online"
 
@@ -239,34 +271,34 @@ verify_lidar_sync() {
             PTP_STATUS=$($UTIL "$ip" get_config time ptp_en 2>/dev/null || echo "unknown")
             if echo "$PTP_STATUS" | grep -q "1"; then
                 ok "  Robin W @ $ip: PTP enabled"
-                ((PASS++))
+                PASS=$((PASS+1))
             else
                 warn "  Robin W @ $ip: PTP status = $PTP_STATUS"
-                ((WARN_COUNT++))
+                WARN_COUNT=$((WARN_COUNT+1))
             fi
         done
     else
         warn "  innovusion_lidar_util not available — cannot query PTP status directly"
         warn "  Check via web UI: http://<lidar_ip>"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Test 4: PTP slave detection ──
     info "Test 4/6: PTP slave devices on network"
-    PTP_PORTS=$(sudo pmc -u -b 0 'GET PORT_DATA_SET' 2>/dev/null || true)
+    PTP_PORTS=$(sudo pmc -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || true)
     if [ -n "$PTP_PORTS" ]; then
         SLAVE_COUNT=$(echo "$PTP_PORTS" | grep -c "SLAVE" || true)
         if [ "$SLAVE_COUNT" -gt 0 ]; then
             ok "  $SLAVE_COUNT PTP slave(s) detected"
-            ((PASS++))
+            PASS=$((PASS+1))
         else
             warn "  No PTP slaves detected — LiDARs may still be syncing (wait 30–60 s)"
-            ((WARN_COUNT++))
+            WARN_COUNT=$((WARN_COUNT+1))
         fi
         echo "$PTP_PORTS" | grep -E "portIdentity|portState" | sed 's/^/    /'
     else
-        warn "  Could not query PTP — pmc command failed"
-        ((WARN_COUNT++))
+        warn "  Could not query PTP peers — slaves unverified"
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Test 5: ptp4l master offset (sync quality) ──
@@ -291,34 +323,34 @@ verify_lidar_sync() {
                 info "  Last $COUNT offsets: avg=${AVG} ns, max=${MAX_ABS} ns"
                 if [ $MAX_ABS -lt 1000 ]; then
                     ok "  PTP offset < 1 µs — excellent (hardware timestamping)"
-                    ((PASS++))
+                    PASS=$((PASS+1))
                 elif [ $MAX_ABS -lt 50000 ]; then
                     ok "  PTP offset < 50 µs — good (software timestamping)"
-                    ((PASS++))
+                    PASS=$((PASS+1))
                 else
                     warn "  PTP offset > 50 µs — sync may be settling"
-                    ((WARN_COUNT++))
+                    WARN_COUNT=$((WARN_COUNT+1))
                 fi
             fi
         else
             warn "  No master offset values in ptp4l log yet"
-            ((WARN_COUNT++))
+            WARN_COUNT=$((WARN_COUNT+1))
         fi
     else
         warn "  Could not read ptp4l journal"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Test 6: Seyond ROS 2 driver ──
     info "Test 6/6: Seyond ROS 2 driver"
-    source /opt/ros/${ROS_DISTRO}/setup.bash 2>/dev/null || true
-    source "$WS_DIR/src/seyond_ros_driver/install/setup.bash" 2>/dev/null || true
+    source_ros_setup || true
+    source_optional_setup "$WS_DIR/src/seyond_ros_driver/install/setup.bash" || true
     if ros2 pkg list 2>/dev/null | grep -q "seyond"; then
         ok "  seyond ROS 2 package found"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  seyond package not found — rebuild: cd ~/ros2_ws/src/seyond_ros_driver && ./build.bash"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     # ── Results ──

@@ -24,9 +24,9 @@
 #      down cleanly.
 #
 # Run:
-#   sudo python3 sensor_recorder.py                     # YAML defaults
-#   sudo python3 sensor_recorder.py --config my.yaml
-#   sudo python3 sensor_recorder.py --no-foxglove --headless
+#   python3 sensor_recorder.py                          # YAML defaults
+#   python3 sensor_recorder.py --config my.yaml
+#   python3 sensor_recorder.py --no-foxglove --headless
 #   python3 sensor_recorder.py --dry-run                # detect only
 #
 # =============================================================
@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import yaml
 except ImportError:  # pragma: no cover
-    sys.exit("ERROR: pyyaml is required. Install with: pip install pyyaml")
+    sys.exit("ERROR: pyyaml is required. Install with: sudo apt install python3-yaml")
 
 
 # ---------------------------------------------------------------------
@@ -150,7 +150,7 @@ class SensorDetector:
             return entry
         # Atlas Duo is Ethernet-only — probe the FusionEngine TCP port.
         # (Hardware has no BNC PPS pin and no USB serial output.)
-        host = c.get("tcp_host", "192.168.1.30")
+        host = c.get("tcp_ip", c.get("tcp_host", "192.168.1.30"))
         port = int(c.get("tcp_port", 30201))
         try:
             with socket.create_connection((host, port), timeout=2):
@@ -745,11 +745,11 @@ def start_drivers(cfg: Dict[str, Any], sensors: List[SensorEntry],
 
     # ---- static TF ----
     # Publishes every imu_link -> sensor_link transform from
-    # ../ROS2 config/sensor_dome_tf.yaml so Foxglove can superimpose
+    # ../config/sensor_dome_tf.yaml so Foxglove can superimpose
     # all three Robin W point clouds (each tagged with its own
     # frame_id) into the IMU frame in the 3D panel.
     here = Path(__file__).resolve().parent
-    tf_yaml = here.parent / "ROS2 config" / "sensor_dome_tf.yaml"
+    tf_yaml = here.parent / "config" / "sensor_dome_tf.yaml"
     launch_file = here / "launch" / "static_tf.launch.py"
     if "static_tf" in drivers:
         if not tf_yaml.exists():
@@ -793,12 +793,35 @@ def start_drivers(cfg: Dict[str, Any], sensors: List[SensorEntry],
                      stdout=open(log_dir / f"{s.name}.log", "wb"))
 
 
+def ros_package_available(package: str) -> bool:
+    if not shutil.which("ros2"):
+        return False
+    result = subprocess.run(
+        ["ros2", "pkg", "prefix", package],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def resolve_bag_storage(rec: Dict[str, Any]) -> str:
+    storage = rec.get("storage", "mcap")
+    if storage == "mcap" and shutil.which("ros2") and \
+            not ros_package_available("rosbag2_storage_mcap"):
+        warn("rosbag2_storage_mcap not found; falling back to sqlite3. "
+             "Install ros-$ROS_DISTRO-rosbag2-storage-mcap for MCAP output.")
+        return "sqlite3"
+    return storage
+
+
 def start_bag(cfg: Dict[str, Any], session_dir: Path, topics: List[str],
-              pm: ProcManager) -> Path:
+              pm: ProcManager) -> Tuple[Path, str]:
     rec = cfg.get("recording", {})
     bag_dir = session_dir / "rosbag2"
+    storage = resolve_bag_storage(rec)
     cmd = ["ros2", "bag", "record",
-           "-s", rec.get("storage", "mcap"),
+           "-s", storage,
            "-o", str(bag_dir)]
     cm = rec.get("compression_mode", "none")
     cf = rec.get("compression_format", "")
@@ -809,7 +832,7 @@ def start_bag(cfg: Dict[str, Any], session_dir: Path, topics: List[str],
     cmd += topics
     pm.spawn("rosbag2", cmd,
              stdout=open(session_dir / "rosbag2.log", "wb"))
-    return bag_dir
+    return bag_dir, storage
 
 
 def start_foxglove(cfg: Dict[str, Any], pm: ProcManager,
@@ -980,7 +1003,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     install_signal_handlers(pm)
 
     start_drivers(cfg, sensors, pm, log_dir)
-    bag_dir = start_bag(cfg, session_dir, topics, pm)
+    bag_dir, bag_storage = start_bag(cfg, session_dir, topics, pm)
     start_rate_monitor(cfg, topics, pm, session_dir)
     fx_port = start_foxglove(cfg, pm, session_dir)
 
@@ -988,7 +1011,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     meta = SessionInfo(
         started_utc=datetime.now(timezone.utc).isoformat(),
         output_dir=str(session_dir),
-        storage=cfg.get("recording", {}).get("storage", "mcap"),
+        storage=bag_storage,
         sensors=[asdict(s) for s in sensors],
         sync=[asdict(r) for r in sync_results],
         topics=topics,
@@ -1015,7 +1038,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         step("Tearing down")
         pm.stop_all()
         info(f"Session saved to: {session_dir}")
-        info(f"MCAP bag:         {bag_dir}")
+        info(f"Rosbag ({bag_storage}): {bag_dir}")
     return 0
 
 

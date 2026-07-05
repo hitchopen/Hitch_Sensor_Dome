@@ -8,7 +8,7 @@
 #
 #   1_install_packages.sh         (was §1 + §2 + §3 + §10 of this)
 #       apt prerequisites, RT scheduling permissions,
-#       kernel sysctl tuning, ROS 2 Jazzy install.
+#       kernel sysctl tuning, ROS 2 Humble/Jazzy install.
 #
 #   2_configure_host_network.sh   (was §4 of this)
 #       host NIC static IP, hardware-timestamping detection,
@@ -16,7 +16,7 @@
 #
 #   3_setup_ins_to_pc_sync.sh     (was §5–§9 + §11 of this)
 #       gpsd, chrony with PPS+NMEA, ptp4l grandmaster, phc2sys,
-#       fusion-engine-driver + Point One host tools.
+#       fusion_engine_driver + Point One host tools.
 #
 # Run them in order:
 #

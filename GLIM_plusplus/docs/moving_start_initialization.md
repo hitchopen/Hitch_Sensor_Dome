@@ -140,7 +140,7 @@ Configuration lives in [`../../config/sensor_dome_tf.yaml`](../../config/sensor_
 ```yaml
 - frame_id: "imu_link"
   child_frame_id: "gnss_antenna_primary_link"
-  translation: { x: 0.0, y: 0.0, z: 0.300 }     # SP1 above the magnetic stand
+  translation: { x: 0.0, y: 0.0, z: 0.273 }     # SP1 above the magnetic stand
   rotation:    { x: 0, y: 0, z: 0, w: 1 }
 
 - frame_id: "imu_link"

@@ -1,9 +1,9 @@
 # Sensor Recording System: Point One Nav Atlas Duo + Seyond Robin W LiDAR + RouteCAM Cameras
 
-Installation and configuration guide for a high-performance GNSS / IMU / LiDAR / camera data recording system running on Ubuntu 24.04 with ROS 2 Jazzy, optionally on a PREEMPT_RT real-time kernel.
+Installation and configuration guide for a high-performance GNSS / IMU / LiDAR / camera data recording system running on Ubuntu 22.04 with ROS 2 Humble or Ubuntu 24.04 with ROS 2 Jazzy, optionally on a PREEMPT_RT real-time kernel.
 
 **Target Hardware:**
-- Ubuntu 24.04 LTS workstation (tested on Lenovo ThinkPad P1 Gen 6, Intel i9-13900H)
+- Ubuntu 22.04 or 24.04 LTS workstation (tested on Lenovo ThinkPad P1 Gen 6, Intel i9-13900H)
 - Point One Nav Atlas Duo (GNSS / INS, Ethernet-only)
 - Up to 3× Seyond Robin W directional LiDARs
 - 4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision cameras (PoE, IEEE 1588 PTP, 2MP global shutter)
@@ -12,9 +12,9 @@ Installation and configuration guide for a high-performance GNSS / IMU / LiDAR /
 
 | # | Script | What it does |
 |---|--------|--------------|
-| 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt prerequisites, RT scheduling permissions, kernel tuning, ROS 2 Jazzy |
+| 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt prerequisites, RT scheduling permissions, kernel tuning, ROS 2 Humble/Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | Host NIC static IP, hardware-timestamping detection, RUTM50 reachability |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd (NMEA over TCP), chrony, ptp4l grandmaster, phc2sys, fusion-engine-driver (TCP) |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd (NMEA over TCP), chrony, ptp4l grandmaster, phc2sys, fusion_engine_driver (TCP) |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave enable + Seyond ROS 2 driver |
 | 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave enable + Aravis (Tier 2 only) |
 
@@ -26,11 +26,11 @@ A one-time per-LiDAR provisioning step lives in [`provision_robin_w_multiunit.sh
 
 ## Section 1: Install Ubuntu Real-Time Kernel and Other Packages
 
-This section installs everything the host needs that is *not* network or PTP configuration: apt prerequisites, real-time scheduling permissions, kernel `sysctl` tuning, and ROS 2 Jazzy.
+This section installs everything the host needs that is *not* network or PTP configuration: apt prerequisites, real-time scheduling permissions, kernel `sysctl` tuning, and ROS 2 Humble or Jazzy.
 
 ### 1.1 PREEMPT_RT kernel — needed only for hard real-time control
 
-**You do not need the RT kernel just to record sensor data.** For perception and localization data collection — the [`recording/`](../recording/) workflow that captures GNSS / IMU / LiDAR / camera into a Foxglove-native MCAP bag for offline mapping, perception training, or SLAM evaluation — the **stock Ubuntu 24.04 generic kernel is sufficient**. PTP timing on the generic kernel typically lands within 1–2× of the RT-kernel numbers in Section 3, which is well inside what every sensor in this dome can resolve.
+**You do not need the RT kernel just to record sensor data.** For perception and localization data collection — the [`recording/`](../recording/) workflow that captures GNSS / IMU / LiDAR / camera into a Foxglove-native MCAP bag for offline mapping, perception training, or SLAM evaluation — the **stock Ubuntu LTS generic kernel is sufficient**. PTP timing on the generic kernel typically lands within 1–2× of the RT-kernel numbers in Section 3, which is well inside what every sensor in this dome can resolve.
 
 The RT kernel matters when the host has to *act* on sensor data with bounded latency: closing a real-time control loop (steering, braking, manipulator servoing), running a deterministic safety monitor, or any scenario where a millisecond of scheduler jitter is unacceptable. If your application is "record now, process later," skip this subsection entirely.
 
@@ -63,14 +63,21 @@ uname -a
 ```bash
 chmod +x 1_install_packages.sh
 ./1_install_packages.sh
+
+# Humble host:
+./1_install_packages.sh --ros-distro humble
 ```
+
+The default is `ROS_DISTRO=jazzy`. Use `--ros-distro humble` or set
+`ROS_DISTRO=humble` before running scripts 1, 3, 4, and 5 on Ubuntu 22.04
+hosts. Use Jazzy on Ubuntu 24.04 hosts.
 
 What it installs:
 
 - **apt prerequisites:** `build-essential`, `cmake`, `git`, `linuxptp`, `chrony`, `gpsd`, `pps-tools`, `tcpdump`, `ethtool`, `libyaml-cpp-dev`, Python tooling.
 - **RT scheduling group + limits:** creates the `realtime` group, adds your user, writes `/etc/security/limits.d/99-realtime.conf` granting `rtprio 99` and `memlock unlimited` to that group. Whether or not you're on the RT kernel, these limits are required for the PTP daemons to run at real-time priority.
 - **Kernel `sysctl` tuning:** large UDP buffers (`net.core.rmem_max=32 MiB`) and `vm.swappiness=10` for the high-bandwidth LiDAR / camera streams.
-- **ROS 2 Jazzy:** desktop + dev tools + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools`. Sources `/opt/ros/jazzy/setup.bash` from `~/.bashrc`.
+- **ROS 2 Humble/Jazzy:** desktop + dev tools + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/default storage plugins. Sources `/opt/ros/$ROS_DISTRO/setup.bash` from `~/.bashrc`.
 - **`tcpdump` cap:** `cap_net_raw+ep` so the recorder can sniff sensor UDP without `sudo`.
 
 The script's self-test at the end verifies the RT kernel banner, group membership, the `sysctl` value, and the ROS 2 install.
@@ -131,8 +138,8 @@ The Atlas Duo is powered separately via its own DC barrel input either way.
 
 | Component | Tier 1 (RUTM50 only) | Tier 2 (Planet BC) | Sensor fusion OK? |
 |-----------|----------------------|--------------------|-------------------|
-| chrony GPS-disciplined `CLOCK_REALTIME` | < 100 ns | < 100 ns | yes (both) |
-| NIC PHC via `phc2sys` | < 200 ns | < 200 ns | yes (both) |
+| chrony GPS-disciplined `CLOCK_REALTIME` | ~10–100 ms (NMEA-only) | ~10–100 ms (NMEA-only) | yes for ROS messages that carry Atlas GPS time |
+| NIC PHC via `phc2sys` | < 1 µs when hardware timestamping is available | < 1 µs when hardware timestamping is available | yes; skipped in software timestamping mode |
 | Robin W LiDAR PTP slave | 5–50 µs | 300–800 ns | yes (both) |
 
 For LiDAR-IMU fusion, 5–50 µs is completely fine — Robin W frames are ~50–100 ms long at 10–20 FPS, so a few-µs cross-sensor offset is well under one frame period. The dramatic improvement on row 3 only matters when you need camera/LiDAR pixel-perfect alignment, which is exactly what Tier 2 brings.
@@ -165,8 +172,8 @@ Internet (5G cellular)
 │ Port    Type            Device                  IP      │
 │ ----    ------------    --------------------    ------ │
 │ 1       1 GbE           → RUTM50 LAN1           (uplink)
-│ 2       2.5 GbE PoE++   RouteCAM Front-Right    .20    │
-│ 3       2.5 GbE PoE++   RouteCAM Front-Left     .21    │
+│ 2       2.5 GbE PoE++   RouteCAM Front-Left     .20    │
+│ 3       2.5 GbE PoE++   RouteCAM Front-Right    .21    │
 │ 4       2.5 GbE PoE++   RouteCAM Rear-Left      .22    │
 │ 5       2.5 GbE PoE++   RouteCAM Rear-Right     .23    │
 │ 6       1 GbE  PoE++    Robin W Front           .10    │
@@ -308,7 +315,7 @@ The Point One Nav Atlas Duo serves NMEA over TCP to discipline the host's `CLOCK
 │  chrony ← SHM → CLOCK_REALTIME (~10–100 ms to GPS)│
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → PTP announce on Ethernet       │
-│  fusion-engine-driver: TCP 30201 → /pose /imu /…   │
+│  fusion_engine_driver: TCP 30201 → /pose /imu /…   │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -336,8 +343,8 @@ What it configures:
 - **chrony:** disciplines `CLOCK_REALTIME` from the gpsd SHM (NMEA only). NTP pools are kept as a holdover fallback. Expected steady-state accuracy ~10–100 ms.
 - **`ptp4l` grandmaster:** announces on the sensor NIC. Because the host clock is no longer disciplined to <100 ns GPS, the script defaults `clockClass` to **13** (application-specific, locked-to-internal-reference) instead of 6 (locked to primary GPS reference). Cross-sensor PTP sync remains tight; the change is just an honest advertisement to PTP slaves about the absolute-time pedigree.
 - **`phc2sys`:** copies `CLOCK_REALTIME` into the NIC PHC (only relevant for hardware timestamping).
-- **systemd:** enables and starts `gpsd`, `chrony`, `ptp4l-grandmaster`, `phc2sys-grandmaster`. The chain is live without a reboot.
-- **fusion-engine-driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch. Driver invocation uses `connection_type:=tcp` with the Atlas Duo IP (no longer `connection_type:=tty`).
+- **systemd:** enables and starts `gpsd`, `chrony`, and `ptp4l-grandmaster`; `phc2sys-grandmaster` is enabled only when the NIC supports hardware timestamping. The chain is live without a reboot.
+- **fusion_engine_driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch. Driver invocation uses `connection_type:=tcp` with the Atlas Duo IP (no longer `connection_type:=tty`).
 - **Point One host tools:** `p1-host-tools/` cloned to `$HOME`, `pip install fusion-engine-client[all]`.
 
 ### 3.2 Manual verification
@@ -376,7 +383,9 @@ sudo journalctl -u phc2sys-grandmaster -f
 # offset values should be < 1000 ns
 
 # Service status
-sudo systemctl status gpsd chrony ptp4l-grandmaster phc2sys-grandmaster
+sudo systemctl status gpsd chrony ptp4l-grandmaster
+# Hardware timestamping only:
+sudo systemctl status phc2sys-grandmaster
 ```
 
 ---
@@ -489,8 +498,8 @@ Interactive commands: `R` start recording, `S` stop, `H` health, `Q` quit.
 │   ├── robin_w_rear_left.pcap   # All timestamps PTP-synchronized
 │   └── robin_w_rear_right.pcap
 ├── camera_pcap/
-│   ├── cam_front_right.pcap     # GigE Vision raw packets (PTP-stamped)
-│   ├── cam_front_left.pcap
+│   ├── cam_front_left.pcap       # GigE Vision raw packets (PTP-stamped)
+│   ├── cam_front_right.pcap
 │   ├── cam_rear_left.pcap
 │   └── cam_rear_right.pcap
 ├── p1nav/
@@ -506,7 +515,7 @@ All sensors are PTP-synchronized, so timestamps share the same GPS time base and
 ```yaml
 point_one_nav:
   connection_type: "tcp"
-  tcp_host: "192.168.1.30"
+  tcp_ip: "192.168.1.30"
   tcp_port: 30201
 
 lidars:
@@ -531,9 +540,9 @@ If you prefer rosbag (higher CPU but simpler replay):
 
 ```bash
 # Terminal 1 — Point One Nav (FusionEngine over TCP)
-ros2 run fusion-engine-driver fusion_engine_ros_driver --ros-args \
+ros2 run fusion_engine_driver fusion_engine_ros_driver --ros-args \
     -p connection_type:=tcp \
-    -p tcp_host:=192.168.1.30 \
+    -p tcp_ip:=192.168.1.30 \
     -p tcp_port:=30201
 
 # Terminal 2 — Seyond Robin W
@@ -647,7 +656,7 @@ ros2 bag record -o $SESSION/replayed_rosbag \
 | Power | PoE (IEEE 802.3af) |
 | Time Sync | IEEE 1588 PTP via GigE Vision |
 | Protection | IP67 |
-| Dome layout | Front stereo pair (104 mm baseline) + rear symmetric pair |
+| Dome layout | Front stereo pair (110 mm baseline) + rear symmetric pair |
 
 ### C. NVIDIA GPU and RT kernel compatibility
 

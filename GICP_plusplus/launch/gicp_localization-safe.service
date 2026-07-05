@@ -16,7 +16,8 @@
 # How to install
 # --------------
 #   1. Edit User= below to match your account.
-#   2. Edit WorkingDirectory + ExecStart to your colcon workspace.
+#   2. Edit ROS_DISTRO, WorkingDirectory, and ExecStart to your ROS 2
+#      distro/colcon workspace.
 #   3. Install:
 #        sudo cp gicp_localization-safe.service /etc/systemd/system/
 #        sudo systemctl daemon-reload
@@ -46,10 +47,12 @@ Type=simple
 User=hitch
 Group=hitch
 WorkingDirectory=/home/hitch/ros2_ws
+Environment=ROS_DISTRO=jazzy
 
 # Source ROS 2 + the colcon workspace, then launch with mode:=safe.
 # The launch file picks up cfg/localization_safe.yaml automatically.
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && \
+# Set ROS_DISTRO=humble on Ubuntu 22.04 / Humble hosts.
+ExecStart=/bin/bash -c 'source /opt/ros/${ROS_DISTRO}/setup.bash && \
                        source /home/hitch/ros2_ws/install/setup.bash && \
                        exec ros2 launch gicp_localization \
                             localization_with_tf.launch.py \

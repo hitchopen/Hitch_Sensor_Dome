@@ -18,22 +18,23 @@ This document is a **complete change log** between GLIM++ and the upstream `koid
 10. [Documentation added](#10-documentation-added)
 11. [What was NOT changed](#11-what-was-not-changed)
 12. [File-by-file diff summary](#12-file-by-file-diff-summary)
+13. [2026-07 P1–P5 improvements — merge evidence, yaw-quality gate, GNSS backfill](#13-2026-07-p1p5-improvements)
 
 ## 1. Sensor adaptation for Hitch Sensor Dome
 
-Topic, frame, and field names throughout the configs are switched from the previous AV-24 deployment (Luminar Iris + custom IMU) to the Hitch Sensor Dome reference setup (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM).
+Topic, frame, and field names throughout the configs target the Hitch Sensor Dome reference setup (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM).
 
-| Surface | Was | Now |
-|---------|-----|-----|
-| IMU topic | `/gps_bot/imu` | `/imu/data` |
-| Primary lidar | `/luminar_front/points` | `/robin_w_front/points` |
-| Aux lidars | `/luminar_left/points`, `/luminar_right/points` | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
-| GNSS | `/gps_nav/odom` | `/gps/fix` (NavSatFix gate signal) |
-| Camera | `/cam_front_left/image_raw` | (same — naming preserved) |
-| `intensity_field` | `reflectance` (Luminar) | `intensity` (Robin W default) |
-| `ring_field` | `line_index` (Luminar) | `ring` (Robin W default) |
-| `flip_points_y` | `true` (Luminar SAE Y-right) | `false` (Robin W in `coordinate_mode:=3` already emits REP-103 axes) |
-| LiDAR–IMU extrinsic source | hand-edited 7-element TUM array | URDF generated from [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) — see §8 |
+| Surface | Hitch Sensor Dome setting |
+|---------|---------------------------|
+| IMU topic | `/imu/data` (fusion_engine_driver, Atlas Duo) |
+| Primary lidar | `/robin_w_front/points` |
+| Aux lidars | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
+| GNSS | `/gps/fix` (NavSatFix gate signal) + `/pose` (INS PoseStamped) |
+| Camera | `/cam_front_left/image_raw` |
+| `intensity_field` | `intensity` (Robin W default) |
+| `ring_field` | `ring` (Robin W default) |
+| `flip_points_y` | `false` (Robin W in `coordinate_mode:=3` already emits REP-103 axes) |
+| LiDAR–IMU extrinsic source | URDF generated from [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) — see §8 |
 
 Files touched: `glim/config/config_sensors.json`, `glim/config/config_ros.json`.
 
@@ -67,7 +68,7 @@ In [`glim/config/config_ros.json`](glim/config/config_ros.json):
 
 Pinning `base_frame_id` to `imu_link` makes GLIM build the global map relative to the Atlas Duo Center of Navigation rather than to a vehicle-specific `base_link`. Each downstream vehicle integrator publishes its own static `imu_link → base_link` transform — the recorded map is then portable across platforms without re-running SLAM.
 
-This is a deliberate departure from upstream GLIM's behaviour, which left `base_frame_id` blank and inherited the IMU frame's name (which on the AV-24 was `gps_bot`, vehicle-specific).
+This is a deliberate departure from upstream GLIM's behaviour, which left `base_frame_id` blank and inherited the IMU frame's name (a vehicle-specific, driver-chosen string).
 
 ## 3. Outdoor / vehicle-scale tuning
 
@@ -201,11 +202,11 @@ Files touched: [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/gl
 
 Upstream `gnss_global` adds **translation-only** prior factors (`PoseTranslationPrior`) — the GNSS quaternion is ignored even when the source publishes one. This is correct for single-antenna setups (where the quaternion is gyro-integrated and drifts) but throws away real information from dual-antenna RTK heading.
 
-GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp) so the module can also emit a `PoseRotationPrior` factor on each submap, pulling its yaw toward the heading carried in the incoming `PoseWithCovarianceStamped` / `Odometry` quaternion. The change is opt-in via two new JSON keys; default is **ON** because the Hitch Sensor Dome ships as a dual-antenna RTK platform.
+GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp) so the module can also emit a `PoseRotationPrior` factor on each submap, pulling its yaw toward the heading carried in the incoming `PoseWithCovarianceStamped` / `Odometry` quaternion. The change is opt-in via two JSON keys; the checked-in default is **OFF** because `sensor_dome_tf.yaml` ships with the single-antenna sentinel for the secondary antenna.
 
 | Config key (`glim_ext/config/config_gnss_global.json`) | Default | Meaning |
 |---|---|---|
-| `enable_orientation_prior` | `true` | Emit a `PoseRotationPrior` factor each submap when the interpolated GNSS sample carries a valid quaternion. |
+| `enable_orientation_prior` | `false` | Emit a `PoseRotationPrior` factor each submap when dual-antenna heading is configured and the interpolated GNSS sample carries a valid quaternion. |
 | `orientation_prior_inf_scale` | `[1e-6, 1e-6, 1e2]` | Information matrix diagonal in `(roll, pitch, yaw)`. Only yaw is meaningfully constrained; roll/pitch get a tiny ε to keep the noise model strictly positive-definite. |
 
 **Algorithmic changes inside the module.**
@@ -217,7 +218,7 @@ GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_glob
 - When `enable_orientation_prior && latest.has_orientation`, after the existing translation prior, the module composes `R_world_imu = R_world_utm · R_utm_imu` and inserts `gtsam::PoseRotationPrior<gtsam::Pose3>` with the configured information matrix.
 - `T_world_utm` is still initialized from position alone (SVD of the planar centered covariance) — orientation does not help us solve for the unknown UTM-to-world rotation; we use it only after the alignment is locked.
 
-**Dual-antenna gating end-to-end.** The factor is harmless on a single antenna only if the operator turns it off, because the wrapper's RTK-gated bridge happily forwards whatever quaternion the INS publishes. The Hitch Sensor Dome therefore enforces dual-antenna intent at three independent points (see `README.md` "Three-layered defense"): the Atlas firmware (operator setup), the launch-time consistency check (mismatch between `sensor_dome_tf.yaml` and `enable_orientation_prior`), and the runtime yaw-σ sanity check inside `try_publish_gnss_factor`. The third one is the only check that can catch a misconfigured Atlas firmware.
+**Dual-antenna gating end-to-end.** The factor is only safe after a secondary antenna is installed and the Atlas is configured for dual-antenna heading. The Hitch Sensor Dome therefore enforces dual-antenna intent at three independent points (see `README.md` "Three-layered defense"): the Atlas firmware (operator setup), the launch-time consistency check (mismatch between `sensor_dome_tf.yaml` and `enable_orientation_prior`), and the runtime yaw-σ sanity check inside `try_publish_gnss_factor`. The third one is the only check that can catch a misconfigured Atlas firmware.
 
 **Why no lever-arm compensation here.** A related branch of work in the broader GLIM ecosystem pairs the orientation prior with antenna-to-IMU lever-arm compensation (`urdf_gnss_frame`-style). GLIM++ intentionally **does not** apply that compensation, because the Atlas Duo is a tightly-coupled GNSS+INS that already resolves antenna observations to the IMU origin in firmware and publishes `/pose` there. Adding a second lever-arm correction would double-compensate. The prerequisite is that the Atlas firmware's `gnss_lever_arm_primary` / `gnss_lever_arm_secondary` are programmed to match the dome's `sensor_dome_tf.yaml`; see the root README's "GLIM++ GNSS antenna lever-arm compensation" callout. If a future deployment swaps the Atlas Duo for a non-tightly-coupled GNSS, lever-arm compensation must be re-introduced inside the `try_publish_gnss_factor` bridge before publishing to `libgnss_global.so`.
 
@@ -283,6 +284,68 @@ Important — so adopters know what stayed identical to upstream and can rely on
 | `docs/moving_start_initialization.md` | new | §9 |
 | `docs/multi_lap_loop_closure.md` | new | §9 |
 | All other upstream files | unchanged | §10 |
+
+
+## 13. 2026-07 P1–P5 improvements
+
+Added 2026-07-05 (the P1–P5 turn-error campaign, plus review fixes); every
+dome adaptation above (Robin W sensors, INS-driven init, RTK gating,
+dual-antenna yaw prior, multi-lap loop tuning) is preserved.
+
+**lidar_concat extracted + hardened** (`glim_ros2/include/glim_ros/lidar_concat.hpp`,
+replacing the in-file copy in `glim_rosbag.cpp`):
+
+- Full PointCloud2 **schema-equality gate** before byte-appending an aux scan
+  (name/offset/datatype/count + point_step + endianness) plus tight-cloud
+  guards — a malformed aux is rejected BEFORE it is appended (all guards are
+  pre-append; nothing is rolled back after the fact).
+- **Strict merge guard** (`require_all_aux` / `abort_on_merge_failure` /
+  `max_consecutive_aux_merge_failures`, config-exposed, GICP++-parity): an
+  incomplete *required* merge skips the scan instead of silently mapping on
+  fewer LiDARs.
+- **Per-frame merge evidence** (`frame_diag_log: true`): one parseable
+  `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… span=…s total_pts=…`
+  INFO line per primary scan, plus per-aux signed header-offset stats every
+  512 merges warning at |mean| > 20 ms — with three PTP-synced Robin W this
+  should never fire; if it does, the sync (PTP_sync/) is broken.
+- Robin W note: FLOAT32 scan-relative per-point times are rebased by the
+  inter-scan dt on merge; the absolute-epoch (uint64 ns) pass-through branch
+  is inert here.
+
+**GNSS global module** (extends §7/§8):
+
+- **Backfill fix**: prior factors are emitted for *every* associated submap
+  (cursor-based), not just the newest — the pre-`T_world_utm` backlog and
+  multi-submap offline batches were silently dropping factors.
+- **`needs_wait()` drain contract** so `save()` cannot serialize the graph
+  while bracketing GNSS factors are still in flight (bag-EOF race).
+- **P5 yaw-quality gate** (`orientation_prior_max_yaw_sigma_deg: 3.0`) on the
+  §8 dual-antenna heading prior: a position-FIXED sample whose reported yaw
+  sigma (√`pose.covariance[35]`) is degraded skips the heading factor
+  (position prior still applied; skips logged). Interpolated samples carry
+  the conservative max of the bracketing variances. Healthy dual-antenna
+  heading is 0.1–0.3° sigma at a ≥1 m baseline. Publishers that leave the
+  covariance unpopulated keep the old behavior.
+- Hitch defaults now match the checked-in single-antenna sentinel:
+  `enable_orientation_prior: false`. Set it true only when the secondary
+  antenna translation is configured; yaw weighting remains
+  `[1e-6, 1e-6, 1e2]`.
+
+**Offline pipeline**: epoch-anchored multi-LiDAR rebase plumbing
+(`points_callback(msg, epoch_anchor_count)`) — a no-op for Robin W's
+scan-relative times, kept for parity with GICP++'s concat. GLIM maps
+OFFLINE by default (`glim_ros/enable_online_mapping: false`):
+`glim_rosbag` feeds `/pose` + `/gps/fix` from the bag into the same INS
+init gate and RTK-gated GNSS factor bridge the live path uses, so offline
+mapping needs no extra nodes. Flip the flag deliberately if you map live.
+
+**Dense localization-map profile — NOT enabled here.** A denser
+preprocess/submap profile exists as an option, but the Robin W density/CPU
+budget is unvalidated, so `config.json` keeps the platform defaults with a
+commented pointer. Derive dense variants from this platform's configs,
+rebuild a map, then **re-baseline the GICP++ fitness floor** with
+`GICP_plusplus/scripts/analyze_scan_debug_log.py` before tuning any GICP++
+ratio thresholds.
 
 ## Quick start
 

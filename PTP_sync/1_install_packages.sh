@@ -8,7 +8,7 @@
 #   - apt prerequisites (linuxptp, chrony, gpsd, build tooling)
 #   - real-time scheduling group + limits
 #   - kernel sysctl tuning for high-bandwidth sensor UDP
-#   - ROS 2 Jazzy desktop + dev tools
+#   - ROS 2 Humble or Jazzy desktop + dev tools
 #   - GCC 14 <cstdint> patch helper (sourced by §3 and §4 scripts)
 #
 # Network configuration and the PTP grandmaster chain are
@@ -29,6 +29,8 @@
 # Usage:
 #   chmod +x 1_install_packages.sh
 #   ./1_install_packages.sh
+#   ./1_install_packages.sh --ros-distro humble
+#   ROS_DISTRO=jazzy ./1_install_packages.sh
 # =============================================================
 
 set -euo pipefail
@@ -39,11 +41,34 @@ warn()  { echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 fail()  { echo -e "\033[1;31m[FAIL]\033[0m $*"; exit 1; }
 
-ROS_DISTRO="jazzy"
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ros-distro)   ROS_DISTRO="$2"; shift 2 ;;
+        --ros-distro=*) ROS_DISTRO="${1#*=}"; shift ;;
+        *)              echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+case "$ROS_DISTRO" in
+    humble|jazzy) ;;
+    *) fail "Unsupported ROS_DISTRO='$ROS_DISTRO'. Use 'humble' or 'jazzy'." ;;
+esac
+
+UBUNTU_CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-}")"
+[ -n "$UBUNTU_CODENAME" ] || fail "Could not detect Ubuntu codename from /etc/os-release."
 
 # =============================================================
 info "Section 1: Install RT kernel + system packages"
+info "  ROS distro: $ROS_DISTRO"
 echo ""
+
+if [ "$ROS_DISTRO" = "humble" ] && [ "$UBUNTU_CODENAME" != "jammy" ]; then
+    warn "ROS 2 Humble apt packages are Tier-1 on Ubuntu 22.04 Jammy; this host is '$UBUNTU_CODENAME'."
+elif [ "$ROS_DISTRO" = "jazzy" ] && [ "$UBUNTU_CODENAME" != "noble" ]; then
+    warn "ROS 2 Jazzy apt packages are Tier-1 on Ubuntu 24.04 Noble; this host is '$UBUNTU_CODENAME'."
+fi
 
 # ─── Detect RT kernel ───────────────────────────────────────
 if uname -r | grep -qi "realtime\|preempt_rt"; then
@@ -63,10 +88,11 @@ info "Installing apt prerequisites..."
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y \
     build-essential cmake git curl wget \
-    python3 python3-pip python3-venv python3-dev python-is-python3 \
+    python3 python3-pip python3-venv python3-dev python3-yaml python-is-python3 \
     net-tools ethtool linuxptp chrony \
     gpsd gpsd-clients pps-tools \
     libyaml-cpp-dev \
+    netcat-openbsd \
     tcpdump
 ok "Apt prerequisites installed."
 
@@ -98,7 +124,7 @@ EOF
 sudo sysctl --system > /dev/null
 ok "Kernel parameters applied."
 
-# ─── 4. ROS 2 Jazzy ─────────────────────────────────────────
+# ─── 4. ROS 2 Humble / Jazzy ────────────────────────────────
 info "Installing ROS 2 $ROS_DISTRO..."
 
 sudo apt install -y locales
@@ -111,13 +137,15 @@ sudo add-apt-repository -y universe
 sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
     -o /usr/share/keyrings/ros-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-    http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | \
+    http://packages.ros.org/ros2/ubuntu $UBUNTU_CODENAME main" | \
     sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
 sudo apt update
 sudo apt install -y ros-${ROS_DISTRO}-desktop ros-dev-tools \
     ros-${ROS_DISTRO}-rviz2 ros-${ROS_DISTRO}-foxglove-bridge \
-    ros-${ROS_DISTRO}-pcl-ros ros-${ROS_DISTRO}-tf2-tools
+    ros-${ROS_DISTRO}-pcl-ros ros-${ROS_DISTRO}-tf2-tools \
+    ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+    ros-${ROS_DISTRO}-rosbag2-storage-default-plugins
 
 # Source ROS in .bashrc
 grep -q "source /opt/ros/${ROS_DISTRO}/setup.bash" "$HOME/.bashrc" 2>/dev/null || \
@@ -140,44 +168,44 @@ verify_install() {
     info "Test 1/4: PREEMPT_RT kernel"
     if uname -r | grep -qi "realtime\|preempt_rt"; then
         ok "  PREEMPT_RT kernel active: $(uname -r)"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  Standard kernel: $(uname -r) — fine for recording"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     info "Test 2/4: RT scheduling permissions"
     if id -nG "$USER" | grep -qw realtime; then
         ok "  User '$USER' is in 'realtime' group"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  User '$USER' not in 'realtime' group yet — log out / log in to activate"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
     if [ -f /etc/security/limits.d/99-realtime.conf ]; then
         ok "  RT limits file present"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         echo "  FAIL: /etc/security/limits.d/99-realtime.conf missing"
-        ((FAIL++))
+        FAIL=$((FAIL+1))
     fi
 
     info "Test 3/4: Kernel sysctl tuning"
     if [ "$(sysctl -n net.core.rmem_max 2>/dev/null)" = "33554432" ]; then
         ok "  net.core.rmem_max = 33554432"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  net.core.rmem_max not at expected value — reapply with: sudo sysctl --system"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     info "Test 4/4: ROS 2 $ROS_DISTRO"
     if command -v ros2 &>/dev/null || [ -d "/opt/ros/$ROS_DISTRO" ]; then
         ok "  ROS 2 $ROS_DISTRO present at /opt/ros/$ROS_DISTRO"
-        ((PASS++))
+        PASS=$((PASS+1))
     else
         warn "  ros2 not found — open a new shell or source /opt/ros/$ROS_DISTRO/setup.bash"
-        ((WARN_COUNT++))
+        WARN_COUNT=$((WARN_COUNT+1))
     fi
 
     echo ""
