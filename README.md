@@ -107,10 +107,11 @@ recording/           Run-time data recording + Foxglove dashboard
 GLIM_plusplus/                LiDAR-Inertial mapping (fork of koide3/glim)
   config/                 sensor_dome.urdf + URDF generator
   launch/                 hitch_sensor_dome.launch.py
-  docs/                   Multi-lap loop-closure debugging guide
+  scripts/                init-pose helpers, mapping-profile generator, PCD export
+  docs/                   Loop-closure guide, merge record, TF verification
   glim/                   Upstream GLIM core (with project tuning)
   glim_ext/               Upstream extensions (GNSS prior re-enabled)
-  glim_ros2/              Upstream ROS 2 wrapper (unmodified)
+  glim_ros2/              ROS 2 wrapper (multi-LiDAR concat, INS/GNSS bag feed)
   README.md               Fork notice, integration, multi-lap fix
 
 GICP_plusplus/                LiDAR-only localization (fork of vectr-ucla/DLIO)
@@ -168,11 +169,115 @@ README's "2026-07 P1–P5 improvements" section:
   notably populates `twist.angular` on INS odometry, which GICP++'s snap
   recovery uses for rate continuity.
 
-**Robin W (Seyond) per-point timestamps are unchanged**: Robin W in
-`coordinate_mode:=3` emits FLOAT32 seconds-since-sweep-start (consumed
-via GICP++'s `velodyne` decoder and GLIM's autoconf). The absolute-epoch
-(uint64 nanosecond) decoder machinery that ships alongside it is inert on
-this platform. The fitness-ratio thresholds, `hessianCondMax`, and the
+### 2026-07-27 GLIM++ upstream re-merge
+
+`GLIM_plusplus/` was re-synced against upstream `augcog/DLIO_plusplus`
+(`ucb-roar`) plus its open PR #15, keeping **P1 as the GNSS source and
+Robin W as the LiDAR** — only algorithm hardening was taken, not upstream's
+different GNSS topic contract. Headlines (full list in
+[`GLIM_plusplus/README.md` §14](GLIM_plusplus/README.md#14-2026-07-27-upstream-re-merge),
+merge record in
+[`GLIM_plusplus/docs/upstream_merge_2026-07-27.md`](GLIM_plusplus/docs/upstream_merge_2026-07-27.md)):
+
+- **Multi-LiDAR sweep matching no longer trusts header time.** Where an
+  absolute per-point time axis exists, aux sweeps are selected by point-time
+  endpoint agreement and the offline reader plans every merge in a
+  deterministic two-pass join; otherwise it holds each primary until every
+  aux header passes it, fixing the "always merge the *previous* side sweep"
+  bias. See the timestamp-encoding note above for which path is active.
+- **GNSS anchoring safety**: submaps bracketing an RTK dropout are left
+  un-anchored instead of chord-interpolated; the one-shot world/GNSS fit has
+  RMS and both-sides-baseline gates; an optional rolling anchor-divergence
+  gate can abort a run rather than write a quietly-misanchored map; and a
+  machine-parseable `gnss_global summary:` line reports delivered-vs-emitted
+  factors and anchor coverage (gate map acceptance on that, not exit code).
+- **Timestamp integrity**: IMU/LiDAR epoch resets (bag loop, power-cycle) are
+  detected and reported loudly instead of silently mixing epochs.
+- Online mapping combined with multi-LiDAR concat is now refused at startup —
+  no operational change here, since this platform already maps offline.
+- New: unit tests for per-point time decoding, a high-quality mapping-profile
+  generator, and a PCD exporter under `GLIM_plusplus/scripts/`.
+
+The dome's P1 and Robin W extrinsics were re-verified against the 3D design
+files after the merge —
+[`GLIM_plusplus/docs/tf_verification_2026-07-27.md`](GLIM_plusplus/docs/tf_verification_2026-07-27.md).
+
+### LiDAR per-point timestamp standard
+
+The following `sensor_msgs/PointCloud2` layouts are the **canonical ingestion
+contract for this repository**. Field name, ROS datatype, unit, and origin are
+all part of the contract; datatype alone is not enough to infer the time axis.
+
+| Vendor / profile | Field | ROS datatype | Stored unit | Time origin |
+|---|---|---:|---|---|
+| Ouster | `t` | `UINT32` | nanoseconds | start of sweep |
+| Velodyne | `time` | `FLOAT32` | seconds | start of sweep |
+| Hesai | `timestamp` | `FLOAT64` | seconds | Unix epoch (absolute) |
+| Livox | `timestamp` | `FLOAT64` | numeric nanoseconds, multiplied by `1e-9` to obtain seconds | Unix epoch (absolute) |
+| Seyond Robin W (ROS 2, `coordinate_mode:=3`) | `timestamp` | `FLOAT64` | seconds | Unix epoch (absolute) |
+
+#### Seyond raw payload vs ROS 2
+
+The two layers must not be conflated:
+
+- **Raw SDK/packet layer:** each point carries a compact offset from its
+  packet/frame time origin. Vendor material may describe this logically as a
+  relative `FLOAT32`; in the pinned driver source the concrete carrier is
+  `ts_10us`, in 10 microsecond ticks. It is not an absolute epoch value.
+- **Hydrated ROS 2 layer:** the driver publishes PCL `double timestamp`, which
+  becomes `sensor_msgs/PointCloud2` field
+  `timestamp/FLOAT64/count=1`, in absolute Unix seconds.
+
+The reviewed driver computes:
+
+```text
+T_packet_start = packet.common.ts_start_us * 1e-6
+delta_t_point  = point.ts_10us * 1e-5
+T_point        = T_packet_start + delta_t_point
+```
+
+This is source-verified at pinned Seyond commit
+[`18c5c936`](https://github.com/Seyond-Inc/seyond_ros_driver/tree/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf):
+[`driver_lidar.cc`](https://github.com/Seyond-Inc/seyond_ros_driver/blob/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf/src/seyond_lidar_ros/src/driver/driver_lidar.cc#L558-L604)
+performs the reconstruction and
+[`point_types.h`](https://github.com/Seyond-Inc/seyond_ros_driver/blob/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf/src/seyond_lidar_ros/src/driver/point_types.h#L35-L52)
+registers `timestamp` as `double`.
+
+Equivalently, when the packet offset within the frame is included in
+`delta_t_point_from_frame`,
+`T_point = T_frame_start + delta_t_point_from_frame`. The cloud
+`header.stamp` is `frame_start_ts_us * 1000` nanoseconds. PTP supplies the
+shared Unix timebase; `coordinate_mode:=3` changes point axes to REP-103 and
+does not change timestamp representation. Never cast an absolute Unix
+timestamp to `FLOAT32`, because that destroys sub-second deskew precision.
+
+GLIM uses `perpoint_relative_time=false`, scale `1.0`, and normalizes the
+absolute values to offsets from the first point for deskew. GICP++ uses its
+explicit `seyond` path and deskews directly on the same absolute values.
+During three-LiDAR concatenation, absolute point timestamps are **not**
+shifted by `aux_header_stamp - primary_header_stamp`; they already identify
+capture time on the shared PTP axis. `float64_time_is_epoch_ns` remains
+`false` because Robin W publishes numeric IEEE-754 seconds, not raw uint64
+nanosecond bits.
+
+[`PTP_sync/4_setup_lidar_ptp.sh`](PTP_sync/4_setup_lidar_ptp.sh) pins the
+reviewed Seyond commit, removes the repository's obsolete relative-time
+override from existing installations, and verifies the source formula and
+PCL registration before building. GLIM also rejects a Robin W cloud unless
+the field schema and absolute axis match this contract.
+Verify a driver or bag before mapping:
+
+```bash
+ros2 topic echo --once --field fields /robin_w_front/points
+# PointField datatype 8 is FLOAT64; expect: name=timestamp, datatype=8, count=1.
+```
+
+The generic GLIM converter retains support for Hesai absolute seconds, Livox
+numeric epoch nanoseconds, relative-time LiDARs, and explicit
+raw-epoch-nanosecond carriers, but those compatibility paths do not redefine
+the Robin W contract above.
+
+The fitness-ratio thresholds, `hessianCondMax`, and the
 dense-map profile were calibrated on earlier datasets from a different
 vehicle and still need a Robin W replay + scorecard pass before tuning —
 see the package READMEs.
@@ -183,7 +288,7 @@ Once the dome is built and the sensors are connected, two folders take it from h
 
 1. **One-time setup** — run the scripts in [`PTP_sync/`](PTP_sync/) to bring up the GPS-disciplined PTP grandmaster on the host and enable IEEE 1588 PTP on every LiDAR and camera. After this, all sensors share a sub-microsecond GPS time base.
 
-2. **Per-session recording** — run [`recording/sensor_recorder.py`](recording/sensor_recorder.py) to auto-detect connected sensors, verify the clock-sync chain, and record GNSS / IMU / LiDAR / camera streams into a Foxglove-native MCAP rosbag. A bundled Foxglove Studio layout shows the three Robin W point clouds superimposed in the IMU frame, all four camera views, a GNSS map, an IMU plot, and live per-topic frame rates while the data is being captured.
+2. **Per-session recording** — run the Atlas [`adapter/`](adapter/) alongside [`recording/sensor_recorder.py`](recording/sensor_recorder.py). The recorder auto-detects connected sensors, verifies the clock-sync chain and the adapter's authoritative Fixed-only odometry, then records GNSS / IMU / LiDAR / camera streams into a Foxglove-native MCAP rosbag. A bundled Foxglove Studio layout shows the three Robin W point clouds superimposed in the IMU frame, all four camera views, a GNSS map, an IMU plot, and live per-topic frame rates while the data is being captured.
 
 ```bash
 # After PTP_sync/ has been run once:
@@ -203,7 +308,7 @@ For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of
 3. **Outdoor / vehicle-scale tuning** — 24 parameter changes (loosened IMU noise, larger voxels, longer init window, sub-mapping density) calibrated for highway / track / vehicle motion.
 4. **Multi-lap loop-closure fix** — wider VGICP convergence basin, looser implicit-loop thresholds, and a stronger GNSS z-prior to prevent the canonical second-lap-tilts-to-the-sky failure mode.
 5. **Initialization rewrite (C++)** — gravity-from-accelerometer is removed; the optimizer now requires an external INS pose to start. Allows recordings that begin in motion (mid-session restarts, race-track replays, bag trims).
-6. **RTK-fixed gating for the initial pose** — three-stage gate on NavSatFix status, covariance, and multi-sample stability, with a bold-RED CLI warning if the gate is not met within the timeout.
+6. **RTK-fixed gating for the initial pose** — authoritative adapter `kRtkFixed` input plus fail-closed NavSatFix status/covariance and multi-sample stability checks, with a bold-RED CLI warning if the gate is not met within the timeout.
 7. **RTK-gated GNSS factor bridge** — soft GNSS prior factors are added to the global graph throughout the session, but only when RTK is fixed. Suspends silently in tunnels and resumes on re-fix.
 8. **Optional GNSS yaw prior (dual-antenna only)** — when a dual-antenna RTK heading is available, an optional `PoseRotationPrior` factor pulls each submap's yaw toward the RTK heading. OFF by default; must be turned on manually for dual-antenna installations.
 
@@ -211,14 +316,14 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 
 > ### ⚠ Operational requirement — RTK-fixed GNSS to start a session
 >
-> **GLIM++ uses the Atlas Duo's RTK-fixed GNSS pose and velocity as the ground truth for initialization.** This replaces the upstream "stationary IMU calibration" requirement with a much sharper one: **a mapping session cannot begin until the Atlas Duo reports an RTK-fixed solution with centimetre-grade covariance.** GLIM++ enforces this in C++ via a three-stage gate (status, covariance, multi-sample stability) and prints a periodic bold-RED warning while waiting. It will not auto-abort — but it will not start collecting map factors either, until the gate passes.
+> **GLIM++ uses the Atlas Duo's RTK-fixed GNSS pose and velocity as the ground truth for initialization.** This replaces the upstream "stationary IMU calibration" requirement with a much sharper one: **a mapping session cannot begin until the Atlas adapter emits a genuine `kRtkFixed` solution with centimetre-grade covariance.** GLIM++ also checks fresh NavSatFix status/covariance and multi-sample stability, then prints a periodic bold-RED warning while waiting. It will not auto-abort, but it will not start collecting map factors until the gate passes.
 >
 > What this means in the field:
 >
 > - **Plan for RTK convergence.** Park with clear sky view and wait for RTK-fixed lock before launching GLIM++. Outdoor convergence is typically 30–120 s; longer in marginal conditions. Verify in the Atlas Duo web UI before starting.
 > - **NTRIP corrections must be flowing.** The Atlas Duo's Ethernet path to the cellular router (see [`PTP_sync/README.md`](PTP_sync/README.md) §3.1) must reach an NTRIP caster. RTK-fixed without NTRIP is not achievable.
 > - **Tunnels and urban canyons during the session are fine** — the per-message RTK gate suspends factor publishing during outages and resumes on re-fix. The session is *not* re-started; only the *initial* pose requires RTK-fixed.
-> - **Without RTK** (no base station, no NTRIP) — the gate can be relaxed via `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5`, accepting RTK-float or SBAS for init. The map is still useful but the world-frame anchor is loose at the metre scale rather than the centimetre scale. See [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) §"Operating without RTK".
+> - **Without RTK** (no base station, no NTRIP) — use an explicitly degraded run configuration that selects a continuous INS source and sets `"ins_require_rtk_fixed": false` plus `"ins_max_position_stddev": 0.5` in `config_ros.json`. These are configuration keys, not launch arguments. The production profile remains Fixed-only and otherwise lets LiDAR-IMU SLAM carry RTK outages. See [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) §"Operating without RTK".
 
 > ### ⚙ GLIM++ GNSS antenna lever-arm compensation — OFF by default (Atlas Duo only)
 >
@@ -237,7 +342,7 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 >
 > **GLIM++ ships with a GNSS yaw prior (`PoseRotationPrior`) enabled in [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json).** Each submap is constrained toward the RTK-derived heading, eliminating the slow yaw drift that LiDAR + IMU alone leave open over a long session. This is the **default configuration** for the Hitch Sensor Dome because the dome ships as a dual-antenna RTK platform.
 >
-> **How it works.** A dual-antenna RTK receiver measures heading directly from the baseline between the two antennas — drift-free, accurate to roughly 0.1°–4° depending on baseline length. The Atlas Duo's `/pose` topic carries that heading as the quaternion field; the wrapper republishes it on `/gnss/pose_rtk_only` with a tight yaw covariance, and `libgnss_global.so` consumes it as a `PoseRotationPrior` factor on every submap. The shipped weighting is `[1e-6, 1e-6, 1e2]` — yaw only, σ_yaw ≈ 0.1 rad (~5.7°), appropriate for a 0.3–1 m baseline. With a longer baseline (e.g. 2 m) the Atlas Duo's heading covariance shrinks and the weight can be raised (try `5e2` for ~2.6° σ). Roll and pitch are kept at near-zero weight because GNSS does not observe them — the IMU + gravity already does.
+> **How it works.** A dual-antenna RTK receiver measures heading directly from the baseline between the two antennas — drift-free, accurate to roughly 0.1°–4° depending on baseline length. The adapter's `/gps_p1/filtered_odom_rtk_fixed` topic carries that heading only while FusionEngine reports `kRtkFixed`; the wrapper republishes it on `/gnss/pose_rtk_only` with a tight yaw covariance, and `libgnss_global.so` consumes it as a `PoseRotationPrior` factor on every submap. The shipped weighting is `[1e-6, 1e-6, 1e2]` — yaw only, σ_yaw ≈ 0.1 rad (~5.7°), appropriate for a 0.3–1 m baseline. With a longer baseline (e.g. 2 m) the Atlas Duo's heading covariance shrinks and the weight can be raised (try `5e2` for ~2.6° σ). Roll and pitch are kept at near-zero weight because GNSS does not observe them — the IMU + gravity already does.
 >
 > ### ⚠ GLIM++ GNSS yaw prior — MUST be turned OFF for single-antenna installations
 >
@@ -266,12 +371,13 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 # (one-time) generate sensor_dome.urdf from sensor_dome_tf.yaml
 cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 
-# Live mapping against the recording stack:
+# Validate the dome mapping configuration and live support nodes:
 #   1. Park with clear sky and wait for Atlas Duo RTK-fixed lock.
-#   2. Launch:
+#   2. Run the launch-time TF/GNSS consistency checks:
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# Or offline against a recorded MCAP bag (the bag must include /pose + /gps/fix):
+# Build offline against a recorded MCAP bag. The adapter must run during
+# capture; the bag must include its Fixed-only odometry plus /gps_p1/fix:
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>

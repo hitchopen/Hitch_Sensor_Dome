@@ -5,6 +5,8 @@
   // imu_gyro_noise              : Gyroscope noise
   // imu_int_noise               : Integration noise
   // imu_bias_noise              : Bias randomwalk noise
+  // imu_input_rotation          : Quaternion [x,y,z,w] rotating incoming
+  //                               acceleration/gyro into the calibrated IMU frame
   //
   // --- LiDAR config ---
   // global_shutter_lidar        : If true, fill per-point timestamps with zero and disable points deskewing
@@ -52,6 +54,10 @@
     "imu_gyro_noise": 0.05,
     "imu_int_noise": 0.001,
     "imu_bias_noise": 1e-4,
+    // Explicit safety-relevant input convention. The Point One driver already
+    // publishes body-frame vectors in imu_link, so no additional rotation is
+    // applied. Replace identity only with a measured receiver-mount rotation.
+    "imu_input_rotation": [0.0, 0.0, 0.0, 1.0],
     // LiDAR config — Seyond Robin W (3× directional, stitched 360°).
     //
     // global_shutter_lidar=false re-enables motion deskewing using the
@@ -66,6 +72,10 @@
     // flip because Luminar emits SAE Y-right; Robin W in mode 3 already
     // matches ROS conventions.
     "global_shutter_lidar": false,
+    // Robin W ROS contract: numeric IEEE-754 FLOAT64 Unix seconds. This flag
+    // controls only a separate legacy FLOAT64-as-raw-uint64-epoch-ns carrier
+    // and MUST stay false here.
+    "float64_time_is_epoch_ns": false,
     "flip_points_y": false,
     // URDF-based T_lidar_imu — auto-extracted at runtime.
     // sensor_dome.urdf is generated from config/sensor_dome_tf.yaml
@@ -92,17 +102,19 @@
     // Luminar uses "reflectance"/"line_index"; Seyond uses the defaults.
     "intensity_field": "intensity",
     "ring_field": "ring",
+    // Fail closed if a modified driver bypasses the pinned build in
+    // PTP_sync/4_setup_lidar_ptp.sh. ROS PointField datatype 8 is FLOAT64.
+    "expected_time_field": "timestamp",
+    "expected_time_datatype": 8,
+    "expected_time_is_absolute": true,
     // LiDAR per-point time settings.
     //
-    // autoconf_perpoint_times=true lets GLIM detect the seyond driver's
-    // per-point timestamp encoding automatically (typical seyond output
-    // is float32 seconds relative to the frame timestamp, but GLIM will
-    // verify the actual encoding from the first message). If you see
-    // deskew artifacts on replay, switch to manual configuration with
-    // perpoint_relative_time=true and perpoint_time_scale=1.0.
-    "autoconf_perpoint_times": true,
+    // The canonical Robin W values below are absolute Unix seconds with scale
+    // 1. Disable autoconf so a malformed relative stream cannot silently
+    // redefine the expected axis.
+    "autoconf_perpoint_times": false,
     "autoconf_prefer_frame_time": false,
-    "perpoint_relative_time": true,
+    "perpoint_relative_time": false,
     "perpoint_time_scale": 1.0,
     // Camera config (used only by extension modules).
     // RouteCAM_P_CU25_CXLC_IP67: 1920×1200 global shutter, 158° DFOV.
@@ -148,29 +160,106 @@
   // primary topic. With sensor_dome.urdf supplying the static transforms
   // there is no manual T_primary_sensor_* matrix to maintain.
   //
-  // time_threshold:0.01 (10 ms) is tight relative to the Robin W 100 ms
-  // rotation period, but PTP keeps all three sensors well within that
-  // bound — sub-microsecond on a managed PTP switch (see PTP_sync §3).
+    // time_threshold:0.01 (10 ms) is tight relative to the Robin W 100 ms
+    // rotation period. PTP aligns clocks but does not guarantee sweep phase;
+    // retain this header fallback gate only after measuring the rig.
   "lidar_concat": {
     "enabled": true,
     "time_threshold": 0.01,
+    // Absolute per-point-time endpoint gate (upstream key name kept for
+    // parity; applies to ANY absolute point-time carrier, here the Robin W
+    // FLOAT64 epoch-seconds layout). An aux sweep is accepted only when the
+    // max of |min-min| / |max-max| endpoint deltas vs the primary sweep is
+    // within this bound; header time is only a tie-break.
+    //
+    // WHAT THIS MEASURES: whole-sweep temporal alignment. It does not — and
+    // need not — distinguish a clock offset from frame-scheduling skew:
+    // either way the two sweeps are non-contemporaneous, which is exactly
+    // what disqualifies them from being merged into one cloud.
+    //
+    // ⚠ THIS VALUE IS UNVALIDATED ON THIS RIG. An earlier comment here
+    // claimed "PTP phase-locks all three Robin W units" — that is NOT
+    // supported:
+    //   * PTP_sync/4_setup_lidar_ptp.sh enables and verifies CLOCK sync
+    //     only; it configures no frame trigger or phase.
+    //   * The Robin W1G public manual documents PTP/gPTP/NTP time sync and
+    //     10-20 FPS operation, but specifies no frame-phase guarantee and
+    //     no trigger configuration.
+    //   * Seyond's own multi-LiDAR driver requires synchronized LiDARs and
+    //     defaults to fusion_time_window = 50 ms — 5x this value.
+    // Sweep phase is therefore a DEPLOYMENT property that must be measured.
+    // It may also change across a run (drift, dropped frames, resync), so a
+    // single startup measurement is not sufficient evidence.
+    //
+    // HOW TO SET IT: run a bag and read the per-aux line
+    //   "lidar_concat: '<topic>' sweep endpoint delta over N evaluations:
+    //    mean=... min=... max=... gate=... rejected=...%"
+    // which is emitted every 512 merges and covers REJECTED candidates too
+    // (the CONCAT DEBUG dt fields do NOT: they appear only for accepted
+    // merges and report header phase, not this endpoint delta). Set the
+    // gate above the observed max, and keep it well under HALF the sweep
+    // period — beyond half a period an adjacent sweep becomes selectable:
+    //   10 FPS -> period 100 ms -> hard ceiling 50 ms
+    //   20 FPS -> period  50 ms -> hard ceiling 25 ms
+    // Widening is not free: a larger accepted delta lengthens the merged
+    // cloud's temporal span and increases reliance on correct IMU deskew
+    // across that span.
+    //
+    // Production therefore requires every aux below. Until this measured gate
+    // admits both rears, scans are skipped and the run aborts after the failure
+    // budget instead of silently producing a 120-degree front-only map.
+    "luminar_time_threshold": 0.01,
+    // Offline readers (glim_rosbag): bag-time bound on holding a queued
+    // primary for a future aux sweep. Past this, the primary is released for a
+    // merge attempt. Strict mode below skips an incomplete scan and eventually
+    // aborts; degraded diagnostic profiles may merge whichever aux aligned.
+    // A dead rear unit therefore cannot park front sweeps until EOF.
+    // 0 = release immediately.
+    // Under two_pass_point_time_join it is the safety slack past a planned
+    // merge's known ready time.
+    "future_sweep_wait_timeout": 0.15,
+    // Offline readers: index absolute point-time ranges in a first bag pass
+    // and plan every merge deterministically (min endpoint-range delta within
+    // luminar_time_threshold; header only as tie-break). Unmatched primaries
+    // carry a recorded miss reason into the strict skip/abort path. Engages on
+    // Hesai/Livox and explicit epoch-ns carriers can use this planner. Robin
+    // W is scan-relative, so it deliberately falls back to the streaming
+    // future-header watermark.
+    "two_pass_point_time_join": true,
+    // Header-only acquisition-phase offsets, used only by the generic
+    // fallback and point-time tie-break. They never modify per-point
+    // timestamps. Zero on the dome: PTP makes the Robin W header clocks
+    // comparable, but does not imply sweep-phase synchronization.
+    "aux_match_time_offsets": [0.0, 0.0],
+    // Measured residual PTP/point-clock corrections, added to the absolute
+    // aux point ranges and merged point timestamps (converted to each
+    // carrier's native unit). Zero is a neutral default, not a measurement;
+    // change it only when endpoint-delta evidence shows a constant per-unit
+    // clock offset (not merely a sweep-phase shift).
+    "aux_point_time_offsets": [0.0, 0.0],
+    // Deprecated compatibility alias. Used only when aux_point_time_offsets
+    // is absent; keep empty in new run configs.
+    "aux_time_offsets": [],
     "buffer_size": 200,
     "aux_topics": ["/robin_w_rear_left/points", "/robin_w_rear_right/points"],
     "aux_frames": ["lidar_rear_left_link", "lidar_rear_right_link"],
     "urdf_path": "../../config/sensor_dome.urdf",
     "primary_frame": "lidar_front_link",
     // --- P4 (2026-07): strict merge guard + per-frame evidence ---
-    // require_all_aux=false: build on whatever Robin W merged this scan.
-    // true = an incomplete merge SKIPS the scan (sync-validation mode); past
-    // max_consecutive_aux_merge_failures the tool aborts only if
-    // abort_on_merge_failure=true.
-    "require_all_aux": false,
+    // Production contract: all three Robin W sweeps are required. An
+    // incomplete merge skips the scan; persistent phase/gap failures abort,
+    // forcing the gate to be validated from real endpoint-delta evidence.
+    // Set false only in an explicitly degraded diagnostic profile.
+    "require_all_aux": true,
     "abort_on_merge_failure": true,
     "max_consecutive_aux_merge_failures": 10,
     // One parseable "CONCAT DEBUG | stamp=... merged=n/N dt<i>=...s pts<i>=...
-    // span=...s total_pts=..." INFO line per primary scan, plus per-aux signed
-    // header-offset stats every 512 merges (warns when |mean| > 20 ms — a
-    // constant clock offset the PTP sync should have removed; see PTP_sync/).
+    // span=...s total_pts=..." INFO line per primary scan. The per-aux dt is
+    // raw signed HEADER acquisition phase (plus any configured residual
+    // point-clock correction); it is summarized every 512 merges WITHOUT a
+    // magnitude warning and must not be copied into aux_point_time_offsets —
+    // matching is gated by absolute point time only. On the PTP-locked dome
+    // a persistent |mean| beyond a few ms still deserves a look at PTP_sync/.
     "frame_diag_log": true
   }
 }

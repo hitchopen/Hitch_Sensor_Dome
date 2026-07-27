@@ -51,7 +51,7 @@ list(APPEND glim_ext_LIBRARIES glim_callback_demo)
 
 # Odometry estimation modules
 if(ENABLE_ORBSLAM)
-  add_subdirectory(modules/odometry/orb_slam_odometry)
+  add_subdirectory(modules/odometry/orb_slam_frontend)
   list(APPEND glim_ext_LIBRARIES orb_slam_odometry)
 endif()
 

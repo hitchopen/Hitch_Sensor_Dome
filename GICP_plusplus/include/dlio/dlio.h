@@ -51,14 +51,10 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #include <nano_gicp/nano_gicp.h>
 
 namespace dlio {
-  // Seyond Robin W in coordinate_mode:=3 publishes float32 per-point
-  // time in seconds relative to scan start — identical to the Velodyne
-  // convention — so on the Hitch Sensor Dome we set
-  // sensor_type: "velodyne" in localization.yaml and reuse the VELODYNE
-  // branch unchanged. LUMINAR is retained from the DLIO_plusplus
-  // art-jazzy port (uint64 epoch-ns per-point timestamps); unused on
-  // this platform, but the ported deskew/merge code paths reference it.
-  enum class SensorType { OUSTER, VELODYNE, HESAI, LIVOX, LUMINAR, UNKNOWN };
+  // Seyond Robin W publishes numeric FLOAT64 Unix seconds in `timestamp`.
+  // Keep an explicit enum value even though its deskew math is the same as
+  // Hesai's, so configuration and wire-contract errors name the real sensor.
+  enum class SensorType { OUSTER, VELODYNE, SEYOND, HESAI, LIVOX, LUMINAR, UNKNOWN };
 
   class OdomNode;
   class MapNode;
@@ -72,7 +68,7 @@ namespace dlio {
     std::uint32_t t;   // (Ouster) time since beginning of scan in nanoseconds
     float time;        // (Velodyne / Seyond Robin W) time since beginning of scan in seconds
     double timestamp;  // (Hesai) absolute timestamp in seconds
-                       // (Livox) absolute timestamp in (seconds * 10e9)
+                       // (Livox) numeric Unix-epoch nanoseconds; scale by 1e-9
     };
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   } EIGEN_ALIGN16;

@@ -1,0 +1,37 @@
+diff --git a/src/seyond_lidar_ros/src/driver/driver_lidar.cc b/src/seyond_lidar_ros/src/driver/driver_lidar.cc
+index 79ce54a..60da3ee 100755
+--- a/src/seyond_lidar_ros/src/driver/driver_lidar.cc
++++ b/src/seyond_lidar_ros/src/driver/driver_lidar.cc
+@@ -600,6 +600,9 @@ void DriverLidar::point_xyz_data_parse(bool is_use_refl, uint32_t point_num, Poi
+     point.flags = point_ptr->channel | roi | (point_ptr->facet << 3);
+     point.is_2nd_return = point_ptr->is_2nd_return;
+-    point.timestamp = point_ptr->ts_10us / ten_us_in_second_c + current_ts_start_;
++    // Hitch Sensor Dome PointCloud2 contract: FLOAT32 seconds from frame
++    // start. frame_start_ts_ is in microseconds; current_ts_start_ and the
++    // point offset are seconds.
++    point.time = point_ptr->ts_10us / ten_us_in_second_c + current_ts_start_ - frame_start_ts_ / us_in_second_c;
+ #endif
+     coordinate_transfer(&point, param_.coordinate_mode, point_ptr->x, point_ptr->y, point_ptr->z);
+     pcl_pc_ptr->points.push_back(point);
+diff --git a/src/seyond_lidar_ros/src/driver/point_types.h b/src/seyond_lidar_ros/src/driver/point_types.h
+index 3e6253e..9d84591 100755
+--- a/src/seyond_lidar_ros/src/driver/point_types.h
++++ b/src/seyond_lidar_ros/src/driver/point_types.h
+@@ -34,7 +34,7 @@ namespace seyond {
+ 
+ struct EIGEN_ALIGN16 PointXYZIT {
+   PCL_ADD_POINT4D;
+-  double timestamp;
++  float time;
+   float intensity;
+   std::uint8_t flags;
+   std::uint8_t elongation;
+@@ -48,7 +48,7 @@ struct EIGEN_ALIGN16 PointXYZIT {
+ POINT_CLOUD_REGISTER_POINT_STRUCT(
+     seyond::PointXYZIT,
+     (float, x, x)(float, y, y)(float, z, z)
+-    (double, timestamp, timestamp)
++    (float, time, time)
+     (float, intensity, intensity)
+     (std::uint8_t, flags, flags)
+     (std::uint8_t, elongation, elongation)

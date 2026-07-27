@@ -62,6 +62,8 @@ ETH_IFACE="${ETH_IFACE:-$NETCFG_ETH}"
 LIDAR_IPS_STR="${LIDAR_IPS_STR:-$NETCFG_LIDAR_IPS}"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 WS_DIR="$HOME/ros2_ws"
+# Pinned because the source-contract checks below target this reviewed layout.
+SEYOND_DRIVER_COMMIT="${SEYOND_DRIVER_COMMIT:-18c5c9362d41cd0766ee1b430f4b431bb14b1ccf}"
 
 # ─── Parse arguments ─────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -197,7 +199,37 @@ if [ ! -d "seyond_ros_driver" ]; then
 fi
 
 cd seyond_ros_driver
+git fetch origin main
+if [ "$(git rev-parse HEAD)" != "$SEYOND_DRIVER_COMMIT" ]; then
+    git checkout --detach "$SEYOND_DRIVER_COMMIT"
+fi
 git submodule update --init --recursive
+
+LEGACY_SEYOND_TIME_PATCH="$SCRIPT_DIR/seyond_robin_w_legacy_relative_time.patch"
+if git apply --reverse --check "$LEGACY_SEYOND_TIME_PATCH" 2>/dev/null; then
+    info "Removing the obsolete Robin W relative-time PointCloud2 override..."
+    git apply --reverse "$LEGACY_SEYOND_TIME_PATCH"
+    ok "Restored upstream timestamp/FLOAT64 absolute-seconds output"
+elif git apply --check "$LEGACY_SEYOND_TIME_PATCH" >/dev/null 2>&1; then
+    ok "Seyond driver already uses upstream timestamp/FLOAT64 output"
+else
+    fail "Seyond timestamp source differs from the reviewed $SEYOND_DRIVER_COMMIT"
+fi
+
+# Fail closed if a future source or local edit changes the ROS wire contract.
+# The SDK payload stores a compact point offset (`ts_10us`); the driver hydrates
+# it with the packet's absolute PTP/GPS start before PCL creates PointCloud2.
+SEYOND_DRIVER_SOURCE="src/seyond_lidar_ros/src/driver/driver_lidar.cc"
+SEYOND_POINT_TYPES="src/seyond_lidar_ros/src/driver/point_types.h"
+grep -Fq "double timestamp;" "$SEYOND_POINT_TYPES" || \
+    fail "Seyond PointXYZIT no longer declares timestamp as double/FLOAT64"
+grep -Fq "(double, timestamp, timestamp)" "$SEYOND_POINT_TYPES" || \
+    fail "Seyond PCL registration no longer exports timestamp/FLOAT64"
+grep -Fq \
+    "point.timestamp = point_ptr->ts_10us / ten_us_in_second_c + current_ts_start_;" \
+    "$SEYOND_DRIVER_SOURCE" || \
+    fail "Seyond point timestamp is no longer absolute packet-start + point-offset seconds"
+ok "Verified Robin W ROS contract: timestamp/FLOAT64 absolute Unix seconds"
 
 info "Building Seyond driver (this may take a few minutes)..."
 source_ros_setup

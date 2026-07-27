@@ -1,8 +1,12 @@
+#include <stdexcept>
 #include <glim_ros/glim_ros.hpp>
 
 #define GLIM_ROS2
 
 #include <deque>
+#include <cmath>
+#include <cstdio>
+#include <algorithm>
 #include <thread>
 #include <iostream>
 #include <functional>
@@ -88,13 +92,49 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
+  expected_time_field =
+    config_sensors.param<std::string>("sensors", "expected_time_field", "");
+  expected_time_datatype =
+    config_sensors.param<int>("sensors", "expected_time_datatype", 0);
+  expected_time_is_absolute =
+    config_sensors.param<bool>("sensors", "expected_time_is_absolute", false);
+  imu_input_rotation = config_sensors.param<Eigen::Quaterniond>("sensors", "imu_input_rotation", Eigen::Quaterniond::Identity());
+  if (!imu_input_rotation.coeffs().allFinite() || imu_input_rotation.norm() < 1e-9) {
+    throw std::invalid_argument("sensors.imu_input_rotation must be a finite, non-zero quaternion [x,y,z,w]");
+  }
+  imu_input_rotation.normalize();
+  if (std::abs(imu_input_rotation.w() - 1.0) > 1e-12 || imu_input_rotation.vec().norm() > 1e-12) {
+    logger->info(
+      "IMU input calibration enabled: q_input_to_calibrated=[{:.9f}, {:.9f}, {:.9f}, {:.9f}]",
+      imu_input_rotation.x(),
+      imu_input_rotation.y(),
+      imu_input_rotation.z(),
+      imu_input_rotation.w());
+  }
+  // [P2 FIX 2026-07-15] Explicit Luminar-contract opt-in: when true, a FLOAT64
+  // per-point time field is decoded as raw uint64 PTP epoch nanoseconds (the
+  // documented Luminar driver variant) instead of IEEE-754 seconds. Default
+  // false so ordinary FLOAT64-seconds sensors (relative offsets, or Hesai
+  // absolute epoch seconds) are never misdecoded.
+  float64_time_is_epoch_ns = config_sensors.param<bool>("sensors", "float64_time_is_epoch_ns", false);
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
 
-  // Multi-LiDAR concatenation. Live glim_ros must merge the auxiliary
-  // (rear-left / rear-right Robin W) clouds into the primary front-lidar
-  // frame just like the offline glim_rosbag tool does; otherwise live
-  // mapping would silently use only the front LiDAR.
+  // Multi-LiDAR concatenation is implemented by the future-aware offline
+  // readers. The live callback has no equivalent release queue, so reject
+  // online+concat immediately after both configuration flags are known.
   aux_concat = glim_ros::load_aux_sensors_from_config(config_sensors);
+
+  this->online_mapping_enabled_ =
+    config_ros.param<bool>("glim_ros", "enable_online_mapping", false);
+  if (!glim_ros::online_concat_configuration_supported(
+        this->online_mapping_enabled_, aux_concat.enabled)) {
+    spdlog::critical(
+      "glim_ros: online mapping (enable_online_mapping=true) combined with lidar_concat is "
+      "unsupported — the live path has no future-sweep release and would drop the late aux "
+      "sweep. Build the concatenated map offline (glim_rosbag / glim_pcap_rosbag). Refusing to start.");
+    throw std::runtime_error(
+      "glim_ros: online mapping + lidar_concat is unsupported (no future-sweep release)");
+  }
 
   // Override T_lidar_imu from URDF if configured
   const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
@@ -112,6 +152,23 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       const std::string config_sensors_path = glim::GlobalConfig::get_config_path("config_sensors");
       config_sensors.override_param<Eigen::Isometry3d>("sensors", "T_lidar_imu", T_lidar_imu);
       config_sensors.save(config_sensors_path);
+      // [P3 FIX 2026-07-10] The override only reaches the other modules VIA
+      // DISK (each constructs its own Config from this path). Config::save
+      // does not check the stream: on a read-only install prefix the write
+      // silently fails, the INFO above still claims the override, and the
+      // estimator runs with the stale checked-in extrinsic. Verify the
+      // round-trip and fail LOUDLY — the extrinsic is safety-relevant.
+      {
+        glim::Config verify(config_sensors_path);
+        const auto readback = verify.param<Eigen::Isometry3d>("sensors", "T_lidar_imu");
+        if (!readback || !readback->isApprox(T_lidar_imu, 1e-9)) {
+          logger->critical(
+            "URDF T_lidar_imu override did NOT persist to {} (read-only install prefix?) — "
+            "modules would silently use the stale checked-in extrinsic; aborting",
+            config_sensors_path);
+          throw std::runtime_error("config_sensors.json override write failed");
+        }
+      }
     } catch (const std::exception& e) {
       logger->error("Failed to compute T_lidar_imu from URDF: {}", e.what());
     }
@@ -124,6 +181,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // Preprocessing
   time_keeper.reset(new glim::TimeKeeper);
+  // [P3 FIX 2026-07-14] Hand the operator-configured points_time_offset to the
+  // TimeKeeper so it survives the absolute-time stamp overwrite. Previously the
+  // offset was added to raw_points->stamp before process(), but the
+  // absolute-time branch of replace_points_stamp overwrites the stamp with the
+  // raw min point time and silently discarded it for Luminar/absolute clouds.
+  time_keeper->set_point_time_offset(points_time_offset);
   preprocessor.reset(new glim::CloudPreprocessor);
 
   // Odometry estimation
@@ -208,22 +271,20 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // Online (live subscription) mapping passway. GLIM builds maps OFFLINE only
   // (glim_rosbag / glim_pcap_rosbag feed the callbacks directly and drive
   // timer_callback() manually), so by default we create NO live subscriptions
-  // and NO wall timer. Set glim_ros/enable_online_mapping=true to restore the
-  // legacy live path.
-  this->online_mapping_enabled_ = config_ros.param<bool>("glim_ros", "enable_online_mapping", false);
-
+  // and NO wall timer. The opt-in legacy live path remains single-LiDAR only.
   // Hitch Sensor Dome fork: external INS init with RTK-fixed gating.
   //
   // GLIM's initial state is anchored to the Atlas Duo's INS pose, but
   // accepting that pose requires confirming the INS itself is reliable.
   // Inputs:
   //
-  //   - ins_pose_topic (default /pose) — geometry_msgs/PoseStamped from
-  //     fusion_engine_driver. Carries orientation + position; no velocity.
-  //   - ins_odom_topic (default empty) — nav_msgs/Odometry, if a node
-  //     republishes the Atlas Duo's full 6-DOF state.
-  //   - ins_fix_topic  (default /gps/fix) — sensor_msgs/NavSatFix, the
-  //     gate signal: status.status, position_covariance.
+  //   - ins_pose_topic (production default empty) — compatibility
+  //     geometry_msgs/PoseStamped source. It has no solution_type and must
+  //     not be used for Fixed-only production mapping.
+  //   - ins_odom_topic (production default adapter Fixed-only topic) —
+  //     nav_msgs/Odometry carrying the Atlas Duo's full 6-DOF state.
+  //   - ins_fix_topic  (default /gps_p1/fix) — the adapter's synchronized
+  //     sensor_msgs/NavSatFix gate signal: status and position covariance.
   //
   // Gate logic lives in ins_pose_callback / ins_odom_callback. These
   // parameters are parsed in BOTH modes: the online path subscribes live
@@ -233,9 +294,11 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // identically in replay. (B4 fix: this block used to be online-only,
   // which silently disabled INS init and starved gnss_global of factors in
   // the offline-only workflow.)
-  ins_pose_topic_ = config_ros.param<std::string>("glim_ros", "ins_pose_topic", "/pose");
-  ins_odom_topic_ = config_ros.param<std::string>("glim_ros", "ins_odom_topic", "");
-  ins_fix_topic_  = config_ros.param<std::string>("glim_ros", "ins_fix_topic",  "/gps/fix");
+  ins_pose_topic_ = config_ros.param<std::string>("glim_ros", "ins_pose_topic", "");
+  ins_odom_topic_ = config_ros.param<std::string>(
+    "glim_ros", "ins_odom_topic", "/gps_p1/filtered_odom_rtk_fixed");
+  ins_fix_topic_  =
+    config_ros.param<std::string>("glim_ros", "ins_fix_topic", "/gps_p1/fix");
 
   // Gate thresholds — overridable from config_ros.json.
   ins_require_rtk_fixed_       = config_ros.param<bool>(  "glim_ros", "ins_require_rtk_fixed",       true);
@@ -243,7 +306,28 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ins_min_pose_window_samples_ = config_ros.param<int>(   "glim_ros", "ins_min_pose_window_samples", 10);
   ins_max_pose_jitter_trans_   = config_ros.param<double>("glim_ros", "ins_max_pose_jitter_trans",   0.05);
   ins_min_quat_dot_            = config_ros.param<double>("glim_ros", "ins_min_quat_dot",            0.999);
+  ins_max_pose_gap_s_          = config_ros.param<double>("glim_ros", "ins_max_pose_gap_s",          0.5);
+  fix_max_age_s_               = config_ros.param<double>("glim_ros", "fix_max_age_s",               0.5);
+  fix_future_tolerance_s_      = config_ros.param<double>("glim_ros", "fix_future_tolerance_s",      0.05);
+  require_rtk_anchor_          = config_ros.param<bool>(  "glim_ros", "require_rtk_anchor",          false);
+  if (!std::isfinite(ins_max_position_stddev_) || ins_max_position_stddev_ <= 0.0 ||
+      ins_min_pose_window_samples_ < 3 ||
+      !std::isfinite(ins_max_pose_jitter_trans_) || ins_max_pose_jitter_trans_ <= 0.0 ||
+      !std::isfinite(ins_min_quat_dot_) || ins_min_quat_dot_ < 0.0 || ins_min_quat_dot_ > 1.0 ||
+      !std::isfinite(ins_max_pose_gap_s_) || ins_max_pose_gap_s_ <= 0.0) {
+    throw std::runtime_error(
+      "glim_ros: invalid INS gate thresholds (stddev/jitter/gap must be finite and > 0, "
+      "window >= 3, quat dot in [0, 1])");
+  }
+  if (!std::isfinite(fix_max_age_s_) || fix_max_age_s_ <= 0.0 ||
+      !std::isfinite(fix_future_tolerance_s_) || fix_future_tolerance_s_ < 0.0) {
+    throw std::runtime_error(
+      "glim_ros: fix_max_age_s must be finite and > 0, fix_future_tolerance_s finite and >= 0");
+  }
   ins_init_timeout_s_          = config_ros.param<double>("glim_ros", "ins_init_timeout_s",          60.0);
+  if (!std::isfinite(ins_init_timeout_s_) || ins_init_timeout_s_ <= 0.0) {
+    throw std::runtime_error("glim_ros: ins_init_timeout_s must be finite and > 0");
+  }
 
   // Dual-antenna RTK heading mode. When enabled we tighten the init gate
   // (orientation locks faster and more precisely with dual-antenna
@@ -298,6 +382,11 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     config_ros.param<bool>(  "glim_ros", "gnss_factor_require_rtk_fixed",   true);
   gnss_factor_max_position_stddev_ =
     config_ros.param<double>("glim_ros", "gnss_factor_max_position_stddev", 0.10);
+  if (!std::isfinite(gnss_factor_max_position_stddev_) ||
+      gnss_factor_max_position_stddev_ <= 0.0) {
+    throw std::runtime_error(
+      "glim_ros: gnss_factor_max_position_stddev must be finite and > 0");
+  }
 
   if (!gnss_factor_topic_.empty()) {
     gnss_pose_pub_ = this->create_publisher<
@@ -325,6 +414,21 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     spdlog::info("Hitch fork: gnss_factor_topic empty — bridge disabled");
   }
 
+  // [B1 FIX 2026-07-27] The INS init-gate watchdog is created in BOTH modes.
+  // It used to live inside the online-mapping block below — but this platform
+  // maps OFFLINE ONLY (enable_online_mapping=false, and online + lidar_concat
+  // is hard-refused), so the entire operator-facing diagnostic for a blocked
+  // init was dead code in glim_rosbag: a bag whose RTK never locks produced
+  // zero submaps at full replay speed with no warning at all, and
+  // ins_init_timeout_s was a dead knob. The offline readers call
+  // rclcpp::spin_some(glim) per bag message, so a wall timer is serviced
+  // there exactly as it is under a live executor.
+  ins_wait_started_ = this->now();
+  ins_last_warn_    = ins_wait_started_;
+  ins_init_timeout_timer = this->create_wall_timer(
+    std::chrono::seconds(2),
+    [this]() { ins_init_timeout_tick(); });
+
   if (this->online_mapping_enabled_) {
     const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
     const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
@@ -342,19 +446,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
 
-    // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
-    // merged into the primary scan on arrival of a primary cloud.
-    if (aux_concat.enabled) {
-      auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-      for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
-        const std::string aux_topic = aux_concat.aux_sensors[i].topic;
-        auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          aux_topic, aux_qos,
-          [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
-        aux_points_subs.push_back(sub);
-        spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
-      }
-    }
 #ifdef BUILD_WITH_CV_BRIDGE
     qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
     image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
@@ -388,12 +479,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         std::bind(&GlimROS::ins_odom_callback, this, _1));
       spdlog::info("Hitch fork: subscribed to INS Odometry topic '{}'", ins_odom_topic_);
     }
-
-    ins_wait_started_ = this->now();
-    ins_last_warn_    = ins_wait_started_;
-    ins_init_timeout_timer = this->create_wall_timer(
-      std::chrono::seconds(2),
-      [this]() { ins_init_timeout_tick(); });
 
     for (const auto& sub : this->extension_subscriptions()) {
       spdlog::debug("subscribe to {}", sub->topic);
@@ -449,8 +534,8 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   const double imu_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + imu_time_offset;
-  const Eigen::Vector3d linear_acc = acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
-  const Eigen::Vector3d angular_vel(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+  const Eigen::Vector3d linear_acc = imu_input_rotation * (acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z));
+  const Eigen::Vector3d angular_vel = imu_input_rotation * Eigen::Vector3d(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
 
   if (!time_keeper->validate_imu_stamp(imu_stamp)) {
     spdlog::warn("skip an invalid IMU data (stamp={})", imu_stamp);
@@ -509,11 +594,161 @@ const char* fix_status_name(int s) {
 }
 
 double cov_diag_stddev(const std::array<double, 9>& C) {
-  // Worst of the three position diagonals' stddev.
-  double sx = std::sqrt(std::max(0.0, C[0]));
-  double sy = std::sqrt(std::max(0.0, C[4]));
-  double sz = std::sqrt(std::max(0.0, C[8]));
-  return std::max({sx, sy, sz});
+  // DISPLAY ONLY. Returns +inf for any covariance that is not a usable
+  // measurement, so it can never read as "tighter than" a real one.
+  // Gating decisions must go through validate_fix() below, which reports
+  // WHY a fix was refused.
+  //
+  // [B3 FIX 2026-07-27] This used to be sqrt(max(0.0, C[i])), which mapped
+  // every "no information" encoding — an all-zero COVARIANCE_TYPE_UNKNOWN
+  // block, and NaN (std::max(0.0, NaN) returns 0.0) — to sigma = 0.000 m,
+  // i.e. the TIGHTEST POSSIBLE fix. The gate therefore failed OPEN on
+  // exactly the cold-start / invalid-solution cases it existed to catch.
+  double worst = 0.0;
+  for (const int i : {0, 4, 8}) {
+    const double v = C[i];
+    if (!std::isfinite(v) || v <= 0.0) return std::numeric_limits<double>::infinity();
+    worst = std::max(worst, std::sqrt(v));
+  }
+  return worst;
+}
+
+// Outcome of validating a NavSatFix as a gate signal. Fails CLOSED: every
+// path that is not a positively-verified good fix returns ok=false with a
+// reason string, so a rejection is always explicable in the log.
+struct FixVerdict {
+  bool ok = false;
+  double pos_stddev = std::numeric_limits<double>::infinity();
+  double age_s = std::numeric_limits<double>::quiet_NaN();
+  std::string reason;
+};
+
+FixVerdict validate_fix(
+  const sensor_msgs::msg::NavSatFix* fix,
+  double consumer_stamp_s,      // header stamp of the pose being gated
+  double max_age_s,
+  double future_tolerance_s,
+  double max_stddev,
+  bool require_rtk_class,
+  const std::array<double, 36>* fallback_pose_cov = nullptr) {
+  FixVerdict v;
+  if (!fix) {
+    if (require_rtk_class) {
+      v.reason = "no NavSatFix received yet";
+      return v;
+    }
+    if (!fallback_pose_cov) {
+      v.reason =
+        "no NavSatFix received and this pose source carries no covariance";
+      return v;
+    }
+
+    // Explicit degraded mode: an Odometry source may bootstrap without a
+    // NavSatFix, but only from real, bounded position covariance. This makes
+    // ins_require_rtk_fixed=false operational without turning missing quality
+    // metadata into a perfect fix. PoseStamped still fails closed because it
+    // has no covariance to prove position quality.
+    double worst = 0.0;
+    for (const int i : {0, 7, 14}) {
+      const double c = (*fallback_pose_cov)[i];
+      if (!std::isfinite(c) || c <= 0.0) {
+        v.reason =
+          "no NavSatFix and odometry position covariance is invalid";
+        return v;
+      }
+      worst = std::max(worst, std::sqrt(c));
+    }
+    v.pos_stddev = worst;
+    if (v.pos_stddev > max_stddev) {
+      char buf[160];
+      std::snprintf(
+        buf, sizeof(buf),
+        "no NavSatFix and odometry position sigma %.3f m > %.3f m",
+        v.pos_stddev, max_stddev);
+      v.reason = buf;
+      return v;
+    }
+    v.ok = true;
+    v.reason = "ok (degraded odometry-covariance fallback)";
+    return v;
+  }
+
+  // (a) Solution status.
+  if (fix->status.status == sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX) {
+    v.reason = "NavSatFix reports NO_FIX";
+    return v;
+  }
+  if (require_rtk_class &&
+      fix->status.status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
+    v.reason = std::string("fix status ") + fix_status_name(fix->status.status) +
+               " is below RTK class";
+    return v;
+  }
+
+  // (b) Covariance must be a real measurement. UNKNOWN, all-zero,
+  // negative and non-finite are all refusals — never "perfect".
+  if (fix->position_covariance_type ==
+      sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN) {
+    v.reason = "position_covariance_type = UNKNOWN (no covariance reported)";
+    return v;
+  }
+  for (const int i : {0, 4, 8}) {
+    const double c = fix->position_covariance[i];
+    if (!std::isfinite(c)) {
+      v.reason = "non-finite position covariance (invalid INS solution)";
+      return v;
+    }
+    if (c <= 0.0) {
+      v.reason = "non-positive position covariance (unpopulated / sentinel)";
+      return v;
+    }
+  }
+  v.pos_stddev = cov_diag_stddev(fix->position_covariance);
+
+  // (c) The position itself must be a real WGS84 coordinate. FusionEngine
+  // emits NaN lat/lon for SolutionType::Invalid.
+  if (!std::isfinite(fix->latitude) || !std::isfinite(fix->longitude) ||
+      !std::isfinite(fix->altitude) ||
+      std::abs(fix->latitude) > 90.0 || std::abs(fix->longitude) > 180.0) {
+    v.reason = "invalid latitude/longitude/altitude";
+    return v;
+  }
+
+  // (d) Freshness, by MESSAGE time. Wall time is meaningless during
+  // offline replay, and a stale fix must never keep authorizing factors:
+  // one RTK sample would otherwise license the whole rest of a session.
+  const double fix_stamp_s = to_sec(fix->header.stamp);
+  if (!std::isfinite(fix_stamp_s) || !std::isfinite(consumer_stamp_s)) {
+    v.reason = "non-finite message timestamp";
+    return v;
+  }
+  v.age_s = consumer_stamp_s - fix_stamp_s;
+  if (v.age_s > max_age_s) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "fix is stale (%.3f s > %.3f s)", v.age_s, max_age_s);
+    v.reason = buf;
+    return v;
+  }
+  if (v.age_s < -future_tolerance_s) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "fix is %.3f s in the future (tolerance %.3f s)",
+                  -v.age_s, future_tolerance_s);
+    v.reason = buf;
+    return v;
+  }
+
+  // (e) Reported precision.
+  if (v.pos_stddev > max_stddev) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "position sigma %.3f m > %.3f m",
+                  v.pos_stddev, max_stddev);
+    v.reason = buf;
+    return v;
+  }
+
+  v.ok = true;
+  v.reason = "ok";
+  return v;
 }
 
 }  // anonymous namespace
@@ -522,6 +757,171 @@ void GlimROS::ins_fix_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
   // Track the most recent fix for the pose/odom callbacks to consult.
   // No gating decision happens here — the pose callbacks own that.
   last_fix_ = msg;
+}
+
+bool GlimROS::ins_window_push_and_check(
+  double stamp,
+  const Eigen::Isometry3d& T,
+  Eigen::Vector3d* v_est) {
+  // ---------------------------------------------------------------------
+  // Hitch Sensor Dome fork — INS stability gate, MOVING-START CAPABLE.
+  //
+  // The Atlas Duo is a TIGHTLY-COUPLED INS: its own calibration, attitude
+  // and velocity estimation are P1's responsibility. GLIM's job at the
+  // boundary is therefore to confirm that P1's solution has SETTLED and is
+  // SELF-CONSISTENT — not to re-derive vehicle state, and emphatically not
+  // to require the vehicle to be parked.
+  //
+  // [FIX 2026-07-27] The previous gate compared RAW inter-sample
+  // displacement against ins_max_pose_jitter_trans (0.05 m). At the Atlas's
+  // 10 Hz /pose rate that is a hard 0.5 m/s (1.8 km/h) ceiling: above it
+  // every consecutive pair failed, the window was cleared on the first
+  // pair, and initialization could NEVER complete. That silently forbade
+  // exactly the moving-start case this fork was built for (mid-session
+  // restarts, trimmed bags, race-track replays) — see
+  // docs/moving_start_initialization.md.
+  //
+  // The test is now a SMOOTHNESS residual against a constant-velocity /
+  // constant-angular-rate prediction from the two preceding samples. It is
+  // ~0 for any steady motion at any speed, small under moderate
+  // acceleration, and large only for a genuine INS jump — which is the
+  // thing worth rejecting. A stationary start still passes trivially
+  // (residual ≈ 0), so this is a strict superset of the old behavior.
+  // ---------------------------------------------------------------------
+  if (!std::isfinite(stamp) || !T.matrix().allFinite()) {
+    ins_last_reject_reason_ = "non-finite INS stamp or pose";
+    pose_window_.clear();
+    return false;
+  }
+
+  // Temporal contiguity. Samples reach this window only AFTER the RTK
+  // status/covariance gates pass, so without this bound a fix that flickers
+  // into RTK once every N seconds could assemble a "stable" window out of
+  // moments minutes apart — each pair individually consistent because the
+  // vehicle happened to be parked, while nothing about the run was settled.
+  if (!pose_window_.empty()) {
+    const double gap = stamp - pose_window_.back().stamp;
+    if (gap <= 0.0) {
+      // Non-monotonic (bag loop, duplicate publish). Restart from here.
+      ins_last_reject_reason_ = "non-monotonic INS stamp; window restarted";
+      pose_window_.clear();
+    } else if (gap > ins_max_pose_gap_s_) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf),
+                    "INS gap %.3f s > %.3f s (non-contiguous); window restarted",
+                    gap, ins_max_pose_gap_s_);
+      ins_last_reject_reason_ = buf;
+      ins_last_hard_reject_ = buf;
+      ++ins_hard_reject_count_;
+      pose_window_.clear();
+    }
+  }
+
+  InsSample sample;
+  sample.stamp = stamp;
+  sample.T = T;
+  pose_window_.push_back(sample);
+
+  // A constant-velocity prediction needs three samples, so the window is at
+  // least 3 deep regardless of how low the operator sets the parameter.
+  const size_t required =
+    static_cast<size_t>(std::max(3, ins_min_pose_window_samples_));
+  while (pose_window_.size() > required) {
+    pose_window_.pop_front();
+  }
+  if (pose_window_.size() < required) {
+    char buf[288];
+    if (ins_hard_reject_count_ > 0) {
+      std::snprintf(buf, sizeof(buf),
+                    "accumulating INS window (%zu/%zu) after %llu rejection(s); last: %s",
+                    pose_window_.size(), required,
+                    static_cast<unsigned long long>(ins_hard_reject_count_),
+                    ins_last_hard_reject_.c_str());
+    } else {
+      std::snprintf(buf, sizeof(buf), "accumulating INS window (%zu/%zu)",
+                    pose_window_.size(), required);
+    }
+    ins_last_reject_reason_ = buf;
+    return false;
+  }
+
+  for (size_t i = 2; i < pose_window_.size(); ++i) {
+    const auto& s0 = pose_window_[i - 2];
+    const auto& s1 = pose_window_[i - 1];
+    const auto& s2 = pose_window_[i];
+    const double dt_prev = s1.stamp - s0.stamp;
+    const double dt      = s2.stamp - s1.stamp;
+    if (dt_prev <= 0.0 || dt <= 0.0) {
+      ins_last_reject_reason_ = "non-monotonic INS stamps within window";
+      ins_last_hard_reject_ = ins_last_reject_reason_;
+      ++ins_hard_reject_count_;
+      pose_window_.clear();
+      return false;
+    }
+
+    // Translation: residual against a constant-velocity extrapolation.
+    // Under constant acceleration a this residual is a·dt², so the 0.05 m
+    // default tolerates ≈5 m/s² at 10 Hz — vehicle dynamics pass, a
+    // metre-scale INS snap does not.
+    const Eigen::Vector3d v_prev =
+      (s1.T.translation() - s0.T.translation()) / dt_prev;
+    const Eigen::Vector3d p_pred = s1.T.translation() + v_prev * dt;
+    const double resid = (s2.T.translation() - p_pred).norm();
+    if (resid > ins_max_pose_jitter_trans_) {
+      char buf[192];
+      std::snprintf(buf, sizeof(buf),
+                    "INS position residual %.3f m > %.3f m vs constant-velocity "
+                    "prediction (|v|=%.2f m/s) — solution not settled",
+                    resid, ins_max_pose_jitter_trans_, v_prev.norm());
+      ins_last_reject_reason_ = buf;
+      ins_last_hard_reject_ = buf;
+      ++ins_hard_reject_count_;
+      pose_window_.clear();
+      return false;
+    }
+
+    // Orientation: residual against a constant-angular-rate extrapolation.
+    // Re-applying the previous relative rotation, time-scaled to this
+    // interval, keeps a steady turn at ~0 residual while still catching an
+    // attitude snap.
+    const Eigen::Quaterniond q0(s0.T.linear());
+    const Eigen::Quaterniond q1(s1.T.linear());
+    const Eigen::Quaterniond q2(s2.T.linear());
+    const Eigen::Quaterniond dq = (q0.conjugate() * q1).normalized();
+    const Eigen::Quaterniond dq_scaled =
+      Eigen::Quaterniond::Identity().slerp(dt / dt_prev, dq);
+    const Eigen::Quaterniond q_pred = (q1 * dq_scaled).normalized();
+    const double qdot = std::abs(q_pred.dot(q2));
+    if (qdot < ins_min_quat_dot_) {
+      char buf[192];
+      std::snprintf(buf, sizeof(buf),
+                    "INS orientation residual |q_pred.q|=%.5f < %.5f vs "
+                    "constant-rate prediction — solution not settled",
+                    qdot, ins_min_quat_dot_);
+      ins_last_reject_reason_ = buf;
+      ins_last_hard_reject_ = buf;
+      ++ins_hard_reject_count_;
+      pose_window_.clear();
+      return false;
+    }
+  }
+
+  // World-frame velocity at the newest sample, for callers whose message
+  // type carries none. Backward difference over the last interval; its
+  // O(a·dt/2) lag is negligible against the optimizer's σ = 1 m/s V(0)
+  // prior, whereas seeding zero on a rolling start is not.
+  if (v_est) {
+    const auto& sN = pose_window_.back();
+    const auto& sP = pose_window_[pose_window_.size() - 2];
+    const double dt = sN.stamp - sP.stamp;
+    *v_est = (dt > 0.0)
+               ? Eigen::Vector3d((sN.T.translation() - sP.T.translation()) / dt)
+               : Eigen::Vector3d::Zero();
+    if (!v_est->allFinite()) {
+      *v_est = Eigen::Vector3d::Zero();
+    }
+  }
+  return true;
 }
 
 void GlimROS::ins_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -547,27 +947,21 @@ void GlimROS::ins_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr
     return;
   }
 
-  // ---- (1)+(2) Fix quality + covariance gate ----
-  if (!last_fix_) {
-    ins_last_reject_reason_ = "no NavSatFix received yet on ins_fix_topic";
+  // ---- (1)+(2) Fix quality gate — SLAM STARTS ONLY AT RTK-FIXED ----
+  // [B3 FIX 2026-07-27] Fails CLOSED and expires by MESSAGE time. The old
+  // gate compared only status + sqrt(max(0,cov)), so an UNKNOWN/NaN
+  // covariance read as sigma=0.000 m (the tightest possible fix), and a
+  // single fix authorized initialization forever because the fix stamp was
+  // never read. Both are now refusals with an explicit reason.
+  const FixVerdict fv = validate_fix(
+    last_fix_.get(), to_sec(msg->header.stamp), fix_max_age_s_,
+    fix_future_tolerance_s_, ins_max_position_stddev_, ins_require_rtk_fixed_);
+  if (!fv.ok) {
+    ins_last_reject_reason_ = fv.reason;
     return;
   }
   const int fix_status = last_fix_->status.status;
-  if (ins_require_rtk_fixed_ &&
-      fix_status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
-    ins_last_reject_reason_ = std::string("fix status is '") + fix_status_name(fix_status) +
-                              "' (need GBAS_FIX = RTK-class)";
-    return;
-  }
-  const double pos_stddev = cov_diag_stddev(last_fix_->position_covariance);
-  if (pos_stddev > ins_max_position_stddev_) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf),
-                  "position covariance stddev=%.3f m > %.3f m (RTK not yet fixed)",
-                  pos_stddev, ins_max_position_stddev_);
-    ins_last_reject_reason_ = buf;
-    return;
-  }
+  const double pos_stddev = fv.pos_stddev;
 
   // ---- Convert message ----
   Eigen::Quaterniond q(msg->pose.orientation.w,
@@ -584,54 +978,27 @@ void GlimROS::ins_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr
   T.translation() << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
 
   // ---- (3) Stability gate ----
-  // PoseStamped has no velocity; assume zero (the optimizer refines it).
-  pose_window_.emplace_back(T, Eigen::Vector3d::Zero());
-  while (static_cast<int>(pose_window_.size()) > ins_min_pose_window_samples_) {
-    pose_window_.pop_front();
-  }
-  if (static_cast<int>(pose_window_.size()) < ins_min_pose_window_samples_) {
-    ins_last_reject_reason_ = "accumulating pose window";
+  // PoseStamped carries no velocity, so the window estimates it. A moving
+  // start MUST seed a real velocity — see ins_window_push_and_check().
+  Eigen::Vector3d v_est = Eigen::Vector3d::Zero();
+  if (!ins_window_push_and_check(to_sec(msg->header.stamp), T, &v_est)) {
     return;
-  }
-  // Pairwise consistency.
-  for (size_t i = 1; i < pose_window_.size(); ++i) {
-    const auto& a = pose_window_[i - 1].first;
-    const auto& b = pose_window_[i    ].first;
-    if ((a.translation() - b.translation()).norm() > ins_max_pose_jitter_trans_) {
-      char buf[160];
-      std::snprintf(buf, sizeof(buf),
-                    "pose translation jitter %.3f m > %.3f m (INS still settling)",
-                    (a.translation() - b.translation()).norm(),
-                    ins_max_pose_jitter_trans_);
-      ins_last_reject_reason_ = buf;
-      pose_window_.clear();  // start over once consistency breaks
-      return;
-    }
-    Eigen::Quaterniond qa(a.linear()), qb(b.linear());
-    if (std::abs(qa.dot(qb)) < ins_min_quat_dot_) {
-      char buf[160];
-      std::snprintf(buf, sizeof(buf),
-                    "pose orientation jitter |q1.q2|=%.4f < %.4f (INS still settling)",
-                    std::abs(qa.dot(qb)), ins_min_quat_dot_);
-      ins_last_reject_reason_ = buf;
-      pose_window_.clear();
-      return;
-    }
   }
 
   // ---- All gates passed → apply ----
   if (odometry_estimation) {
-    odometry_estimation->set_init_state(T, Eigen::Vector3d::Zero());
+    odometry_estimation->set_init_state(T, v_est);
     ins_init_applied.store(true);
     spdlog::info(
       "{}Hitch fork: INS init pose ACCEPTED — fix={}, pos σ={:.3f} m, "
-      "translation=[{:.3f}, {:.3f}, {:.3f}], qw={:.4f}{}",
+      "translation=[{:.3f}, {:.3f}, {:.3f}], qw={:.4f}, "
+      "v_est=[{:.3f}, {:.3f}, {:.3f}] |v|={:.2f} m/s (from /pose finite difference){}",
       CYAN, fix_status_name(fix_status), pos_stddev,
       T.translation().x(), T.translation().y(), T.translation().z(),
-      q.w(), RESET);
+      q.w(), v_est.x(), v_est.y(), v_est.z(), v_est.norm(), RESET);
     // Note: subscriptions are KEPT ALIVE post-init so the factor bridge
     // can republish each subsequent /pose as PoseWithCovarianceStamped on
-    // /gnss/pose_rtk_only (gated against the latest /gps/fix). The init
+    // /gnss/pose_rtk_only (gated against the latest ins_fix_topic sample). The init
     // pose itself is not also republished as a factor — set_init_state
     // already pinned that information into the optimizer.
     if (ins_init_timeout_timer) ins_init_timeout_timer->cancel();
@@ -662,26 +1029,22 @@ void GlimROS::ins_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
   }
 
   // (1)+(2) Fix gate.
-  if (!last_fix_) {
-    ins_last_reject_reason_ = "no NavSatFix received yet on ins_fix_topic";
+  // SLAM STARTS ONLY AT RTK-FIXED — same fail-closed, message-time-expiring
+  // validator as the pose path. See validate_fix().
+  std::array<double, 36> source_cov{};
+  for (int i = 0; i < 36; ++i) source_cov[i] = msg->pose.covariance[i];
+  const FixVerdict fv = validate_fix(
+    last_fix_.get(), to_sec(msg->header.stamp), fix_max_age_s_,
+    fix_future_tolerance_s_, ins_max_position_stddev_, ins_require_rtk_fixed_,
+    &source_cov);
+  if (!fv.ok) {
+    ins_last_reject_reason_ = fv.reason;
     return;
   }
-  const int fix_status = last_fix_->status.status;
-  if (ins_require_rtk_fixed_ &&
-      fix_status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
-    ins_last_reject_reason_ = std::string("fix status is '") + fix_status_name(fix_status) +
-                              "' (need GBAS_FIX = RTK-class)";
-    return;
-  }
-  const double pos_stddev = cov_diag_stddev(last_fix_->position_covariance);
-  if (pos_stddev > ins_max_position_stddev_) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf),
-                  "position covariance stddev=%.3f m > %.3f m (RTK not yet fixed)",
-                  pos_stddev, ins_max_position_stddev_);
-    ins_last_reject_reason_ = buf;
-    return;
-  }
+  const std::string fix_quality =
+    last_fix_ ? fix_status_name(last_fix_->status.status)
+              : "ODOMETRY_COVARIANCE_ONLY";
+  const double pos_stddev = fv.pos_stddev;
 
   Eigen::Quaterniond q(msg->pose.pose.orientation.w,
                        msg->pose.pose.orientation.x,
@@ -701,29 +1064,10 @@ void GlimROS::ins_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
                     msg->twist.twist.linear.y,
                     msg->twist.twist.linear.z);
 
-  // (3) Stability gate (translation + orientation; velocity is informational).
-  pose_window_.emplace_back(T, v);
-  while (static_cast<int>(pose_window_.size()) > ins_min_pose_window_samples_) {
-    pose_window_.pop_front();
-  }
-  if (static_cast<int>(pose_window_.size()) < ins_min_pose_window_samples_) {
-    ins_last_reject_reason_ = "accumulating pose window";
+  // (3) Stability gate. Odometry already carries P1's own velocity, which is
+  // authoritative (tightly-coupled INS), so no estimate is requested here.
+  if (!ins_window_push_and_check(to_sec(msg->header.stamp), T, nullptr)) {
     return;
-  }
-  for (size_t i = 1; i < pose_window_.size(); ++i) {
-    const auto& a = pose_window_[i - 1].first;
-    const auto& b = pose_window_[i    ].first;
-    if ((a.translation() - b.translation()).norm() > ins_max_pose_jitter_trans_) {
-      ins_last_reject_reason_ = "pose translation jitter (INS still settling)";
-      pose_window_.clear();
-      return;
-    }
-    Eigen::Quaterniond qa(a.linear()), qb(b.linear());
-    if (std::abs(qa.dot(qb)) < ins_min_quat_dot_) {
-      ins_last_reject_reason_ = "pose orientation jitter (INS still settling)";
-      pose_window_.clear();
-      return;
-    }
   }
 
   if (odometry_estimation) {
@@ -732,7 +1076,7 @@ void GlimROS::ins_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     spdlog::info(
       "{}Hitch fork: INS init pose+velocity ACCEPTED — fix={}, pos σ={:.3f} m, "
       "translation=[{:.3f}, {:.3f}, {:.3f}], v=[{:.3f}, {:.3f}, {:.3f}]{}",
-      CYAN, fix_status_name(fix_status), pos_stddev,
+      CYAN, fix_quality, pos_stddev,
       T.translation().x(), T.translation().y(), T.translation().z(),
       v.x(), v.y(), v.z(), RESET);
     // Subscriptions stay alive post-init for the GNSS factor bridge.
@@ -749,7 +1093,8 @@ void GlimROS::try_publish_gnss_factor(
   //
   // Drops the pose if any of:
   //   - publisher not initialized (gnss factor bridge disabled)
-  //   - last_fix_ is null (no NavSatFix received yet)
+  //   - last_fix_ is null while RTK-class gating is required, or the degraded
+  //     Odometry source has no usable position covariance
   //   - last_fix_ is below RTK-fixed status when require_rtk_fixed is on
   //   - position covariance stddev is above threshold
   //
@@ -758,20 +1103,33 @@ void GlimROS::try_publish_gnss_factor(
   // RTK locks again, factors resume on the next /pose. The optimizer's
   // LiDAR cost carries the trajectory through the gap.
   if (!gnss_pose_pub_) return;
-  if (!last_fix_) {
+  // [B3 FIX 2026-07-27] Fail CLOSED. Every refusal path is explicit and the
+  // fix is expired by MESSAGE time, so a single RTK sample can no longer
+  // license GNSS factors for the rest of a session while the receiver is
+  // dead-reckoning. When this refuses, NO factor is emitted and LiDAR-IMU
+  // SLAM simply continues unconstrained — that is the designed
+  // RTK-float / no-fix / stale-fix operating state, not an error.
+  //
+  // NOTE this NavSatFix-driven path is the HEURISTIC compatibility bridge:
+  // REP-145 STATUS_GBAS_FIX cannot distinguish RTK-FLOAT from RTK-FIXED,
+  // and float ambiguities carry a consistent decimetre-scale BIAS that no
+  // robust loss or reported covariance protects against. Production
+  // mapping should instead point gnss_global straight at the adapter's
+  // explicit solution_type == kRtkFixed stream — see config_gnss_global.json.
+  const FixVerdict fv = validate_fix(
+    last_fix_.get(), to_sec(stamp), fix_max_age_s_, fix_future_tolerance_s_,
+    gnss_factor_max_position_stddev_, gnss_factor_require_rtk_fixed_,
+    &pose_cov);
+  if (!fv.ok) {
     gnss_factors_rejected_.fetch_add(1);
+    if (gnss_factor_last_reject_ != fv.reason) {
+      gnss_factor_last_reject_ = fv.reason;
+      spdlog::debug("Hitch fork: GNSS factor suppressed — {} (LiDAR-IMU SLAM continues)",
+                    fv.reason);
+    }
     return;
   }
-  if (gnss_factor_require_rtk_fixed_ &&
-      last_fix_->status.status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
-    gnss_factors_rejected_.fetch_add(1);
-    return;
-  }
-  const double pos_stddev = cov_diag_stddev(last_fix_->position_covariance);
-  if (pos_stddev > gnss_factor_max_position_stddev_) {
-    gnss_factors_rejected_.fetch_add(1);
-    return;
-  }
+  const double pos_stddev = fv.pos_stddev;
 
   geometry_msgs::msg::PoseWithCovarianceStamped out;
   out.header.stamp = stamp;
@@ -988,7 +1346,8 @@ void GlimROS::ins_init_timeout_tick() {
   spdlog::warn("{}  ⚠  GLIM is waiting for a reliable INS pose. ⚠  {}", RED, RESET);
   spdlog::warn("{}{}{}", RED,
                "============================================================", RESET);
-  spdlog::warn("  Elapsed:  {:.1f} s  (timeout {:.1f} s)", elapsed, ins_init_timeout_s_);
+  spdlog::warn("  Elapsed:  {:.1f} s wall (timeout {:.1f} s){}", elapsed, ins_init_timeout_s_,
+               online_mapping_enabled_ ? "" : " — offline replay: wall time, not bag time");
   if (last_fix_) {
     const double s = cov_diag_stddev(last_fix_->position_covariance);
     spdlog::warn("  Last NavSatFix: status={}, pos σ={:.3f} m, "
@@ -1012,17 +1371,33 @@ void GlimROS::ins_init_timeout_tick() {
   spdlog::warn("    1. Wait — RTK convergence typically takes 30–120 s outdoors.");
   spdlog::warn("    2. Check sky visibility — RTK needs unobstructed L1+L5.");
   spdlog::warn("    3. Verify NTRIP corrections are flowing (check Atlas web UI).");
-  spdlog::warn("    4. Relax the gate (degraded init) by re-launching with:");
-  spdlog::warn("         ins_require_rtk_fixed:=false");
-  spdlog::warn("         ins_max_position_stddev:=0.5    # 0.5 m for SBAS-class");
+  spdlog::warn("    4. Relax the gate (degraded init) by editing the");
+  spdlog::warn("       \"glim_ros\" section of config_ros.json:");
+  spdlog::warn("         \"ins_require_rtk_fixed\": false");
+  spdlog::warn("         \"ins_max_position_stddev\": 0.5   // 0.5 m for SBAS-class");
+  spdlog::warn("       These are read from config_ros.json, NOT from launch");
+  spdlog::warn("       arguments — a launch-time override has no effect.");
   spdlog::warn("       Note: relaxing INVALIDATES the fix to the moving-start");
   spdlog::warn("       pathology; the map will not be reliably gravity-aligned.");
+  if (!online_mapping_enabled_) {
+    spdlog::warn("    5. A moving start is supported and is NOT the problem:");
+    spdlog::warn("       the stability gate tests solution smoothness, not");
+    spdlog::warn("       stationarity. Check the reject reason above.");
+  }
 
   if (elapsed > ins_init_timeout_s_) {
     spdlog::warn("");
-    spdlog::warn("{}  TIMEOUT exceeded. Aborting glim_rosnode is now safe.{}", RED, RESET);
-    spdlog::warn("{}  (No automatic abort — GLIM will continue to wait if you{}", RED, RESET);
-    spdlog::warn("{}  prefer to leave it running until the fix locks.){}", RED, RESET);
+    if (online_mapping_enabled_) {
+      spdlog::warn("{}  TIMEOUT exceeded. Aborting glim_rosnode is now safe.{}", RED, RESET);
+      spdlog::warn("{}  (No automatic abort — GLIM will continue to wait if you{}", RED, RESET);
+      spdlog::warn("{}  prefer to leave it running until the fix locks.){}", RED, RESET);
+    } else {
+      spdlog::warn("{}  TIMEOUT exceeded, and this is an OFFLINE replay: the{}", RED, RESET);
+      spdlog::warn("{}  gate will not open later unless the bag itself contains{}", RED, RESET);
+      spdlog::warn("{}  a passing fix. If it does not, this run will produce an{}", RED, RESET);
+      spdlog::warn("{}  EMPTY map (num_submaps: 0 in <dump>/graph.txt) and still{}", RED, RESET);
+      spdlog::warn("{}  exit 0. Stop it, fix the input or the gate, and re-run.{}", RED, RESET);
+    }
   }
   spdlog::warn("");
 }
@@ -1062,52 +1437,69 @@ void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr
     return;
   }
   auto& aux = aux_concat.aux_sensors[aux_index];
-  aux.buffer.push_back(msg);
+  aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg, aux_concat.float64_time_is_epoch_ns));
   while (aux.buffer.size() > aux.buffer_size) {
     aux.buffer.pop_front();
   }
 }
 
 void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  // Merge buffered auxiliary clouds into the primary scan (front + rear-left +
-  // rear-right -> primary front-lidar frame), then hand the result to the
-  // estimator. The mutex
-  // guards the aux buffers, which merge_clouds() reads via find_nearest().
-  if (aux_concat.enabled && !aux_concat.aux_sensors.empty()) {
-    // Primary point count BEFORE merge: lidar_concat appends aux bytes after the
-    // primary, so these are the first points in the merged cloud. Pass it as the
-    // epoch-rebase anchor so a multi-LiDAR sweep is not shifted late when an aux
-    // scan started before the primary.
-    const int primary_count = static_cast<int>(msg->width * msg->height);
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
-    {
-      std::lock_guard<std::mutex> lock(aux_buffers_mutex);
-      // frame_diag_log wired through (review fix): without it the live node
-      // silently used the default `false` even when config_sensors.json
-      // enabled the per-frame CONCAT DEBUG evidence.
-      merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold,
-                                      aux_concat.require_all_aux, aux_concat.max_consecutive_aux_merge_failures,
-                                      &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure,
-                                      aux_concat.frame_diag_log);
-    }
-    // nullptr = strict merge skipped this scan (require_all_aux); drop it.
-    if (!merged) {
-      return;
-    }
-    points_callback(merged, primary_count);
-  } else {
-    points_callback(msg);
+  if (aux_concat.enabled) {
+    spdlog::critical(
+      "points_callback_live reached with lidar_concat enabled, but the live path "
+      "has no future-sweep release queue; refusing a past-only merge");
+    throw std::logic_error(
+      "points_callback_live cannot concatenate LiDAR sweeps without a future-sweep release queue");
   }
+  points_callback(msg);
 }
 
-size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count) {
+size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count, bool* ingested) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+  if (ingested) {
+    *ingested = false;
+  }
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
   }
 
-  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count);
+  if (!expected_time_field.empty()) {
+    const auto field = std::find_if(
+      msg->fields.begin(), msg->fields.end(),
+      [this](const auto& candidate) {
+        return candidate.name == expected_time_field;
+      });
+    if (field == msg->fields.end() ||
+        static_cast<int>(field->datatype) != expected_time_datatype ||
+        field->count != 1) {
+      spdlog::error(
+        "rejecting point cloud: expected timestamp field '{}/datatype={}/count=1'. "
+        "For Robin W, install the pinned driver with "
+        "PTP_sync/4_setup_lidar_ptp.sh (timestamp/FLOAT64=8).",
+        expected_time_field, expected_time_datatype);
+      return 0;
+    }
+  }
+  if (expected_time_is_absolute) {
+    const auto range =
+      glim_ros::luminar_timestamp_range(*msg, float64_time_is_epoch_ns);
+    const double header_s = glim_ros::stamp_to_sec(msg->header.stamp);
+    const double first_point_s =
+      range.valid ? static_cast<double>(range.min_ns) * 1.0e-9 : 0.0;
+    if (!range.valid || !std::isfinite(header_s) ||
+        std::abs(first_point_s - header_s) > 1.0) {
+      spdlog::error(
+        "rejecting point cloud: '{}' must contain finite absolute epoch times "
+        "within 1 s of header.stamp (header={:.9f}, first_point={:.9f}). "
+        "For Robin W, expect numeric FLOAT64 Unix seconds reconstructed by the "
+        "pinned Seyond ROS 2 driver.",
+        expected_time_field, header_s, first_point_s);
+      return 0;
+    }
+  }
+
+  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count, float64_time_is_epoch_ns);
   if (raw_points == nullptr) {
     spdlog::warn("failed to extract points from message");
     return 0;
@@ -1119,7 +1511,9 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     }
   }
 
-  raw_points->stamp += points_time_offset;
+  // [P3 FIX 2026-07-14] points_time_offset is now applied inside TimeKeeper
+  // (see the constructor), AFTER any absolute-time stamp overwrite, so it is no
+  // longer silently discarded for Luminar/absolute clouds.
   if (!time_keeper->process(raw_points)) {
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
     return 0;
@@ -1133,6 +1527,9 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
   odometry_estimation->insert_frame(preprocessed);
+  if (ingested) {
+    *ingested = true;
+  }
 
   // Throttle offline bag playback on the SLOWEST stage, not just odometry.
   // glim_rosbag uses this return value to pace playback; reporting only the
@@ -1160,11 +1557,18 @@ bool GlimROS::needs_wait() {
   return false;
 }
 
-void GlimROS::timer_callback() {
+bool GlimROS::ok() const {
   for (const auto& ext_module : extension_modules) {
     if (!ext_module->ok()) {
-      rclcpp::shutdown();
+      return false;
     }
+  }
+  return true;
+}
+
+void GlimROS::timer_callback() {
+  if (!ok()) {
+    rclcpp::shutdown();
   }
 
   std::vector<glim::EstimationFrame::ConstPtr> estimation_frames;
@@ -1220,6 +1624,35 @@ void GlimROS::wait(bool auto_quit) {
   }
 }
 
+void GlimROS::log_map_status() const {
+  // End-of-run verdict. LiDAR-IMU SLAM is the primary estimator; GNSS is an
+  // optional global constraint, so "no GNSS factors" is a REPORTED STATE,
+  // not automatically a failure. Only require_rtk_anchor makes it one.
+  const char* state = map_anchor_state();
+  const int factors = gnss_factors_published_.load();
+  const int rejected = gnss_factors_rejected_.load();
+  spdlog::info(
+    "Hitch fork: map status: state={} slam_initialized={} gnss_factors={} "
+    "gnss_suppressed={} require_rtk_anchor={}",
+    state, slam_initialized() ? "true" : "false", factors, rejected,
+    require_rtk_anchor_ ? "true" : "false");
+
+  if (!slam_initialized()) {
+    spdlog::error(
+      "{}  MAP IS EMPTY: SLAM never initialized — no validated RTK-fixed INS "
+      "solution was seen, so no frame was ever ingested.{}", RED, RESET);
+    return;
+  }
+  if (factors == 0) {
+    spdlog::warn(
+      "  Map origin is RTK-anchored, but RTK never returned afterwards: the "
+      "trajectory past initialization is constrained by LiDAR-IMU only. This "
+      "is a legitimate outcome{}",
+      require_rtk_anchor_ ? " — but require_rtk_anchor=true, so this run FAILS."
+                          : " (set require_rtk_anchor=true to reject it).");
+  }
+}
+
 void GlimROS::save(const std::string& path) {
   if (global_mapping) {
     // TODO(follow-up refactor): replace this needs_wait() quiescence-inference
@@ -1250,6 +1683,9 @@ void GlimROS::save(const std::string& path) {
   for (auto& module : extension_modules) {
     module->at_exit(path);
   }
+  // After the extensions have written their own summaries, so the map
+  // verdict is the last thing in the log.
+  log_map_status();
 }
 
 }  // namespace glim

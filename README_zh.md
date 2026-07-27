@@ -2,6 +2,16 @@
 
 可 3D 打印的模块化传感器穹顶，通过吸盘式相机支架将多传感器测绘平台安装到车顶。
 
+> **⚠ 本中文文档落后于英文版。** 以下内容目前**仅存在于**
+> [`README.md`](README.md)，尚未翻译：
+>
+> - 「2026-07 定位与建图改进 (P1–P5)」整节
+> - 「2026-07-27 GLIM++ 上游重新合并」小节
+> - Robin W 逐点时间戳的已确认规范：原始点偏移由驱动补全为
+>   `timestamp/FLOAT64` 绝对 Unix 秒
+>
+> 硬件、装配与接线部分的中文内容仍然有效。涉及软件行为的部分请以英文版为准。
+
 ## 传感器
 
 - 3× Seyond Robin W LiDAR —— 单台 120° 水平视场，按 120° 间隔排布，实现 360° 环视
@@ -238,7 +248,8 @@ cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 #   2. 启动：
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# 或对已采集的 MCAP 包做离线建图（bag 中必须包含 /pose 与 /gps/fix）：
+# 或对已采集的 MCAP 包做离线建图（bag 中必须包含 adapter 的
+# /gps_p1/filtered_odom_rtk_fixed 与 /gps/fix）：
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>

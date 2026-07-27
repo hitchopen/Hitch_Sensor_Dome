@@ -26,14 +26,27 @@
     imu_frame_id: "imu_link"
     body_frame_id: "imu_link"
     odom_frame_id: "map"
+    navsat_frame_id: "imu_link"
+    navsat_fix_topic: "/gps_p1/fix"
 
-    # Local ENU map origin (lat_deg, lon_deg, alt_m). PLACEHOLDER from an
-    # earlier deployment — set this to your deployment datum before mapping.
+    # Local ENU map origin (lat_deg, lon_deg, alt_m). This is intentionally
+    # empty: the adapter refuses to start until this deployment's surveyed
+    # datum is supplied here or through local_enu_origin_ttl_path.
     # The GLIM++ map, the seed odometry, and GICP++ must all share this one
     # datum or their frames silently disagree.
-    local_enu_origin: "39.58227391,-86.74232215,260.4"
+    local_enu_origin: ""
     local_enu_origin_ttl_path: ""
+    # The retired placeholder 39.58227391,-86.74232215,260.4 is rejected even
+    # when explicitly supplied. Set true only when mapping at that exact site.
+    allow_legacy_local_enu_origin: false
     summary_output_path: ""
+
+    # Max forward jump (s) of an output pose stamp vs the last published one
+    # before it is quarantined as a glitch. A jump that persists past this
+    # bound is accepted as a genuine session/epoch reset. The node validates
+    # this at startup (finite and > 0), so it is carried explicitly here
+    # rather than left to the built-in default.
+    pose_max_forward_jump_sec: 5.0
 
     rtk_max_var_xy: 0.001
     rtk_max_var_z: 0.005

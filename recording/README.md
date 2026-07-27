@@ -36,6 +36,12 @@ This folder is the run-time companion to the one-time setup scripts in [`../PTP_
 
 Each driver is a separate process so a single crashed driver does not kill the bag recorder. All sensors share the GPS-disciplined PTP clock, so the MCAP timestamps line up without post-hoc correction.
 
+The Seyond driver installed by `PTP_sync/4_setup_lidar_ptp.sh` is pinned and
+source-validated at build time to publish the repository contract directly:
+`timestamp/FLOAT64/count=1`, numeric Unix seconds. The driver hydrates each
+compact packet-relative point offset with its absolute packet start time
+before PCL creates PointCloud2; no recording-side conversion is required.
+
 ## Running It
 
 ```bash
@@ -71,7 +77,7 @@ While the recorder is running:
 2. **Open Connection → Foxglove WebSocket → `ws://localhost:8765`**.
 3. **Layouts → Import from file → `recording/foxglove/sensor_dome_layout.json`**.
 
-The layout shows the three Robin W point clouds superimposed in `imu_link` (resolved through `/tf_static` from `../config/sensor_dome_tf.yaml`), the four camera views, a GNSS map that follows `/gps/fix`, an IMU plot, a fix-status indicator, and a Diagnostics panel bound to `/sensor_dome/rates` that lights up yellow / red when a sensor falls below its expected Hz.
+The layout shows the three Robin W point clouds superimposed in `imu_link` (resolved through `/tf_static` from `../config/sensor_dome_tf.yaml`), the four camera views, a GNSS map that follows `/gps_p1/fix`, an IMU plot, a fix-status indicator, and a Diagnostics panel bound to `/sensor_dome/rates` that lights up yellow / red when a sensor falls below its expected Hz.
 
 For replay after the fact, open the recorded `.mcap` directly in Foxglove (`File → Open local file`) and apply the same layout — no bridge or recorder needed.
 

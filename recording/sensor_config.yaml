@@ -26,11 +26,16 @@ point_one_nav:
   tcp_ip: "192.168.1.30"     # Atlas Duo IP on RUTM50 LAN 4
   tcp_port: 30201            # FusionEngine TCP port
   frame_id: "imu_link"
-  # ROS topics published by fusion_engine_driver
+  # ROS topics recorded for the GNSS/INS path. The first three are published
+  # by fusion_engine_driver. adapter_fix and rtk_fixed_odom are synchronized
+  # outputs from the Atlas adapter and form GLIM++'s production gate/source.
+  # Start the adapter during capture when producing mapping bags.
   topics:
     imu: "/imu/data"           # sensor_msgs/Imu       @ 200 Hz
     gps_fix: "/gps/fix"        # sensor_msgs/NavSatFix @ 10 Hz
     pose: "/pose"              # geometry_msgs/PoseStamped @ 10 Hz
+    adapter_fix: "/gps_p1/fix" # sensor_msgs/NavSatFix; adapter solution class/covariance
+    rtk_fixed_odom: "/gps_p1/filtered_odom_rtk_fixed"  # nav_msgs/Odometry; kRtkFixed only
 
 # -------------------------------------------------------------
 # Seyond Robin W LiDARs (3× directional)
@@ -116,10 +121,9 @@ sync:
 # -------------------------------------------------------------
 # GLIM++ requires the Atlas Duo to report RTK-fixed status with cm-grade
 # covariance to start a mapping session — see GLIM_plusplus/README.md §6.
-# This pre-flight subscribes to gnss_topic for capture_window_s and
-# verifies every NavSatFix sample passes the same gate the GLIM++ C++
-# wrapper uses, so an operator catches a not-yet-locked Atlas Duo before
-# committing to a long recording.
+# This pre-flight subscribes to gnss_topic and fixed_odom_topic for
+# capture_window_s. NavSatFix supplies the synchronized covariance check;
+# only arrival on the adapter topic proves FusionEngine kRtkFixed.
 rtk:
   # Behavior when the gate fails:
   #   "prompt" — bold-RED warning + y/N prompt (default)
@@ -128,10 +132,13 @@ rtk:
   mode: "prompt"
 
   # NavSatFix topic to inspect — same as GLIM++'s ins_fix_topic.
-  gnss_topic: "/gps/fix"
+  gnss_topic: "/gps_p1/fix"
 
-  # If true, require status >= STATUS_GBAS_FIX (RTK-class). Set to false
-  # for setups without a base station (RTK-float / SBAS will be accepted).
+  # Authoritative stream emitted by adapter only for solution_type=kRtkFixed.
+  fixed_odom_topic: "/gps_p1/filtered_odom_rtk_fixed"
+
+  # If true, require both the Fixed-only stream and NavSatFix status >=
+  # STATUS_GBAS_FIX. Set false only for an explicit degraded recording.
   require_rtk_fixed: true
 
   # Maximum allowed σ on the NavSatFix position covariance (m). Default

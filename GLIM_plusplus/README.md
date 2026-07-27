@@ -19,6 +19,7 @@ This document is a **complete change log** between GLIM++ and the upstream `koid
 11. [What was NOT changed](#11-what-was-not-changed)
 12. [File-by-file diff summary](#12-file-by-file-diff-summary)
 13. [2026-07 P1–P5 improvements — merge evidence, yaw-quality gate, GNSS backfill](#13-2026-07-p1p5-improvements)
+14. [2026-07-27 upstream re-merge — point-time sweep matching, GNSS anchor health, PR #15](#14-2026-07-27-upstream-re-merge)
 
 ## 1. Sensor adaptation for Hitch Sensor Dome
 
@@ -29,7 +30,7 @@ Topic, frame, and field names throughout the configs target the Hitch Sensor Dom
 | IMU topic | `/imu/data` (fusion_engine_driver, Atlas Duo) |
 | Primary lidar | `/robin_w_front/points` |
 | Aux lidars | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
-| GNSS | `/gps/fix` (NavSatFix gate signal) + `/pose` (INS PoseStamped) |
+| GNSS | `/gps_p1/fix` (synchronized adapter NavSatFix gate) + `/gps_p1/filtered_odom_rtk_fixed` (adapter Fixed-only odometry) |
 | Camera | `/cam_front_left/image_raw` |
 | `intensity_field` | `intensity` (Robin W default) |
 | `ring_field` | `ring` (Robin W default) |
@@ -81,7 +82,7 @@ Twenty-four parameter changes across the seven JSON configs, each annotated inli
 | **Initialization** | `config_odometry_gpu.json` | Window `1.0 → 3.0` s for cleaner gravity (later replaced entirely — see §5). |
 | **GNSS prior** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]` (was silently disabled upstream). `min_baseline: 1.0 → 0.5`. |
 | **Deskewing** | `config_sensors.json` | `global_shutter_lidar: true → false`. Re-enables motion deskewing (the upstream multi-LiDAR timestamp rebasing bug it was working around has since been fixed). |
-| **Per-point time** | `config_sensors.json` | `autoconf_perpoint_times: false → true`, `perpoint_relative_time: false → true`. Robin W driver emits relative-to-frame timestamps. |
+| **Per-point time** | `config_sensors.json` | `timestamp/FLOAT64`, numeric Unix seconds, with `autoconf_perpoint_times: false`, `perpoint_relative_time: false`, and scale `1.0`. The schema and absolute axis are validated before deskew. |
 | **Downsampling** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`, `k_correspondences: 10 → 20`. Higher density required for the 360° stitched cloud from 3 sensors; the 3× upstream factor is safe because the dome pipeline runs GLIM **offline** against recorded MCAP bags, so there is no real-time per-scan budget. Lower to 15-20K if switching to live mapping. |
 | **VGICP voxels** | `config_odometry_gpu.json`, `config_sub_mapping_gpu.json` | Base resolutions raised for outdoor scale: `voxel_resolution 0.25 → 0.5`, `voxel_resolution_max 0.5 → 1.0`. Submap-internal `keyframe_voxel_resolution 0.25 → 0.15` for tighter local alignment. |
 | **Smoother window** | `config_odometry_gpu.json` | `full_connection_window_size: 2 → 4`. Aggressive vehicle motion. |
@@ -123,7 +124,7 @@ GLIM++ removes the gravity-from-accelerometer pathway entirely and requires an e
 
 | File | Change |
 |------|--------|
-| [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) and [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | New subscriptions to `ins_pose_topic` (default `/pose`, `geometry_msgs/PoseStamped`) and `ins_odom_topic` (default empty, `nav_msgs/Odometry`). On the first valid message that passes the gate (§6), the orientation is forwarded to `odometry_estimation->set_init_state(T, v)` and the optimizer's gravity reference is fixed for the session. |
+| [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) and [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | New subscriptions to `ins_pose_topic` and `ins_odom_topic` (production default `/gps_p1/filtered_odom_rtk_fixed`, `nav_msgs/Odometry`). On the first valid message that passes the gate (§6), the orientation is forwarded to `odometry_estimation->set_init_state(T, v)` and the optimizer's gravity reference is fixed for the session. |
 
 The pathway is documented in detail in [`docs/moving_start_initialization.md`](docs/moving_start_initialization.md).
 
@@ -133,22 +134,24 @@ The pathway is documented in detail in [`docs/moving_start_initialization.md`](d
 
 Naive "accept the first pose" would happily latch onto an INS that's still cold-starting, dead-reckoning on IMU only, or in RTK-float mode. Since the entire SLAM map is anchored to this single pose, accepting a bad one means re-recording the session.
 
-The wrapper enforces a **three-stage gate** before calling `set_init_state`:
+The wrapper enforces an authoritative source check plus three independent
+guards before calling `set_init_state`:
 
 | Stage | Check | Default threshold |
 |-------|-------|-------------------|
-| 1. Fix status | `NavSatFix.status.status ≥ STATUS_GBAS_FIX` (RTK-class) | `ins_require_rtk_fixed = true` |
-| 2. Covariance | `position_covariance` diagonal max σ ≤ threshold | `0.10 m` |
+| 0. Solution class | Input arrives on adapter's Fixed-only odometry topic | FusionEngine `kRtkFixed` |
+| 1. Fix status | `NavSatFix.status.status ≥ STATUS_GBAS_FIX` (RTK-class cross-check) | `ins_require_rtk_fixed = true` |
+| 2. Covariance | Known type; finite, non-negative diagonal; max σ ≤ threshold | `0.10 m` |
 | 3. Stability | Last N consecutive INS poses are mutually consistent (translation jitter, `\|q1·q2\|`) | `N=10`, `0.05 m`, `0.999` |
 
 While any stage is failing, a 2-second wall timer ticks `ins_init_timeout_tick()` and prints a **bold-RED multi-line warning every 10 s** naming the most recent rejection reason and listing remediation steps. After `ins_init_timeout_s = 60 s` the warning escalates to "TIMEOUT" — but **GLIM never auto-aborts**. The operator decides.
 
-Eight new ROS parameters (declared in [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py) and documented in [`glim/config/config_ros.json`](glim/config/config_ros.json)):
+The production values are read from [`glim/config/config_ros.json`](glim/config/config_ros.json). The similarly named launch arguments are documentation-only because this platform maps offline:
 
 ```
-ins_pose_topic                    default /pose
-ins_odom_topic                    default ""
-ins_fix_topic                     default /gps/fix
+ins_pose_topic                    default ""
+ins_odom_topic                    default /gps_p1/filtered_odom_rtk_fixed
+ins_fix_topic                     default /gps_p1/fix
 ins_require_rtk_fixed             default true
 ins_max_position_stddev           default 0.10
 ins_min_pose_window_samples       default 10
@@ -166,9 +169,9 @@ The upstream module also (per its own header comment) "ignores GNSS observation 
 The fork adds an in-process bridge:
 
 ```
-fusion_engine_driver
-   ├── /pose          (PoseStamped)
-   └── /gps/fix       (NavSatFix, RTK gate signal)
+fusion_engine_driver + adapter
+   ├── /gps_p1/filtered_odom_rtk_fixed (Odometry, solution_type == kRtkFixed)
+   └── /gps_p1/fix                    (NavSatFix, freshness/covariance cross-check)
                   │
                   ▼
        GlimROS::try_publish_gnss_factor
@@ -188,13 +191,14 @@ fusion_engine_driver
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `gnss_factor_topic` | `/gnss/pose_rtk_only` | Where the bridge publishes; `""` disables the bridge |
+| `ins_odom_topic` | `/gps_p1/filtered_odom_rtk_fixed` | Adapter stream emitted only for FusionEngine `kRtkFixed` |
+| `gnss_factor_topic` | `/gnss/pose_rtk_only` | Where the fixed-source bridge publishes; `""` disables the bridge |
 | `gnss_factor_require_rtk_fixed` | `true` | If true, only republish during RTK-class fixes |
 | `gnss_factor_max_position_stddev` | `0.10 m` | Reject poses whose NavSatFix covariance exceeds this |
 
 A periodic 10-second log line reports `N published, M rejected` so the operator can see the bridge actually doing work mid-session.
 
-**Behavior on RTK loss.** When RTK degrades to float / no-fix (tunnel, urban canyon), the bridge silently suspends; `gnss_global` sees a quiet topic and adds no factor for that interval. The optimizer's LiDAR cost carries the trajectory through the gap. When RTK locks again, factors resume on the next `/pose`. The session-long RTK requirement only applies to the initial pose (§6); per-message gating during the session is a soft suspend, not a hard block.
+**Behavior on RTK loss.** When RTK degrades to float / no-fix (tunnel, urban canyon), the adapter's Fixed-only odometry topic goes silent; `gnss_global` sees no bridge output and adds no factor for that interval. The optimizer's LiDAR cost carries the trajectory through the gap. When RTK locks again, factors resume on the next Fixed odometry sample. The session-long RTK requirement only applies to the initial pose (§6); per-message gating during the session is a soft suspend, not a hard block.
 
 Files touched: [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp), [`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json), [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py).
 
@@ -241,6 +245,8 @@ Three new top-level folders inside `GLIM_plusplus/` that hold integration-only c
 Inside [`docs/`](docs/):
 
 - [`moving_start_initialization.md`](docs/moving_start_initialization.md) — full design of §5 + §6 + §7. Covers the data flow, the RTK gate semantics, sample warning output, sample success output, and how to operate without RTK.
+- [`upstream_merge_2026-07-27.md`](docs/upstream_merge_2026-07-27.md) — the §14 merge record: what was ported from upstream `ucb-roar` + PR #15, what was deliberately skipped, and how each dome-specific behavior was preserved through the conflict resolutions.
+- [`tf_verification_2026-07-27.md`](docs/tf_verification_2026-07-27.md) — end-to-end verification of the P1 and Robin W extrinsics against the 3D design files (SCAD parameters, STL measurements, sensor datasheets), including the yaml → URDF → GLIM-config chain.
 - [`multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md) — root-cause analysis of the chicken-and-egg between odometry initialization and VGICP convergence basin, the three-layer fix, post-run verification checks (GNSS factor count, pose-graph edges, `T_world_utm.txt` stability, trajectory altitude vs GNSS altitude), and a five-step escalation if the default fix isn't sufficient.
 
 ## 11. What was NOT changed
@@ -306,11 +312,13 @@ replacing the in-file copy in `glim_rosbag.cpp`):
 - **Per-frame merge evidence** (`frame_diag_log: true`): one parseable
   `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… span=…s total_pts=…`
   INFO line per primary scan, plus per-aux signed header-offset stats every
-  512 merges warning at |mean| > 20 ms — with three PTP-synced Robin W this
-  should never fire; if it does, the sync (PTP_sync/) is broken.
-- Robin W note: FLOAT32 scan-relative per-point times are rebased by the
-  inter-scan dt on merge; the absolute-epoch (uint64 ns) pass-through branch
-  is inert here.
+  512 merges. (The |mean| > 20 ms warning documented here was **removed** in
+  the 2026-07-27 re-merge — see §14: the header dt is acquisition phase, not
+  a residual clock-offset estimate, and must never be copied into a
+  correction.)
+- Robin W note: per-point time handling was reworked in the 2026-07-27
+  re-merge and is now **encoding-agnostic**. See §14 — including an open
+  question about which encoding the driver actually emits.
 
 **GNSS global module** (extends §7/§8):
 
@@ -332,12 +340,14 @@ replacing the in-file copy in `glim_rosbag.cpp`):
   `[1e-6, 1e-6, 1e2]`.
 
 **Offline pipeline**: epoch-anchored multi-LiDAR rebase plumbing
-(`points_callback(msg, epoch_anchor_count)`) — a no-op for Robin W's
-scan-relative times, kept for parity with GICP++'s concat. GLIM maps
+(`points_callback(msg, epoch_anchor_count)`) — engages only for absolute
+per-point time encodings (see §14), kept for parity with GICP++'s concat.
+GLIM maps
 OFFLINE by default (`glim_ros/enable_online_mapping: false`):
-`glim_rosbag` feeds `/pose` + `/gps/fix` from the bag into the same INS
-init gate and RTK-gated GNSS factor bridge the live path uses, so offline
-mapping needs no extra nodes. Flip the flag deliberately if you map live.
+`glim_rosbag` feeds `/gps_p1/filtered_odom_rtk_fixed` + `/gps_p1/fix` from the
+bag into the same INS init gate and RTK-gated GNSS factor bridge the live
+path uses. The adapter must run during capture so its Fixed-only output is
+present in the bag. Flip the flag deliberately if you map live.
 
 **Dense localization-map profile — NOT enabled here.** A denser
 preprocess/submap profile exists as an option, but the Robin W density/CPU
@@ -346,6 +356,133 @@ commented pointer. Derive dense variants from this platform's configs,
 rebuild a map, then **re-baseline the GICP++ fitness floor** with
 `GICP_plusplus/scripts/analyze_scan_debug_log.py` before tuning any GICP++
 ratio thresholds.
+
+## 14. 2026-07-27 upstream re-merge
+
+Re-synced against `augcog/DLIO_plusplus` branch `ucb-roar` (fork point
+`edfede3` → tip `69eb574`) plus upstream **PR #15** (`19c1537`+`2aeb05f`,
+still an OPEN PR at merge time). Every dome adaptation in §1–§13 is
+preserved: P1 GNSS stays the GNSS source with its own bridge contract
+(`/gnss/pose_rtk_only`, `PoseWithCovarianceStamped`), Robin W stays the
+LiDAR, and the Naive/INS-driven initialization is unchanged. Full merge
+record: [`docs/upstream_merge_2026-07-27.md`](docs/upstream_merge_2026-07-27.md).
+
+> The shipped production path now also starts from
+> `/gps_p1/filtered_odom_rtk_fixed`. The local bridge retains its
+> `PoseWithCovarianceStamped` output contract so map-status accounting and
+> dual-antenna covariance propagation remain unchanged.
+
+**Per-point time and multi-LiDAR merge — the headline change.** Aux sweep
+selection no longer trusts header time. Where an *absolute* per-point time
+axis is decodable, an aux sweep is accepted only when its point-time
+endpoints match the primary's within `luminar_time_threshold` (10 ms);
+header time survives only as a tie-break and as a scheduling hint
+(`aux_match_time_offsets`). Residual clock corrections are a separate,
+explicitly-measured knob (`aux_point_time_offsets`) applied to point times,
+never inferred from the header phase. The offline reader gained a
+deterministic **two-pass point-time join** (`two_pass_point_time_join`):
+pass 1 indexes every scan's point-time range and plans each merge, pass 2
+releases each primary exactly when its planned sweeps have arrived, bounded
+by `future_sweep_wait_timeout`. Where no absolute axis exists, the reader
+instead holds each primary until every aux header passes it (PR #15), which
+fixes the "always merge the *previous* side sweep" bias of naive
+header-nearest matching. New `lidar_concat` keys in `config_sensors.json`:
+`luminar_time_threshold`, `future_sweep_wait_timeout`,
+`two_pass_point_time_join`, `aux_match_time_offsets`,
+`aux_point_time_offsets` (all zero on the PTP-locked dome).
+
+> #### Robin W timestamp contract
+>
+> The Hitch Sensor Dome profile is definitive: its canonical Seyond Robin W
+> topic carries `timestamp/FLOAT64/count=1`, numeric Unix seconds. The pinned
+> driver reconstructs each value from the packet's absolute start time plus
+> the compact per-point offset. `coordinate_mode:=3` controls axes only.
+>
+> GLIM decodes the values as IEEE-754 doubles, verifies that they are absolute,
+> then TimeKeeper converts them to offsets from the first point for deskew.
+> The offline concat planner matches sweeps on their absolute endpoint ranges,
+> and `shift_cloud_timestamps()` does not add the inter-header delta to Robin W
+> points. `float64_time_is_epoch_ns` remains false; that flag is only for a
+> legacy raw-uint64 encoding mislabeled FLOAT64.
+>
+> See the root README's
+> [LiDAR per-point timestamp standard](../README.md#lidar-per-point-timestamp-standard)
+> for the complete five-vendor contract and the live-topic validation command.
+
+**GNSS global module** (extends §7/§8/§13):
+
+- **RTK-dropout un-anchoring** (`max_interp_gap_sec: 1.0`): a submap whose
+  bracketing GNSS samples straddle a dropout is left un-anchored rather than
+  pinned to a straight-line chord between dropout entry and exit — the chord
+  sagitta was warping curved GNSS-denied segments at ~1 cm stiffness.
+- **One-shot `T_world_utm` fit gates**: post-fit RMS residual gate
+  (`fit_max_rms`), *both-sides* `min_baseline` requirement (a frozen GNSS
+  could previously latch a garbage rotation forever), and an optional
+  recent-suffix fit (`fit_recent_baseline_window`) that rejects
+  stationary-launch transients.
+- **Covariance-adaptive position priors** (PR #15): precision =
+  `clamp(1/variance, prior_inf_floor, prior_inf_cap)` per axis, with optional
+  Huber wrapping (`position_prior_robust_width`). Fed by the per-sample
+  covariance the P1 bridge already publishes. **Off by default** (negative
+  floor/cap ⇒ legacy fixed `prior_inf_scale`).
+- **Anchor-divergence health gate** (PR #15): rolling median of the
+  *post-optimization* GNSS residual; if it exceeds `anchor_abort_median_m`
+  for `anchor_abort_consecutive_updates` global updates, the module reports
+  unhealthy via `ok()` and the offline run aborts instead of writing a
+  quietly-misanchored map. **Off by default** (`0.0`).
+- **Optional gravity prior** (`gravity_prior_sigma_deg`, PR #15): a
+  `Pose3AttitudeFactor` constraining roll/pitch from the INS orientation
+  without touching yaw. **Off by default** — enable only for a validated
+  fused-INS attitude stream (some publishers emit identity quaternions as an
+  "unavailable" placeholder).
+- **Delivery accounting**: emitted-vs-delivered factor counts and a
+  machine-parseable `gnss_global summary: …` line at exit
+  (`factors_undelivered`, `submap_anchor_coverage`, `anchor_residual_median_m`,
+  bracket stats). Gate map acceptance on this line, not on a clean exit code —
+  a run can exit 0 while being completely un-anchored.
+- Also fixed: submap-origin snapshot race against post-optimization rewrites,
+  GNSS stamp monotonicity/non-finite guards, `T_world_utm.txt` write mutex,
+  and an offline-replay throttle caused by the old `needs_wait()` predicate.
+
+**Core / ROS**
+
+- **Epoch-reset detection** in `TimeKeeper`: an IMU or LiDAR timestamp rewind
+  > 5 s (bag loop, sensor power-cycle) is reported loudly and stalls, instead
+  of silently mixing epochs through the preintegration and GNSS queues.
+- `points_time_offset` moved *inside* `TimeKeeper::process()` so it survives
+  the absolute-time stamp overwrite (it was previously discarded for
+  absolute-time clouds).
+- `fix_imu_bias` now pins every state to the **initial** bias, not the
+  unconfigured (zero) `sensors/imu_bias`.
+- URDF `T_lidar_imu` override is verified to have persisted to disk and
+  aborts loudly on a read-only install prefix (it is consumed by other
+  modules *via* that file).
+- Online mapping combined with `lidar_concat` is now **refused at startup**:
+  the live path has no future-sweep release and would silently drop the late
+  aux sweep. Build concat maps offline with `glim_rosbag` — which is already
+  this platform's default (`enable_online_mapping: false`), so no
+  operational change here.
+- Optional `sensors/imu_input_rotation` quaternion (PR #15) for a measured
+  IMU mount tilt; identity here.
+- **Long-run pose-graph quality** (PR #15): loop-candidate bounding,
+  correction-magnitude rejection gates, and bounded forced relinearization in
+  `global_mapping_pose_graph`. Only active with the pose-graph backend — this
+  platform runs the GPU `GlobalMapping` backend, so it is currently latent.
+  A post-merge **P2 fix** was applied there so extension-module factors are
+  delivered on the final flush (details in the merge doc).
+
+**Tests**: `glim_ros2/test/lidar_concat_point_time_test.cpp` (12 cases:
+upstream point-time matching + the fork's Robin W encoding cases). Built
+under `BUILD_TESTING`; run with `colcon test --packages-select glim_ros`.
+
+**Tooling** (PR #15): `scripts/generate_glim_mapping_config.py` generates a
+self-contained high-quality mapping profile (defaults adapted to this
+platform's Robin W topics/frames; everything overridable via CLI), and
+`scripts/export_glim_dump_to_pcd.py` exports a dump to PCD.
+
+**TF verification**: the P1 and Robin W extrinsics were re-verified against
+the 3D design after the merges — see
+[`docs/tf_verification_2026-07-27.md`](docs/tf_verification_2026-07-27.md).
 
 ## Quick start
 
@@ -367,6 +504,27 @@ ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
+```
+
+Optional extras:
+
+```bash
+# Unit tests (per-point time decoding + aux sweep matching, 12 cases)
+colcon build --packages-select glim_ros --cmake-args -DBUILD_TESTING=ON
+colcon test --packages-select glim_ros && colcon test-result --verbose
+
+# Generate a self-contained high-quality mapping profile for one run
+# (defaults target this platform's Robin W topics/frames; --help for all knobs)
+python3 GLIM_plusplus/scripts/generate_glim_mapping_config.py \
+    --imu-topic /gps_p1/imu \
+    --t-lidar-imu -0.080 0 -0.1145 0 0 0 1 \
+    --urdf-path GLIM_plusplus/config/sensor_dome.urdf \
+    --aux-lidar /robin_w_rear_left/points:lidar_rear_left_link \
+    --aux-lidar /robin_w_rear_right/points:lidar_rear_right_link \
+    --offload-dir /tmp/glim_run1 --output-dir glim_profiles/run1
+
+# Export a finished dump to a single PCD
+python3 GLIM_plusplus/scripts/export_glim_dump_to_pcd.py --help
 ```
 
 The ROS 2 package names (`glim`, `glim_ext`, `glim_ros`) are unchanged — only the workspace folder differs from upstream. So `colcon build --packages-select glim …` works identically.

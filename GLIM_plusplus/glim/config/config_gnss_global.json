@@ -1,0 +1,45 @@
+{
+  // Run-local GNSS configuration. The matching config_gnss_global key in
+  // config.json makes this file authoritative for both GlobalConfigExt and
+  // the provenance snapshot written under <dump>/config.
+  "gnss": {
+    "gnss_topic": "/gnss/pose_rtk_only",
+    "gnss_msg_type": "geometry_msgs/msg/PoseWithCovarianceStamped",
+    "min_baseline": 10.0,
+    "fit_recent_baseline_window": true,
+    "fit_min_samples": 10,
+    "fit_validation_samples": 10,
+    "fit_max_rms": 0.25,
+    "prior_inf_scale": [
+      100.0,
+      100.0,
+      25.0
+    ],
+    "prior_inf_floor": [
+      100.0,
+      100.0,
+      25.0
+    ],
+    "prior_inf_cap": [
+      2500.0,
+      2500.0,
+      1000.0
+    ],
+    "position_prior_robust_width": 1.5,
+    "anchor_abort_median_m": 0.5,
+    "anchor_residual_window": 100,
+    "anchor_residual_min_samples": 20,
+    "anchor_abort_consecutive_updates": 5,
+    "enable_orientation_prior": false,
+    "orientation_prior_inf_scale": [
+      1e-6,
+      1e-6,
+      1e2
+    ],
+    "orientation_prior_max_yaw_sigma_deg": 3.0,
+    "gravity_prior_sigma_deg": 0.0,
+    "max_interp_gap_sec": 1.0,
+    "enable_lever_arm": false,
+    "urdf_gnss_frame": ""
+  }
+}

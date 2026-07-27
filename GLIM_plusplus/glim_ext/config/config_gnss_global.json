@@ -14,7 +14,7 @@
   // runs a small RTK-gated bridge:
   //
   //     /pose          (Atlas Duo INS, PoseStamped) ─┐
-  //     /gps/fix       (NavSatFix, gate signal)      │
+  //     /gps_p1/fix    (adapter NavSatFix gate)      │
   //                                                  ▼
   //                           GlimROS::try_publish_gnss_factor
   //                           - require RTK-fixed (configurable)
@@ -30,7 +30,7 @@
   // During RTK-float / no-fix / tunnel periods, the bridge silently
   // suspends — gnss_global gets no input and emits no factors,
   // and the optimizer's LiDAR cost carries the trajectory through the
-  // gap. When RTK locks again, factors resume on the next /pose.
+  // gap. When RTK locks again, factors resume on the next Fixed odometry sample.
   //
   // gnss_topic / gnss_msg_type
   //   /gnss/pose_rtk_only is the bridge's output, set to match the
@@ -40,59 +40,98 @@
   //   config_ros.json.
   //
   // min_baseline
-  //   Minimum motion (m) before a new GNSS factor is added by the
-  //   gnss_global module. The bridge already publishes at the source's
-  //   /pose rate (10 Hz Atlas Duo), so this just deduplicates within
-  //   gnss_global. 0.5 m is a sensible lap-mapping default; lower to
-  //   0.25 m for very fast vehicles.
-  //
-  // prior_inf_scale
-  //   Information matrix diagonal (x, y, z) for the GNSS prior factor.
-  //   The z component is 5× larger than horizontal because the
-  //   canonical multi-lap failure mode is z-drift; Atlas Duo + RTK
-  //   delivers ~1 cm vertical, so giving GNSS extra authority on z is
-  //   justified. Drop z back to 1e4 if you relax the bridge gate to
-  //   accept RTK-float (i.e., set gnss_factor_require_rtk_fixed=false).
-  //
-  // enable_orientation_prior  (Hitch Sensor Dome fork)
-  //   When TRUE the module emits an additional PoseRotationPrior factor
-  //   on each submap, pulling its yaw toward the heading carried in the
-  //   incoming PoseWithCovarianceStamped / Odometry quaternion.
-  //
-  //   Default is FALSE because the checked-in TF uses the single-antenna
-  //   sentinel for gnss_antenna_secondary_link. Flip this to true only
-  //   after installing and configuring the secondary antenna translation.
-  //
-  //   ⚠ SET TO FALSE for single-antenna installations. With only one
-  //   antenna, the heading on /pose is gyro-integrated and drifting
-  //   over the session. Enabling this factor in single-antenna mode
-  //   would tie the optimizer to a reference that is itself drifting —
-  //   worse than leaving yaw under LiDAR + IMU control alone. The
-  //   single-antenna fallback path requires this flag to be flipped
-  //   off; see README "GLIM++ GNSS yaw prior" callout.
-  //
-  // orientation_prior_inf_scale  (Hitch Sensor Dome fork)
-  //   Information matrix diagonal in (roll, pitch, yaw) for the
-  //   rotation prior. The recommended weighting is essentially
-  //   yaw-only: [1e-6, 1e-6, 1e2]. Reasoning:
-  //     - Roll and pitch are well-observed from IMU + gravity; GNSS
-  //       adds nothing to those axes.
-  //     - Yaw is the drift-prone axis that dual-antenna RTK heading
-  //       constrains directly via baseline measurement.
-  //   The tiny 1e-6 on roll/pitch keeps the information matrix
-  //   strictly positive-definite for GTSAM without effectively
-  //   constraining those axes.
-  //   Order: (roll, pitch, yaw), interpreted in the local Lie algebra
-  //   of Pose3's rotation block.
+    // [H2 CORRECTION 2026-07-27] This does NOT deduplicate GNSS factors.
+    // Grep the module: min_baseline appears only in the one-shot T_world_utm
+    // fit gate and NEVER in the factor-emission loop — every associated
+    // submap gets a factor regardless of motion. It is the minimum
+    // estimate-side AND GNSS-side endpoint displacement required before the
+    // world<->UTM alignment may be fitted at all. It was previously lowered
+    // 5.0 -> 0.5 on the mistaken dedup reading, which is what let a 2-sample
+    // fit latch a several-degree yaw error (see H1). Restored to 10.0.
   "gnss": {
+    // ===================================================================
+    // GNSS FACTOR SOURCE — production vs compatibility
+    // ===================================================================
+    // PRODUCTION (recommended): point this at the adapter's AUTHORITATIVE
+    // fixed stream. adapter/src/adapter_utils.cpp:124 (posePassesRtkGate)
+    // admits a sample only when solution_type == kRtkFixed AND the
+    // covariance is finite and in range — an EXPLICIT fixed-vs-float
+    // decision taken from the FusionEngine solution type:
+    //
+    //   "gnss_topic":    "/gps_p1/filtered_odom_rtk_fixed",
+    //   "gnss_msg_type": "nav_msgs/msg/Odometry",
+    //
+    // Record that topic in mapping bags. This is the posture Hitch
+    // production mapping should use.
+    //
+    // SHIPPED PRODUCTION PATH: config_ros.json now feeds this bridge only from
+    // /gps_p1/filtered_odom_rtk_fixed. The adapter creates that topic from an
+    // explicit FusionEngine solution_type == kRtkFixed decision, so Float and
+    // all lower classes produce no message and LiDAR-IMU SLAM carries the gap.
+    //
+    // COMPATIBILITY ONLY: changing config_ros.json back to raw /pose makes this
+    // a NavSatFix heuristic. REP-145 STATUS_GBAS_FIX cannot distinguish Float
+    // from Fixed, so that mode must not be used for production mapping.
     "gnss_topic": "/gnss/pose_rtk_only",
     "gnss_msg_type": "geometry_msgs/msg/PoseWithCovarianceStamped",
-    "min_baseline": 0.5,
+    "min_baseline": 10.0,
+    // Fit the newest suffix that still spans min_baseline on both the estimate
+    // and GNSS trajectories. This keeps stationary/low-speed startup
+    // transients from dominating the one-shot yaw fit.
+    "fit_recent_baseline_window": true,
+    // [H1 FIX 2026-07-27] Minimum associated submaps in the fit window, and
+    // the number of SUBSEQUENT unfitted samples the candidate transform must
+    // additionally predict within fit_max_rms before it is latched. The
+    // in-sample RMS below measures fit CONSISTENCY, not yaw OBSERVABILITY: a
+    // short noisy segment is reproduced exactly by its own least-squares fit,
+    // so a badly-rotated transform can report ~0 RMS. Only an out-of-sample
+    // residual can catch that.
+    "fit_min_samples": 10,
+    "fit_validation_samples": 10,
+    // Max post-fit RMS residual (m) to accept an alignment. Was ABSENT, so the
+    // permissive 2.0 m code default silently applied.
+    "fit_max_rms": 0.25,
+    // [H1 FIX 2026-07-27] Lowered from [1e4, 1e4, 5e4] (sigma ~1 cm horizontal /
+    // 4.5 mm vertical). With prior_inf_floor/cap now set, the adaptive
+    // covariance-aware path is ACTIVE and this vector is only the fallback for
+    // samples that carry no usable covariance — leaving it at 1 cm would have
+    // made a covariance-less sample STIFFER than the capped adaptive maximum
+    // (2500 => 2 cm). Matched to the validated generated profile.
     "prior_inf_scale": [
-      1e4,
-      1e4,
-      5e4
+      100.0,
+      100.0,
+      25.0
     ],
+    // Optional covariance-aware position precision =
+    // clamp(1 / variance, floor, cap). Negative vectors preserve the legacy
+    // fixed prior_inf_scale behavior (the P1 bridge publishes
+    // PoseWithCovarianceStamped, so per-sample position variances ARE
+    // available when enabling this). The generated high-quality mapping
+    // profile enables the proven floor/cap values per run.
+    "prior_inf_floor": [
+      100.0,
+      100.0,
+      25.0
+    ],
+    "prior_inf_cap": [
+      2500.0,
+      2500.0,
+      1000.0
+    ],
+    // Huber width in normalized residual units; <= 0 disables robust wrapping.
+    "position_prior_robust_width": 1.5,
+    // Rolling optimized GNSS-anchor rejection gate; <= 0 disables it. The
+    // residual is measured after the global iSAM2 update, not against the raw
+    // LIO pose before the GNSS factor has been applied. The run-local
+    // high-quality profile enables this only with its matching GNSS contract.
+    "anchor_abort_median_m": 0.5,
+    "anchor_residual_window": 100,
+    "anchor_residual_min_samples": 20,
+    // Require this many consecutive optimized global updates above the same
+    // median threshold before latching failure. One preserves the historical
+    // fail-fast behavior; run-local profiles can tolerate a short iSAM2
+    // convergence transient without relaxing anchor_abort_median_m.
+    "anchor_abort_consecutive_updates": 5,
     "enable_orientation_prior": false,
     "orientation_prior_inf_scale": [
       1e-6,
@@ -115,6 +154,22 @@
     // otherwise ingest. <= 0 disables the gate; samples without populated
     // yaw covariance pass (covariance-less publishers keep old behavior).
     "orientation_prior_max_yaw_sigma_deg": 3.0,
+    // Optional gravity-direction prior from the GNSS/INS orientation. This
+    // constrains body Z (roll/pitch) without constraining yaw. The value is the
+    // 1-sigma angular uncertainty in degrees; <= 0 disables it. Keep disabled
+    // in shared config because some generic pose publishers use an identity
+    // quaternion as an "orientation unavailable" placeholder. A run-local
+    // profile may enable it only for a validated fused-INS orientation stream
+    // (the Atlas Duo dual-antenna attitude qualifies once validated on a bag).
+    "gravity_prior_sigma_deg": 0.0,
+    // [P1 FIX 2026-07-09] Max GNSS bracket width (seconds) for submap
+    // association. Submaps whose bracketing samples are further apart than
+    // this (i.e., inside an RTK dropout) are left UN-ANCHORED instead of
+    // being pinned to a straight-line chord between dropout entry and exit.
+    // Healthy filtered-odom output is ~10 Hz+, so 1.0 s passes normal
+    // operation with wide margin and blocks every real dropout. <= 0
+    // restores the legacy (chord-interpolating) behavior.
+    "max_interp_gap_sec": 1.0,
     // Software antenna -> IMU lever-arm compensation.
     //
     // Set to FALSE for tightly-coupled INS receivers (Point One Atlas,

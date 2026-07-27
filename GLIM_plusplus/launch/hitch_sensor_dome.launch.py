@@ -18,15 +18,16 @@
 #      in glim/config/config_ros.json makes glim_rosnode refuse to run).
 #      Record the session (recording/), then build the map with:
 #        ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out>
-#      glim_rosbag feeds /imu/data, /robin_w_*/points, /pose, and /gps/fix
-#      from the bag into the same callbacks the live path would use, so
-#      INS init and the RTK-gated GNSS factor bridge behave identically.
+#      glim_rosbag feeds /imu/data, /robin_w_*/points,
+#      /gps_p1/filtered_odom_rtk_fixed, and /gps_p1/fix from the bag into the
+#      same callbacks the live path would use, so INS init and the
+#      RTK-gated GNSS factor bridge behave identically.
 #      A launch-time diagnostic still runs dual-antenna detection and the
 #      orientation-prior consistency check (see _build_glim_node).
 #
 #   4. C++-side INS initialization (Hitch fork). In offline replay the
-#      first PoseStamped on ins_pose_topic (config_ros.json, default
-#      /pose) that passes the RTK gate is forwarded to
+#      first Odometry on ins_odom_topic (config_ros.json, production default
+#      /gps_p1/filtered_odom_rtk_fixed) that passes the synchronized fix gate is forwarded to
 #      OdometryEstimationIMU::set_init_state(), which pins
 #      NaiveInitialStateEstimation's force_init pathway. GLIM's
 #      gravity-from-accelerometer calibration is NEVER invoked in this
@@ -43,8 +44,8 @@
 # Usage:
 #   ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 #   ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py foxglove:=false
-#   ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py \
-#                            ins_pose_topic:=/atlas/pose
+# Topic/gate settings are read from glim/config/config_ros.json; the
+# similarly named launch arguments below are documentation-only.
 # =============================================================================
 
 import json
@@ -67,7 +68,7 @@ GLIM_DIR = HERE.parent                          # GLIM_plusplus/
 REPO_ROOT = GLIM_DIR.parent                     # Hitch_Sensor_Dome/
 DEFAULT_TF_YAML = REPO_ROOT / "config" / "sensor_dome_tf.yaml"
 DEFAULT_GLIM_CONFIG = GLIM_DIR / "glim" / "config"
-DEFAULT_GNSS_CONFIG = GLIM_DIR / "glim_ext" / "config" / "config_gnss_global.json"
+DEFAULT_GNSS_CONFIG = DEFAULT_GLIM_CONFIG / "config_gnss_global.json"
 SCRIPTS_DIR = GLIM_DIR / "scripts"
 
 # Bold-yellow ANSI escape — used for consistency-mismatch warnings.
@@ -129,8 +130,8 @@ def _maybe_pre_flight(context, *args, **kwargs):
 
 
 def _read_orientation_prior_flag(gnss_config_path: Path):
-    """Parse GLIM_plusplus/glim_ext/config/config_gnss_global.json (JSONC
-    format — has `// …` comments) and return the value of
+    """Parse the run-local config_gnss_global.json (JSONC format — has
+    `// …` comments) and return the value of
     gnss.enable_orientation_prior. Returns None if the file cannot be
     read or the key is absent, so callers can distinguish "not present"
     from "present and false".
@@ -269,8 +270,9 @@ def _build_glim_node(context, *args, **kwargs):
         ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out>
 
     glim_rosbag reads the INS init-gate / GNSS-factor-bridge settings from
-    glim/config/config_ros.json ("glim_ros" section) and feeds /pose +
-    /gps/fix from the bag itself. The ins_* / gnss_factor_* launch
+    glim/config/config_ros.json ("glim_ros" section) and feeds the adapter's
+    Fixed-only odometry + /gps_p1/fix from the bag itself. The ins_* /
+    gnss_factor_* launch
     arguments are NOT forwarded to GLIM (they never were — the C++ reads
     config_ros.json, not ROS parameters); they are kept only as documented
     defaults. Edit config_ros.json to change gate thresholds or topics.
@@ -348,22 +350,22 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "ins_pose_topic",
-            default_value="/pose",
-            description="INS PoseStamped topic for GLIM's external init "
-                        "(Atlas Duo /pose by default). Set to '' to disable "
-                        "and rely on ins_odom_topic instead.",
+            default_value="",
+            description="Compatibility-only INS PoseStamped topic for GLIM's "
+                        "external init. Empty in the production Fixed-only "
+                        "profile; edit config_ros.json to change it.",
         ),
         DeclareLaunchArgument(
             "ins_odom_topic",
-            default_value="",
-            description="INS Odometry topic for GLIM's external init. "
-                        "Provides linear velocity in addition to orientation. "
-                        "Empty by default (use ins_pose_topic).",
+            default_value="/gps_p1/filtered_odom_rtk_fixed",
+            description="Production Fixed-only INS Odometry topic for GLIM's "
+                        "external init. Emitted by adapter only for "
+                        "FusionEngine kRtkFixed; edit config_ros.json to change it.",
         ),
         DeclareLaunchArgument(
             "ins_fix_topic",
-            default_value="/gps/fix",
-            description="NavSatFix topic used as the RTK gate signal. "
+            default_value="/gps_p1/fix",
+            description="Adapter NavSatFix topic used as the RTK gate signal. "
                         "GLIM rejects all INS poses until the most recent "
                         "fix here shows RTK-class status and "
                         "covariance below ins_max_position_stddev.",
@@ -373,8 +375,9 @@ def generate_launch_description() -> LaunchDescription:
             default_value="true",
             description="If true, require NavSatFix.status >= GBAS_FIX "
                         "(RTK-class) before accepting an INS pose. Set to "
-                        "false to allow SBAS / single-point starts (degraded; "
-                        "moving-start fix is no longer guaranteed).",
+                        "false to allow lower valid fix classes, or an "
+                        "Odometry-only start when its covariance passes the "
+                        "position gate (degraded).",
         ),
         DeclareLaunchArgument(
             "ins_max_position_stddev",

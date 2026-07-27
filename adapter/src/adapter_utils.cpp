@@ -23,8 +23,22 @@ double stampToSec(const builtin_interfaces::msg::Time& stamp)
 
 builtin_interfaces::msg::Time secToStamp(double sec)
 {
-  const int64_t ns = static_cast<int64_t>(std::llround(sec * 1e9));
   builtin_interfaces::msg::Time stamp;
+  // [P2 FIX 2026-07-14] Guard the int32 seconds field. `sec * 1e9` for a
+  // non-finite or out-of-range input overflows the int32 cast (UB): the
+  // FusionEngine 0xFFFFFFFF "time unavailable" sentinel (~4.29e9 s) lands
+  // directly past INT32_MAX seconds (~2.147e9). Clamp to a representable
+  // range so a poisoned stamp becomes a benign bounded value, never UB.
+  if (!std::isfinite(sec) || sec <= 0.0) {
+    stamp.sec = 0;
+    stamp.nanosec = 0;
+    return stamp;
+  }
+  constexpr double kMaxStampSec = 2147483647.0;  // INT32_MAX seconds
+  if (sec > kMaxStampSec) {
+    sec = kMaxStampSec;
+  }
+  const int64_t ns = static_cast<int64_t>(std::llround(sec * 1e9));
   stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
   stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
   return stamp;
@@ -111,16 +125,61 @@ bool posePassesRtkGate(const fusion_engine_msgs::msg::Pose& msg,
                        double max_var_xy,
                        double max_var_z)
 {
+  // [P3 FIX 2026-07-10] Require finite NONNEGATIVE covariance: `<= max`
+  // alone let a negative sentinel (-1 = "unknown" in some publishers) pass
+  // the accuracy gate whenever solution_type said RTK_FIXED.
+  const auto ok = [](double v, double mx) { return std::isfinite(v) && v >= 0.0 && v <= mx; };
   return msg.solution_type == kRtkFixed &&
-         msg.position_covariance[0] <= max_var_xy &&
-         msg.position_covariance[4] <= max_var_xy &&
-         msg.position_covariance[8] <= max_var_z;
+         ok(msg.position_covariance[0], max_var_xy) &&
+         ok(msg.position_covariance[4], max_var_xy) &&
+         ok(msg.position_covariance[8], max_var_z);
 }
 
-P1ClockMapper::P1ClockMapper(double bin_seconds) : bin_seconds_(bin_seconds) {}
+// [P2 FIX 2026-07-09] bin_seconds <= 0 previously produced NaN/inf bins and
+// UB int casts; clamp to a sane floor.
+P1ClockMapper::P1ClockMapper(double bin_seconds) : bin_seconds_(std::max(1.0, bin_seconds)) {}
 
 void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
 {
+  // [P2 FIX 2026-07-09] Input validation + epoch-reset handling. FusionEngine
+  // encodes "time not yet available" as 0xFFFFFFFF in both Timestamp fields
+  // (~4.29e9 s): as the FIRST sample it used to poison first_p1_ (every later
+  // genuine sample -> bin < 0 -> mapper never ready -> zero IMU all run); as a
+  // LATER sample it triggered a ~1.7 GB bins_.resize() inside a callback.
+  // A P1 regression (device power-cycle, bag loop) used to freeze the mapper
+  // forever (bin < 0 on every subsequent pair).
+  constexpr double kInvalidP1SentinelSec = 4.0e9;  // sentinel converts to ~4.29e9
+  constexpr double kResetThresholdSec = 5.0;       // backward jump = epoch change
+  constexpr double kMaxSessionSec = 24.0 * 3600.0; // forward cap (bin count <= 1440)
+  constexpr int kGlitchResetCount = 100;           // persistent forward jump = epoch change
+
+  if (!std::isfinite(arrival_ros) || !std::isfinite(p1_time) || p1_time < 0.0 ||
+      p1_time >= kInvalidP1SentinelSec) {
+    return;
+  }
+  if (std::isfinite(first_p1_)) {
+    const double rel = p1_time - first_p1_;
+    if (rel < -kResetThresholdSec) {
+      // Backward epoch change: re-learn from scratch.
+      bins_.clear();
+      first_p1_ = p1_time;
+      forward_glitch_streak_ = 0;
+      applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
+    } else if (rel > kMaxSessionSec) {
+      // Single forward glitches are rejected; a persistent forward jump is a
+      // real epoch change and resets the mapper.
+      if (++forward_glitch_streak_ >= kGlitchResetCount) {
+        bins_.clear();
+        first_p1_ = p1_time;
+        forward_glitch_streak_ = 0;
+        applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
+      } else {
+        return;
+      }
+    } else {
+      forward_glitch_streak_ = 0;
+    }
+  }
   if (!std::isfinite(first_p1_)) {
     first_p1_ = p1_time;
   }
@@ -144,7 +203,16 @@ bool P1ClockMapper::ready() const
   return std::any_of(bins_.begin(), bins_.end(), [](const Bin& b) { return b.count > 0; });
 }
 
-double P1ClockMapper::toRos(double p1_time) const
+void P1ClockMapper::reset()
+{
+  bins_.clear();
+  first_p1_ = std::numeric_limits<double>::quiet_NaN();
+  applied_offset_ = std::numeric_limits<double>::quiet_NaN();
+  last_slew_p1_ = std::numeric_limits<double>::quiet_NaN();
+  forward_glitch_streak_ = 0;
+}
+
+double P1ClockMapper::toRos(double p1_time)
 {
   std::vector<std::pair<double, double>> envelope;
   envelope.reserve(bins_.size());
@@ -156,6 +224,7 @@ double P1ClockMapper::toRos(double p1_time) const
   if (envelope.empty()) {
     return p1_time;
   }
+  double target_offset;
   if (envelope.size() == 1 || offsetDrift(envelope) < 0.005) {
     std::vector<double> offsets;
     offsets.reserve(envelope.size());
@@ -164,21 +233,36 @@ double P1ClockMapper::toRos(double p1_time) const
     }
     const size_t mid = offsets.size() / 2;
     std::nth_element(offsets.begin(), offsets.begin() + static_cast<long>(mid), offsets.end());
-    return p1_time + offsets[mid];
-  }
-
-  if (p1_time <= envelope.front().first) {
-    return p1_time + envelope.front().second;
-  }
-  for (size_t i = 1; i < envelope.size(); ++i) {
-    if (p1_time <= envelope[i].first) {
-      const double t0 = envelope[i - 1].first;
-      const double t1 = envelope[i].first;
-      const double u = (p1_time - t0) / std::max(1e-9, t1 - t0);
-      return p1_time + envelope[i - 1].second * (1.0 - u) + envelope[i].second * u;
+    target_offset = offsets[mid];
+  } else if (p1_time <= envelope.front().first) {
+    target_offset = envelope.front().second;
+  } else {
+    target_offset = envelope.back().second;
+    for (size_t i = 1; i < envelope.size(); ++i) {
+      if (p1_time <= envelope[i].first) {
+        const double t0 = envelope[i - 1].first;
+        const double t1 = envelope[i].first;
+        const double u = (p1_time - t0) / std::max(1e-9, t1 - t0);
+        target_offset = envelope[i - 1].second * (1.0 - u) + envelope[i].second * u;
+        break;
+      }
     }
   }
-  return p1_time + envelope.back().second;
+
+  // [P3 FIX 2026-07-10] Slew instead of stepping: bounded offset motion of
+  // 0.5 ms per second of stream keeps consecutive output stamps' dt within
+  // ~0.5% of nominal even while bin refinement moves the raw estimate.
+  constexpr double kMaxSlewPerSec = 5e-4;
+  if (!std::isfinite(applied_offset_) || !std::isfinite(last_slew_p1_) ||
+      p1_time < last_slew_p1_ - 1.0) {
+    applied_offset_ = target_offset;  // first use or epoch reset: re-anchor
+  } else {
+    const double budget = kMaxSlewPerSec * std::max(0.0, p1_time - last_slew_p1_) + 1e-12;
+    const double delta = target_offset - applied_offset_;
+    applied_offset_ += std::clamp(delta, -budget, budget);
+  }
+  last_slew_p1_ = p1_time;
+  return p1_time + applied_offset_;
 }
 
 double P1ClockMapper::driftMs() const

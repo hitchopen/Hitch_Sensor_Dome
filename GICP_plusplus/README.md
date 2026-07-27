@@ -37,8 +37,8 @@ Topic, frame, and URDF defaults throughout the configs target the Hitch Sensor D
 | `lidar_frame` | `lidar_front_link` |
 | Aux LiDAR frames | `lidar_rear_left_link`, `lidar_rear_right_link` |
 | URDF auto-discovery | walks up for `GLIM_plusplus/config/sensor_dome.urdf` |
-| `sensor_type` | `velodyne` (Robin W in coordinate_mode:=3 publishes float32 relative `time` — identical to Velodyne convention) |
-| Absolute-epoch (uint64 ns) timestamp branches | present (`sensor_type: "luminar"`) but unused — Robin W takes the Velodyne float-seconds path |
+| `sensor_type` | `seyond` (`timestamp/FLOAT64`, numeric Unix seconds) |
+| Absolute timestamp handling | Robin W uses numeric absolute seconds; the separate `luminar` path retains raw uint64 epoch-ns support |
 
 Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py), [`include/dlio/dlio.h`](include/dlio/dlio.h), [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h), [`src/localization.cc`](src/localization.cc).
 
@@ -229,9 +229,10 @@ A small set of upstream additions that don't apply on the Hitch dome were remove
 - **`SensorType::LUMINAR`** enum value and its per-sensor branches were
   removed in the original retarget — and then RESTORED by the 2026-07 P1–P5
   improvements (§14), whose deskew/merge code paths reference them. The enum
-  is now `{ OUSTER, VELODYNE, HESAI, LIVOX, LUMINAR, UNKNOWN }` and
+  is now `{ OUSTER, VELODYNE, SEYOND, HESAI, LIVOX, LUMINAR, UNKNOWN }` and
   `sensor_type: "luminar"` parses (uint64 epoch-ns per-point timestamps);
-  the value is unused on the dome (Robin W uses the `velodyne` branch).
+  the value is unused on the dome (Robin W uses numeric FLOAT64 seconds via
+  the explicit `seyond` branch).
 - **`is_luminar_` dead member** in `localization.h` (declared but never used) — still removed.
 - **`luminar_uint64` parameter** on `shiftCloudTimestamps` — removed in the
   retarget, re-introduced with §14 (it selects the absolute-epoch no-shift
@@ -262,7 +263,7 @@ Important — so adopters can rely on the existing DLIO body of work and literat
 | [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service) | NEW | systemd unit, default scheduling, `Conflicts=race` |
 | [`src/nav_sat_gated_odom.cc`](src/nav_sat_gated_odom.cc) | NEW | RTK-gated INS odometry republisher (§3) |
 | [`src/localization.cc`](src/localization.cc) | MODIFIED | Sensor scrub + warm-start + yaw-rate attenuation + motion gate + gt_odom health + §14 P1–P5 improvements (incl. LUMINAR branches) |
-| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum: LUMINAR re-added for §14 (dome still uses `velodyne`) |
+| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum: explicit `SEYOND` absolute-seconds path; LUMINAR retained for §14 |
 | [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h) | MODIFIED | New member fields for yaw-rate attenuation + motion gate + gt_odom timer |
 | [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py) | NEW | GLIM++ submap → single PCD bridge (§4) |
 | [`scripts/convert_ply_to_pcd.py`](scripts/convert_ply_to_pcd.py) | UNCHANGED | Legacy single-file PLY→PCD; still shipped for fallback |
@@ -319,15 +320,13 @@ against the locked pre-fix baseline.
 - **Evidence-first defaults:** `debug/enable_pub` and `verbose_scan_log` are
   ON (and the `verbose:false` WARN clamp now spares the SCAN DEBUG lines).
 
-**Robin W notes.** `localization/sensor_type: "velodyne"` stays the correct
-decoder — Robin W in `coordinate_mode:=3` emits FLOAT32 seconds-since-sweep
-per point. The absolute-epoch machinery (UINT8[8] epoch-ns decoding,
-absolute-time concat pass-through, timestamp diagnostics) is **inert** on
-this platform and kept intact for sensors that need it. Aux scans merged by
-`lidar_concat` are FLOAT32-relative and DO get rebased by the inter-scan dt
-(`lidar_concat` remains disabled by default here until 3× Robin W PTP sync
-is validated; the strict-merge guard + per-frame evidence are ready when it
-is enabled).
+**Robin W notes.** `localization/sensor_type: "seyond"` validates
+`timestamp/FLOAT64/count=1` and interprets it as numeric Unix seconds. The
+deskewer uses those absolute capture times directly. Aux scans merged by
+`lidar_concat` remain on the shared PTP axis and are not rebased by the
+inter-header delta (`lidar_concat` remains disabled by default here until
+3x Robin W sweep alignment is validated; the strict-merge guard and per-frame
+evidence are ready when it is enabled).
 
 **Also included:** the Atlas `adapter` package at the repo root (optional
 alternative ingestion, see

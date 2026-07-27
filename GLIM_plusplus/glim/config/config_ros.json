@@ -126,7 +126,8 @@
     // and prints a periodic bold RED warning naming the rejection reason.
     // See GLIM/docs/moving_start_initialization.md for the full design.
     //
-    // ins_fix_topic                — NavSatFix gate signal (default /gps/fix).
+    // ins_fix_topic                — synchronized adapter NavSatFix gate
+    //                                 signal (default /gps_p1/fix).
     // ins_require_rtk_fixed        — true ⇒ enforce RTK-class status.
     //                                false ⇒ accept SBAS / single-point too
     //                                (degraded; only use without RTK base).
@@ -139,14 +140,83 @@
     // NOTE (B4 fix): these settings apply in BOTH modes — offline replay
     // (glim_rosbag / glim_pcap_rosbag reads the same topics from the bag
     // and feeds the gate callbacks directly) and the optional live path.
-    "ins_pose_topic": "/pose",
-    "ins_odom_topic": "",
-    "ins_fix_topic":  "/gps/fix",
+    // Production source: the adapter publishes this topic only when the
+    // FusionEngine solution_type is exactly kRtkFixed and its covariance is
+    // finite/in-range. Using that source makes Fixed-vs-Float an authoritative
+    // upstream decision instead of a REP-145 NavSatFix heuristic.
+    "ins_pose_topic": "",
+    // Initialization source. PoseStamped (/pose) carries no velocity and no
+    // FusionEngine solution_type, so it is compatibility-only. Production
+    // points ins_odom_topic at the adapter's FIXED-ONLY stream and clears
+    // ins_pose_topic —
+    //   "ins_pose_topic": "",
+    //   "ins_odom_topic": "/gps_p1/filtered_odom_rtk_fixed",
+    // nav_msgs/Odometry carries P1's own velocity, which is authoritative
+    // for a tightly-coupled INS and avoids the finite-difference estimate.
+    // The topic itself is emitted only for solution_type == kRtkFixed; the
+    // synchronized NavSatFix companion below supplies the covariance, WGS84
+    // position, and timestamp checks.
+    "ins_odom_topic": "/gps_p1/filtered_odom_rtk_fixed",
+    "ins_fix_topic":  "/gps_p1/fix",
+    // SLAM STARTS ONLY AT RTK-FIXED. Initialization waits for a fresh,
+    // validated RTK-class fix: the map origin must be globally referenced
+    // and the INS attitude validated before any factor is built. Leaving
+    // this true is the production posture. False accepts valid non-RTK fixes
+    // and, when NavSatFix is absent, permits Odometry only if its own finite,
+    // positive position covariance passes ins_max_position_stddev. A
+    // covariance-less PoseStamped still fails closed.
+    // NOTE: after initialization, RTK loss does NOT stop mapping — GNSS
+    // factors simply suspend and LiDAR-IMU SLAM carries the trajectory.
     "ins_require_rtk_fixed": true,
     "ins_max_position_stddev": 0.10,
+    // INS stability gate — MOVING-START CAPABLE (2026-07-27).
+    // The Atlas Duo is a tightly-coupled INS, so its calibration/attitude/
+    // velocity are P1's responsibility. This gate therefore only checks that
+    // P1's solution is SETTLED and SELF-CONSISTENT; it does NOT require the
+    // vehicle to be stationary.
+    //
+    // ins_min_pose_window_samples — consecutive contiguous samples required
+    //   (floored at 3, since a constant-velocity prediction needs three).
+    //   10 samples at the Atlas's 10 Hz = 1.0 s of settled solution.
     "ins_min_pose_window_samples": 10,
+    // ins_max_pose_jitter_trans — max position RESIDUAL (m) against a
+    //   constant-velocity prediction from the two preceding samples. NOT a
+    //   displacement bound: steady motion at any speed gives ~0 residual.
+    //   Under constant acceleration a the residual is a*dt^2, so 0.05 m at
+    //   10 Hz tolerates ~5 m/s^2 (0.5 g) of real vehicle dynamics before the
+    //   solution is called unsettled. Raise it if mapping runs start under
+    //   harder acceleration; lower it to demand a calmer start.
     "ins_max_pose_jitter_trans": 0.05,
+    // ins_min_quat_dot — same idea for attitude: |q_pred . q| against a
+    //   constant-angular-rate prediction. 0.999 ~ 2.5 deg of residual, i.e.
+    //   ~250 deg/s^2 of angular acceleration at 10 Hz. A steady turn passes
+    //   at any rate; an attitude snap does not.
     "ins_min_quat_dot": 0.999,
+    // ins_max_pose_gap_s — max gap (s) between consecutive accepted samples
+    //   before the window is discarded as non-contiguous. Samples enter the
+    //   window only after the RTK gates pass, so without this a fix that
+    //   flickers into RTK once every N seconds could assemble a "stable"
+    //   window out of moments minutes apart.
+    "ins_max_pose_gap_s": 0.5,
+    // --- Fix freshness (B3 fix, 2026-07-27) ---
+    // A NavSatFix authorizes a gating decision only while it is FRESH.
+    // Age is measured between MESSAGE header stamps (the pose being gated
+    // vs the fix), never wall time — offline replay runs at arbitrary
+    // speed. Without this a single RTK sample licensed initialization and
+    // every GNSS factor for the rest of a session, even while the receiver
+    // was dead-reckoning. At the Atlas's 10 Hz fix rate 0.5 s is
+    // conservative (5 missed messages).
+    "fix_max_age_s": 0.5,
+    // Small allowance for a fix stamped marginally ahead of the pose it
+    // gates (benign publisher-side ordering). Beyond this the fix is
+    // refused as implausibly future-dated.
+    "fix_future_tolerance_s": 0.05,
+    // Operator policy for the END OF RUN. LiDAR-IMU SLAM is the primary
+    // estimator; GNSS is an optional global constraint. A map whose origin
+    // is RTK-anchored but which saw no further RTK is reported
+    // "rtk_origin_only" and ACCEPTED by default. Set true to make that an
+    // exit-nonzero failure (a run that never initialized always fails).
+    "require_rtk_anchor": false,
     "ins_init_timeout_s": 60.0,
     // GNSS factor bridge (post-init, RTK-gated republisher feeding
     // libgnss_global.so — gnss_topic in config_gnss_global.json must match

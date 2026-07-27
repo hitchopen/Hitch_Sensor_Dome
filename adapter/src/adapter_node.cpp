@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -21,11 +22,23 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "sensor_msgs/msg/nav_sat_fix.hpp"
+#include "sensor_msgs/msg/nav_sat_status.hpp"
 
 namespace {
 
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 constexpr double kDegToRadSq = kDegToRad * kDegToRad;
+constexpr double kLegacyOriginLat = 39.58227391;
+constexpr double kLegacyOriginLon = -86.74232215;
+constexpr double kLegacyOriginAlt = 260.4;
+
+bool isLegacyPlaceholderOrigin(double lat, double lon, double alt)
+{
+  return std::abs(lat - kLegacyOriginLat) < 1.0e-8 &&
+         std::abs(lon - kLegacyOriginLon) < 1.0e-8 &&
+         std::abs(alt - kLegacyOriginAlt) < 1.0e-3;
+}
 
 }  // namespace
 
@@ -41,7 +54,10 @@ public:
     imu_input_topic_ = declare_parameter("imu_input_topic", "/atlas/imu_calibrated");
     imu_stamp_mode_ = declare_parameter("imu_stamp_mode", "auto");
     p1_like_threshold_sec_ = declare_parameter("p1_like_threshold_sec", 100000000.0);
-    imu_lookahead_ = static_cast<size_t>(declare_parameter("imu_arrival_retime_lookahead", 128));
+    // [P2 FIX 2026-07-09] clamp: a negative value wrapped to SIZE_MAX and the
+    // arrival-retime queue never published during continuous streaming.
+    imu_lookahead_ = static_cast<size_t>(
+        std::clamp<int64_t>(declare_parameter("imu_arrival_retime_lookahead", 128), 1, 4096));
     imu_flush_timeout_sec_ = declare_parameter("imu_flush_timeout_sec", 0.5);
     nominal_imu_period_sec_ = declare_parameter("nominal_imu_period_sec", 0.01);
     imu_period_sec_ = nominal_imu_period_sec_;
@@ -54,24 +70,62 @@ public:
     imu_frame_id_ = declare_parameter("imu_frame_id", "imu_link");
     odom_frame_id_ = declare_parameter("odom_frame_id", "map");
     body_frame_id_ = declare_parameter("body_frame_id", "imu_link");
+    navsat_frame_id_ = declare_parameter("navsat_frame_id", "imu_link");
+    navsat_fix_topic_ = declare_parameter("navsat_fix_topic", "/gps_p1/fix");
     rtk_max_var_xy_ = declare_parameter("rtk_max_var_xy", 1e-3);
     rtk_max_var_z_ = declare_parameter("rtk_max_var_z", 5e-3);
+    // [P2 FIX 2026-07-14] Max forward jump (s) of an output pose stamp vs the
+    // last published one before it is treated as a glitch and dropped. A
+    // persistent jump past this bound is accepted as a session reset.
+    pose_max_forward_jump_sec_ = declare_parameter("pose_max_forward_jump_sec", 5.0);
     publish_gnss_pose_ = declare_parameter("publish_gnss_pose", true);
     summary_output_path_ = declare_parameter("summary_output_path", "");
     imu_p1_sidecar_path_ = declare_parameter("imu_p1_sidecar_path", "");
     imu_p1_sidecar_match_tolerance_sec_ =
       declare_parameter("imu_p1_sidecar_match_tolerance_sec", 0.02);
 
+    // [P3 HARDENING 2026-07-14] Timing parameters must be finite and positive.
+    // The defaults are safe, but a bad override (NaN, 0, negative) silently
+    // degrades retiming: a nonpositive nominal period breaks synthesized
+    // spacing, a zero flush timeout strands the arrival-retime queue, a
+    // nonpositive P1 threshold reclassifies every stamp, and a nonpositive
+    // sidecar tolerance drops every sidecar match. Fail loud at startup.
+    const auto require_positive_finite = [this](const char* name, double v) {
+      if (!std::isfinite(v) || v <= 0.0) {
+        RCLCPP_FATAL(get_logger(), "%s = %g is invalid (must be finite and > 0); refusing to start",
+                     name, v);
+        throw std::runtime_error(std::string(name) + ": invalid timing parameter");
+      }
+    };
+    require_positive_finite("nominal_imu_period_sec", nominal_imu_period_sec_);
+    require_positive_finite("imu_flush_timeout_sec", imu_flush_timeout_sec_);
+    require_positive_finite("p1_like_threshold_sec", p1_like_threshold_sec_);
+    require_positive_finite("imu_p1_sidecar_match_tolerance_sec",
+                            imu_p1_sidecar_match_tolerance_sec_);
+    require_positive_finite("pose_max_forward_jump_sec", pose_max_forward_jump_sec_);
+
     if (!imu_p1_sidecar_path_.empty()) {
       loadImuP1Sidecar(imu_p1_sidecar_path_);
     }
 
-    const std::string origin_text = declare_parameter(
-      "local_enu_origin", "39.58227391,-86.74232215,260.4");
+    // A local ENU datum is a deployment input, not a portable default. The old
+    // built-in/YAML value was an earlier-site placeholder; using it elsewhere
+    // produces numerically plausible coordinates in a frame displaced by
+    // thousands of kilometres. Require exactly one source and reject the old
+    // placeholder unless the operator explicitly acknowledges that this run
+    // is genuinely at that site.
+    std::string origin_text = declare_parameter("local_enu_origin", std::string(""));
     const std::string origin_ttl_path = declare_parameter("local_enu_origin_ttl_path", "");
-    if (origin_text.empty() == origin_ttl_path.empty()) {
+    const bool allow_legacy_origin =
+      declare_parameter("allow_legacy_local_enu_origin", false);
+    if (!origin_text.empty() && !origin_ttl_path.empty()) {
       throw std::runtime_error(
-        "exactly one of local_enu_origin or local_enu_origin_ttl_path must be set");
+        "set at most one of local_enu_origin or local_enu_origin_ttl_path, not both");
+    }
+    if (origin_text.empty() && origin_ttl_path.empty()) {
+      throw std::runtime_error(
+        "local ENU origin is required: set exactly one of local_enu_origin or "
+        "local_enu_origin_ttl_path to this deployment's surveyed datum");
     }
     if (!origin_text.empty()) {
       if (!parseLocalEnuOrigin(origin_text, local_origin_lat_, local_origin_lon_, local_origin_alt_)) {
@@ -81,9 +135,25 @@ public:
     } else if (!parseLocalEnuOriginTtl(origin_ttl_path, local_origin_lat_, local_origin_lon_, local_origin_alt_)) {
       throw std::runtime_error("failed to read local_enu_origin_ttl_path: " + origin_ttl_path);
     }
+    if (std::abs(local_origin_lat_) > 90.0 || std::abs(local_origin_lon_) > 180.0) {
+      throw std::runtime_error("local ENU origin latitude/longitude is out of range");
+    }
+    if (isLegacyPlaceholderOrigin(
+          local_origin_lat_, local_origin_lon_, local_origin_alt_) &&
+        !allow_legacy_origin) {
+      throw std::runtime_error(
+        "local ENU origin matches the retired earlier-deployment placeholder "
+        "39.58227391,-86.74232215,260.4; set the current surveyed datum, or set "
+        "allow_legacy_local_enu_origin:=true only for that exact site");
+    }
     local_cartesian_.Reset(local_origin_lat_, local_origin_lon_, local_origin_alt_);
 
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/gps_p1/imu", rclcpp::SensorDataQoS());
+    if (navsat_fix_topic_.empty()) {
+      throw std::runtime_error("navsat_fix_topic must not be empty");
+    }
+    navsat_fix_pub_ =
+      create_publisher<sensor_msgs::msg::NavSatFix>(navsat_fix_topic_, 50);
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/gps_p1/filtered_odom", 50);
     odom_rtk_pub_ = create_publisher<nav_msgs::msg::Odometry>("/gps_p1/filtered_odom_rtk_fixed", 50);
     if (publish_gnss_pose_) {
@@ -117,8 +187,10 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "Adapter ready: pose=%s imu=%s imu_stamp_mode=%s local_enu_origin=[%.8f, %.8f, %.3f]",
-      pose_input_topic_.c_str(), imu_input_topic_.c_str(), imu_stamp_mode_.c_str(),
+      "Adapter ready: pose=%s imu=%s fix=%s imu_stamp_mode=%s "
+      "local_enu_origin=[%.8f, %.8f, %.3f]",
+      pose_input_topic_.c_str(), imu_input_topic_.c_str(), navsat_fix_topic_.c_str(),
+      imu_stamp_mode_.c_str(),
       local_origin_lat_, local_origin_lon_, local_origin_alt_);
   }
 
@@ -134,12 +206,26 @@ public:
     std::lock_guard<std::mutex> lock(core_mutex_);
     std::ostringstream out;
     out << "pose_in=" << pose_in_count_
+        << " navsat_fix_out=" << navsat_fix_out_count_
         << " gnss_out=" << gnss_out_count_
         << " gnss_rtk_out=" << gnss_rtk_out_count_
         << " odom_out=" << odom_out_count_
         << " rtk_out=" << rtk_out_count_
         << " imu_in=" << imu_in_count_
-        << " imu_out=" << imu_out_count_;
+        << " imu_out=" << imu_out_count_
+        // Drop counters are ALWAYS reported (P3 hardening): equal in/out
+        // counts alone can hide loss — a run report must be able to prove
+        // pose_dropped_invalid == sidecar_miss_drop == imu_dropped_not_ready
+        // == 0 rather than infer it.
+        << " pose_dropped_invalid=" << pose_dropped_invalid_count_
+        << " imu_dropped_invalid_stamp=" << imu_dropped_invalid_stamp_count_
+        << " imu_sidecar_miss_drop=" << sidecar_miss_drop_count_
+        << " imu_dropped_clock_not_ready=" << p1_imu_dropped_not_ready_count_
+        // [P3 AUDIT 2026-07-14] P1->ROS clock mapping evidence: run reports
+        // must be able to verify the retiming contract (mapper became ready,
+        // and the offset drift over the run stayed sane) end-to-end.
+        << " p1_clock_ready=" << (clock_mapper_.ready() ? 1 : 0)
+        << " p1_clock_drift_ms=" << clock_mapper_.driftMs();
     if (!imu_p1_sidecar_.empty()) {
       out << " imu_p1_sidecar_match=" << imu_p1_sidecar_match_count_
           << " imu_p1_sidecar_miss=" << imu_p1_sidecar_miss_count_
@@ -270,6 +356,11 @@ private:
     if (reliability == "reliable") {
       qos.reliable();
     } else {
+      if (reliability != "best_effort") {
+        RCLCPP_WARN(get_logger(),
+                    "Unrecognized reliability '%s'; using best_effort (check for a typo in YAML)",
+                    reliability.c_str());
+      }
       qos.best_effort();
     }
     qos.durability_volatile();
@@ -282,10 +373,107 @@ private:
     ++pose_in_count_;
     const double arrival = stampToSec(msg->header.stamp);
     const double p1_time = p1ToSec(msg->p1_time);
+    const bool p1_valid = std::isfinite(p1_time) && p1_time > 0.0 && p1_time < 4.0e9;
+
+    // [P1 FIX 2026-07-15] Forward-spike QUARANTINE, BEFORE any stateful update
+    // (last_p1_time_, addPosePair, toRos). A single in-range forward glitch
+    // (e.g. +10 s) must never reach the clock mapper: with prep_bag's default
+    // single huge clock bin it would become the bin's minimum lag and publish
+    // every subsequent NORMAL sample ~spike-seconds early, and it would also
+    // advance last_p1_time_ so the next normal sample reads as a backward epoch
+    // reset. Drop isolated spikes without touching any state; only a PERSISTENT
+    // forward jump (kPoseForwardJumpResetCount consecutive) is a genuine new
+    // epoch, which is then committed AND re-anchors the mapper below.
+    constexpr int kPoseForwardJumpResetCount = 20;
+    bool forward_epoch_accepted = false;
+    if (p1_valid && std::isfinite(last_p1_time_) &&
+        p1_time > last_p1_time_ + pose_max_forward_jump_sec_) {
+      if (++pose_forward_jump_streak_ < kPoseForwardJumpResetCount) {
+        ++pose_dropped_invalid_count_;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Quarantining pose: P1 jumped +%.3f s forward vs last (%.3f, > %.3f s "
+                             "bound) — likely a glitch; dropped without touching the clock mapper "
+                             "(%lu dropped so far)",
+                             p1_time - last_p1_time_, last_p1_time_, pose_max_forward_jump_sec_,
+                             static_cast<unsigned long>(pose_dropped_invalid_count_));
+        return;  // DO NOT update last_p1_time_ / addPosePair / toRos / publish
+      }
+      forward_epoch_accepted = true;
+      pose_forward_jump_streak_ = 0;
+      RCLCPP_WARN(get_logger(),
+                  "P1 forward jump persisted %d samples — accepting as a new epoch (%.3f -> %.3f)",
+                  kPoseForwardJumpResetCount, last_p1_time_, p1_time);
+    } else if (p1_valid) {
+      pose_forward_jump_streak_ = 0;
+    }
+
+    // [P2 FIX 2026-07-09] Epoch-reset detection (device power-cycle or bag loop):
+    // the node-side stamp map and sidecar cursor must reset or every subsequent
+    // output stays frozen at last+1us / the sidecar never matches. Covers BOTH a
+    // backward regression and a persistence-confirmed forward epoch, and forces
+    // the clock mapper to re-anchor (clear its stale-epoch bins) — the mapper's
+    // own internal re-anchor only fires for backward jumps, not forward ones.
+    const bool backward_epoch =
+        p1_valid && std::isfinite(last_p1_time_) && p1_time < last_p1_time_ - 5.0;
+    if (backward_epoch || forward_epoch_accepted) {
+      RCLCPP_WARN(get_logger(),
+                  "P1 epoch change (%s) %.3f -> %.3f; resetting stamp map, sidecar cursor, and "
+                  "re-anchoring the clock mapper",
+                  backward_epoch ? "backward regression" : "forward persistence", last_p1_time_,
+                  p1_time);
+      last_stamp_by_topic_.clear();
+      imu_p1_sidecar_index_ = 0;
+      clock_mapper_.reset();
+    }
+
+    if (p1_valid) {
+      last_p1_time_ = p1_time;
+    }
+    // Fed even during pose outages (invalid solution below): the mapper keeps
+    // learning the P1->ROS clock. It validates its own inputs, and after the
+    // reset() above it re-anchors on this sample.
     clock_mapper_.addPosePair(arrival, p1_time);
 
+    // [P2 FIX 2026-07-09] Fail closed on invalid solutions. FusionEngine
+    // emits solution_type=Invalid(0) with NaN lla/rpy on every cold start
+    // and during full outages; LocalCartesian/rpyToQuat propagate the NaNs
+    // into /gps_p1/filtered_odom and /gnss, which downstream uses for INS
+    // heading priors and GT-snap recovery. The clock mapper above is still
+    // fed (it validates its own inputs).
+    const bool pose_finite =
+        std::isfinite(msg->latitude) && std::isfinite(msg->longitude) &&
+        std::isfinite(msg->altitude) && std::isfinite(msg->rpy.roll) &&
+        std::isfinite(msg->rpy.pitch) && std::isfinite(msg->rpy.yaw) &&
+        std::isfinite(msg->velflu.x) && std::isfinite(msg->velflu.y) &&
+        std::isfinite(msg->velflu.z);
+    if (msg->solution_type == 0 || !pose_finite) {
+      ++pose_dropped_invalid_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping invalid FusionEngine pose (solution_type=%u, finite=%d) — "
+                           "%lu dropped so far",
+                           static_cast<unsigned>(msg->solution_type),
+                           pose_finite ? 1 : 0,
+                           static_cast<unsigned long>(pose_dropped_invalid_count_));
+      return;
+    }
+
+    // [P1 FIX 2026-07-15] Output stamp validity. The forward-spike quarantine at
+    // the top already protected the mapper and the node-side state; here we only
+    // need to refuse publishing an invalid-P1 sample (the 0xFFFFFFFF sentinel or
+    // a non-finite/<=0 stamp), which would otherwise set a far-future header
+    // stamp that poisons the monotone consumer buffers.
+    if (!p1_valid) {
+      ++pose_dropped_invalid_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping pose with invalid P1 stamp %.3f — %lu dropped so far",
+                           p1_time, static_cast<unsigned long>(pose_dropped_invalid_count_));
+      return;
+    }
+    // toRos is slew-limited and stateful — call it exactly once per sample.
+    const double ros_stamp = clock_mapper_.toRos(p1_time);
+
     nav_msgs::msg::Odometry odom;
-    odom.header.stamp = monotonicStamp("/gps_p1/filtered_odom", clock_mapper_.toRos(p1_time));
+    odom.header.stamp = monotonicStamp("/gps_p1/filtered_odom", ros_stamp);
     odom.header.frame_id = odom_frame_id_;
     odom.child_frame_id = body_frame_id_;
 
@@ -303,31 +491,89 @@ private:
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
 
+    // [P2 FIX 2026-07-10] Fail closed on non-finite covariance. The pose
+    // VALUES are validated above, but a solution can be value-finite with a
+    // NaN covariance (degraded heading with an unsolved variance). Downstream
+    // gates split by comparison direction: position gates use `<= max`
+    // (NaN already fails closed), but GICP's INS yaw-quality gate keys on
+    // `cov_yaw > 0` — false for NaN — so a NaN yaw variance used to pass as
+    // "unpopulated" (fail-OPEN). Map non-finite variances to +inf = KNOWN-BAD,
+    // matching GLIM gnss_global's sanitize_yaw_var policy.
+    const auto fail_closed = [](double v) {
+      return std::isfinite(v) ? v : std::numeric_limits<double>::infinity();
+    };
     const auto& pc = msg->position_covariance;
     const auto& rc = msg->rpy_covariance;
-    odom.pose.covariance[0] = static_cast<double>(pc[0]);
-    odom.pose.covariance[7] = static_cast<double>(pc[4]);
-    odom.pose.covariance[14] = static_cast<double>(pc[8]);
-    odom.pose.covariance[21] = static_cast<double>(rc[0]) * kDegToRadSq;
-    odom.pose.covariance[28] = static_cast<double>(rc[4]) * kDegToRadSq;
-    odom.pose.covariance[35] = static_cast<double>(rc[8]) * kDegToRadSq;
+    odom.pose.covariance[0] = fail_closed(static_cast<double>(pc[0]));
+    odom.pose.covariance[7] = fail_closed(static_cast<double>(pc[4]));
+    odom.pose.covariance[14] = fail_closed(static_cast<double>(pc[8]));
+    odom.pose.covariance[21] = fail_closed(static_cast<double>(rc[0]) * kDegToRadSq);
+    odom.pose.covariance[28] = fail_closed(static_cast<double>(rc[4]) * kDegToRadSq);
+    odom.pose.covariance[35] = fail_closed(static_cast<double>(rc[8]) * kDegToRadSq);
+
+    const bool rtk_fixed = isRtkFixed(*msg);
+    sensor_msgs::msg::NavSatFix fix;
+    fix.header.stamp = odom.header.stamp;
+    fix.header.frame_id = navsat_frame_id_;
+    fix.status.status = rtk_fixed
+      ? sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
+      : sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+    fix.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+    fix.latitude = msg->latitude;
+    fix.longitude = msg->longitude;
+    fix.altitude = msg->altitude;
+    bool position_covariance_valid = true;
+    for (size_t i = 0; i < fix.position_covariance.size(); ++i) {
+      const double value = static_cast<double>(pc[i]);
+      fix.position_covariance[i] = value;
+      position_covariance_valid =
+        position_covariance_valid && std::isfinite(value);
+    }
+    for (const size_t i : {size_t{0}, size_t{4}, size_t{8}}) {
+      position_covariance_valid =
+        position_covariance_valid && fix.position_covariance[i] > 0.0;
+    }
+    if (position_covariance_valid) {
+      fix.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_KNOWN;
+    } else {
+      fix.position_covariance.fill(std::numeric_limits<double>::quiet_NaN());
+      fix.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+    }
+    // Publish before odometry so live and recorded consumers normally observe
+    // the synchronized gate sample before the pose it authorizes.
+    navsat_fix_pub_->publish(fix);
+    ++navsat_fix_out_count_;
 
     odom.twist.twist.linear.x = msg->velflu.x;
     odom.twist.twist.linear.y = msg->velflu.y;
     odom.twist.twist.linear.z = msg->velflu.z;
+    // [P3 FIX 2026-07-14] Sanitize twist covariance with the same fail-closed
+    // policy as the pose covariance above: a NaN velocity variance must map to
+    // +inf (KNOWN-BAD), never reach the wire raw. No in-scope consumer reads it
+    // today, but the fail-closed contract must hold uniformly.
     const auto& vc = msg->velflu_covariance;
-    odom.twist.covariance[0] = static_cast<double>(vc[0]);
-    odom.twist.covariance[7] = static_cast<double>(vc[4]);
-    odom.twist.covariance[14] = static_cast<double>(vc[8]);
+    odom.twist.covariance[0] = fail_closed(static_cast<double>(vc[0]));
+    odom.twist.covariance[7] = fail_closed(static_cast<double>(vc[4]));
+    odom.twist.covariance[14] = fail_closed(static_cast<double>(vc[8]));
     // P2#2: angular twist from the latest Atlas gyro (see publishImu note).
     // Only when reasonably fresh; a stale gyro (IMU stream stalled) is worse
     // than the documented "no angular twist" default of zero, which consumers
     // (gicp_localization snap) now detect and back-fill from their own IMU.
     // Both stamps are in the ROS-mapped time domain (odom.header.stamp was set
-    // via clock_mapper_.toRos above; latest_gyro_stamp_ is publishImu's mapped
+    // via clock_mapper_.toRos above; the gyro freshness check below is now
     // stamp), so the age comparison is domain-consistent.
-    const double gyro_age = stampToSec(odom.header.stamp) - latest_gyro_stamp_;
-    if (latest_gyro_stamp_ > 0.0 && std::abs(gyro_age) < kMaxGyroAgeSec) {
+    // [P3 FIX 2026-07-10] WALL-CLOCK freshness, cached at INGEST. The old
+    // publish-time stamp-domain age check was permanently dead in
+    // arrival_retime mode: the 128-sample queue delays publish by ~1.28 s at
+    // 100 Hz, always exceeding the 0.5 s window. Angular rate is a physical
+    // quantity — its freshness is how long ago it was MEASURED (wall time),
+    // independent of any stamp domain; this also removes the last stamp-
+    // domain mixing from the backfill.
+    const double gyro_age = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - latest_gyro_wall_).count();
+    if (has_gyro_ && gyro_age < kMaxGyroAgeSec) {
       odom.twist.twist.angular = latest_gyro_;
       // Conservative fixed rate variance (Atlas imu_calibrated gyro noise is
       // ~1e-2 rad/s class at 100 Hz bandwidth).
@@ -344,7 +590,7 @@ private:
 
     odom_pub_->publish(odom);
     ++odom_out_count_;
-    if (isRtkFixed(*msg)) {
+    if (rtk_fixed) {
       auto rtk = odom;
       rtk.header.stamp = monotonicStamp("/gps_p1/filtered_odom_rtk_fixed", stampToSec(odom.header.stamp));
       if (publish_gnss_pose_) {
@@ -379,7 +625,25 @@ private:
     std::lock_guard<std::mutex> lock(core_mutex_);
     ++imu_in_count_;
     last_imu_wall_time_ = std::chrono::steady_clock::now();
+    // [P3 FIX 2026-07-10] Cache the gyro at INGEST (see poseCallback): the
+    // measurement is fresh NOW regardless of when the retime queue publishes.
+    latest_gyro_ = msg->angular_velocity;
+    latest_gyro_wall_ = last_imu_wall_time_;
+    has_gyro_ = true;
     const double stamp = stampToSec(msg->header.stamp);
+    // [P2 FIX 2026-07-14] Validate the IMU input stamp with the same predicate
+    // the pose path / clock mapper use. The IMU path previously had no stamp
+    // validation (the pose path and the pcap replay node both did): a
+    // cold-start 0xFFFFFFFF "time unavailable" sentinel (~4.29e9 s) emitted one
+    // year-2106 IMU message, and the next real sample then regressed ~2.5e9 s,
+    // wedging both consumers' monotone IMU buffers for the run.
+    if (!(std::isfinite(stamp) && stamp > 0.0 && stamp < 4.0e9)) {
+      ++imu_dropped_invalid_stamp_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping IMU with invalid stamp %.3f — %lu dropped so far",
+                           stamp, static_cast<unsigned long>(imu_dropped_invalid_stamp_count_));
+      return;
+    }
     if (!imu_p1_sidecar_.empty()) {
       double sidecar_p1 = 0.0;
       if (lookupSidecarP1(stamp, sidecar_p1)) {
@@ -390,10 +654,18 @@ private:
         flushP1ImuQueue();
         return;
       }
+      // [P2 FIX 2026-07-09] With a sidecar configured, a tolerance miss must
+      // DROP the sample, not fall through to arrival-retime: the fallback
+      // stranded the sample in the arrival queue (which only drains at
+      // 128-depth or a full-stream stall), then injected it minutes later,
+      // stale and with a fabricated last+1us stamp. Losing ~1 sample per
+      // burst at 100+ Hz is negligible; mixing stamp domains is not.
+      ++sidecar_miss_drop_count_;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
-        "No IMU P1 sidecar match for capture stamp %.6f; falling back to imu_stamp_mode=%s.",
-        stamp, imu_stamp_mode_.c_str());
+        "No IMU P1 sidecar match for capture stamp %.6f; sample dropped (%lu so far).",
+        stamp, static_cast<unsigned long>(sidecar_miss_drop_count_));
+      return;
     }
 
     const bool p1_like = stamp > 0.0 && stamp < p1_like_threshold_sec_;
@@ -465,6 +737,24 @@ private:
   void flushP1ImuQueue()
   {
     if (!clock_mapper_.ready()) {
+      // [P2 FIX 2026-07-09] Previously this returned silently forever: with a
+      // wrong pose topic or GNSS down, every IMU sample queued unbounded and
+      // /gps_p1/imu published NOTHING with no diagnostic. Bound the queue
+      // (~10 s at 200 Hz) and say why the output is silent.
+      constexpr size_t kMaxP1ImuQueue = 2000;
+      if (p1_imu_queue_.size() > kMaxP1ImuQueue) {
+        while (p1_imu_queue_.size() > kMaxP1ImuQueue) {
+          p1_imu_queue_.pop_front();
+          ++p1_imu_dropped_not_ready_count_;
+        }
+      }
+      if (!p1_imu_queue_.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "/gps_p1/imu silent: %zu IMU samples queued but no pose pair yet on '%s' "
+                             "(clock mapper not ready; %lu oldest dropped)",
+                             p1_imu_queue_.size(), pose_input_topic_.c_str(),
+                             static_cast<unsigned long>(p1_imu_dropped_not_ready_count_));
+      }
       return;
     }
     while (!p1_imu_queue_.empty()) {
@@ -502,8 +792,7 @@ private:
     // location-independent on a rigid body, and IMUOutput is already rotated
     // into vehicle body axes == odom child_frame axes, so the gyro is exactly
     // the odometry twist.angular. Guarded by core_mutex_ (all callers hold it).
-    latest_gyro_ = msg.angular_velocity;
-    latest_gyro_stamp_ = stamp;
+    // (gyro cache moved to imuCallback ingest — see P3 FIX 2026-07-10)
     imu_pub_->publish(msg);
     ++imu_out_count_;
   }
@@ -512,6 +801,17 @@ private:
   {
     double& last = last_stamp_by_topic_[topic];
     if (last > 0.0 && sec <= last) {
+      // [P2 FIX 2026-07-09] The +1us nudge is for us-scale jitter only. A
+      // regression larger than 1 s is a legitimate time reset (bag loop,
+      // device power-cycle): pass it through and re-anchor, instead of
+      // freezing the topic at last+1us forever.
+      if (last - sec > 1.0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Stamp on '%s' regressed by %.3f s — re-anchoring (time reset)",
+                             topic.c_str(), last - sec);
+        last = sec;
+        return secToStamp(sec);
+      }
       sec = last + 1e-6;
     }
     last = sec;
@@ -524,6 +824,8 @@ private:
   std::string imu_frame_id_;
   std::string odom_frame_id_;
   std::string body_frame_id_;
+  std::string navsat_frame_id_;
+  std::string navsat_fix_topic_;
   std::string summary_output_path_;
   std::string pose_input_reliability_;
   std::string imu_input_reliability_;
@@ -553,6 +855,16 @@ private:
   std::deque<QueuedImu> p1_imu_queue_;
   std::vector<ImuP1SidecarSample> imu_p1_sidecar_;
   size_t imu_p1_sidecar_index_ = 0;
+  double last_p1_time_ = std::numeric_limits<double>::quiet_NaN();  // P2 fix: epoch-reset detection
+  // [P1 FIX 2026-07-15] P1-domain forward-spike quarantine (poseCallback). A
+  // jump > pose_max_forward_jump_sec_ vs last_p1_time_ is quarantined before it
+  // can reach the clock mapper; a persistent one is accepted as a new epoch.
+  double pose_max_forward_jump_sec_ = 5.0;
+  int pose_forward_jump_streak_ = 0;
+  uint64_t pose_dropped_invalid_count_ = 0;       // P2 fix: NaN/Invalid solution drops
+  uint64_t sidecar_miss_drop_count_ = 0;          // P2 fix: sidecar tolerance misses
+  uint64_t imu_dropped_invalid_stamp_count_ = 0;  // P2 fix: invalid IMU input stamps
+  uint64_t p1_imu_dropped_not_ready_count_ = 0;   // P2 fix: bounded not-ready queue drops
   std::map<std::string, double> last_stamp_by_topic_;
 
   rclcpp::CallbackGroup::SharedPtr pose_group_;
@@ -560,6 +872,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr timer_group_;
 
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr navsat_fix_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gnss_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gnss_rtk_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
@@ -571,6 +884,7 @@ private:
   rclcpp::TimerBase::SharedPtr summary_timer_;
 
   uint64_t pose_in_count_ = 0;
+  uint64_t navsat_fix_out_count_ = 0;
   uint64_t gnss_out_count_ = 0;
   uint64_t gnss_rtk_out_count_ = 0;
   uint64_t odom_out_count_ = 0;
@@ -585,7 +899,8 @@ private:
   // /gps_p1/filtered_odom twist.angular. Guarded by core_mutex_.
   static constexpr double kMaxGyroAgeSec = 0.5;
   geometry_msgs::msg::Vector3 latest_gyro_;
-  double latest_gyro_stamp_ = 0.0;
+  std::chrono::steady_clock::time_point latest_gyro_wall_{};  // P3: wall-clock freshness
+  bool has_gyro_ = false;
 
   mutable std::mutex core_mutex_;
 };

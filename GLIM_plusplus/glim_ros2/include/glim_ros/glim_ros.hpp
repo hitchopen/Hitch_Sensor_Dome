@@ -6,10 +6,10 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 
 #include <Eigen/Core>
-#include <Eigen/Geometry>
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -40,6 +40,9 @@ public:
   ~GlimROS();
 
   bool needs_wait();
+  // False when any quality/safety extension (for example the GNSS anchor
+  // divergence gate) has rejected the run.
+  bool ok() const;
   void timer_callback();
 
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -65,7 +68,7 @@ public:
   // Hitch Sensor Dome fork — RTK-gated GNSS factor bridge.
   //
   // After init, every incoming /pose (or /odom) is also evaluated against
-  // the most-recent /gps/fix; if the fix shows RTK-class status with
+  // the most-recent NavSatFix on ins_fix_topic; if it shows RTK-class status with
   // covariance below gnss_factor_max_position_stddev, the pose is
   // republished as a geometry_msgs/PoseWithCovarianceStamped on
   // gnss_factor_topic (default /gnss/pose_rtk_only). The
@@ -85,11 +88,14 @@ public:
   // point count in a concatenated multi-LiDAR cloud; forwarded to
   // extract_raw_points() so the epoch-axis rebase anchors on the primary scan's
   // earliest time rather than the global merged minimum. See points_callback_live().
-  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count = -1);
+  // `ingested` (optional): set true only when the cloud passed extraction and
+  // TimeKeeper validation and was inserted into odometry estimation; false when
+  // the frame was skipped. Offline readers use it for primary accounting.
+  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count = -1, bool* ingested = nullptr);
 
-  // Live subscription entry point for the primary LiDAR. Merges any buffered
-  // auxiliary clouds into the primary (matching the offline glim_rosbag /
-  // glim_pcap_rosbag path) and then forwards the result to points_callback().
+  // Live subscription entry point for the primary LiDAR. Online mapping with
+  // concatenation is rejected until this path has a future-sweep release queue;
+  // single-LiDAR online mapping forwards directly to points_callback().
   void points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   // Buffers an auxiliary LiDAR cloud for later time-matched merging.
   void aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index);
@@ -111,6 +117,35 @@ public:
   const std::string& ins_pose_topic() const { return ins_pose_topic_; }
   const std::string& ins_odom_topic() const { return ins_odom_topic_; }
   const std::string& ins_fix_topic() const { return ins_fix_topic_; }
+  const std::string& gnss_factor_topic() const { return gnss_factor_topic_; }
+
+  // --- Operational state -------------------------------------------------
+  // SLAM STARTS ONLY AT RTK-FIXED: the map origin must be globally
+  // referenced and the INS attitude validated before any factor is built,
+  // so initialization waits for a fresh, validated RTK-fixed solution.
+  //
+  // AFTER that, LiDAR-IMU SLAM is the primary estimator and runs
+  // continuously; GNSS is an optional global constraint that comes and
+  // goes with RTK availability. These report what the finished map
+  // actually got, so an operator (or CI) accepts a weakly-constrained map
+  // deliberately rather than by accident.
+  bool slam_initialized() const { return ins_init_applied.load(); }
+  // Number of GNSS position factors handed to the global graph.
+  int gnss_factors_published() const { return gnss_factors_published_.load(); }
+  // End-of-run map state:
+  //   "uninitialized"    — RTK-fixed never validated; NO map was built.
+  //   "rtk_origin_only"  — origin anchored at RTK-fixed, but RTK never
+  //                        returned afterwards, so the trajectory past t0
+  //                        is constrained by LiDAR-IMU alone.
+  //   "rtk_anchored"     — origin anchored AND ongoing GNSS constraints.
+  const char* map_anchor_state() const {
+    if (!ins_init_applied.load()) return "uninitialized";
+    return gnss_factors_published_.load() > 0 ? "rtk_anchored" : "rtk_origin_only";
+  }
+  // Operator policy: fail the run when the map came out local_only.
+  bool require_rtk_anchor() const { return require_rtk_anchor_; }
+  // One-line end-of-run verdict; also logged by save().
+  void log_map_status() const;
 
 private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
@@ -124,9 +159,16 @@ private:
   double imu_time_offset;
   double points_time_offset;
   double acc_scale;
+  // Fixed input-vector calibration. Both acceleration and gyro are rotated
+  // into the IMU frame used by T_lidar_imu before entering any estimator.
+  Eigen::Quaterniond imu_input_rotation = Eigen::Quaterniond::Identity();
   bool dump_on_unload;
 
   std::string intensity_field, ring_field;
+  std::string expected_time_field;
+  int expected_time_datatype = 0;
+  bool expected_time_is_absolute = false;
+  bool float64_time_is_epoch_ns = false;  // [P2 FIX 2026-07-15] Luminar FLOAT64-epoch-ns opt-in
   bool flip_points_y;
 
   // Extension modulles
@@ -162,18 +204,82 @@ private:
   // explicit mutex needed if rclcpp uses MultiThreadedExecutor it would,
   // but the default SingleThreadedExecutor serializes callbacks).
   sensor_msgs::msg::NavSatFix::SharedPtr last_fix_;
-  std::deque<std::pair<Eigen::Isometry3d, Eigen::Vector3d>> pose_window_;
+  // Timestamped INS solution window backing the stability gate.
+  // The stamp is REQUIRED: without it the gate can neither enforce temporal
+  // contiguity (a fix that flickers once every N seconds would otherwise
+  // accumulate a "stable" window out of unrelated moments) nor form the
+  // constant-velocity prediction that lets it accept a MOVING start.
+  // See ins_window_push_and_check().
+  struct InsSample {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    double stamp = 0.0;
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  };
+  std::deque<InsSample, Eigen::aligned_allocator<InsSample>> pose_window_;
   rclcpp::Time ins_wait_started_;
   rclcpp::Time ins_last_warn_;
   std::string ins_last_reject_reason_;
+  // The last SUBSTANTIVE rejection (residual / contiguity / monotonicity),
+  // kept separately: after such a rejection the window restarts, so the
+  // transient "accumulating" message would otherwise overwrite the real
+  // cause before any diagnostic gets to print it.
+  std::string ins_last_hard_reject_;
+  uint64_t ins_hard_reject_count_ = 0;
+
+  // Push one INS solution into the stability window and report whether the
+  // window now demonstrates a settled, self-consistent P1 solution.
+  //
+  // The Atlas Duo is a TIGHTLY-COUPLED INS: attitude/velocity estimation and
+  // its own calibration are P1's responsibility, not GLIM's. So this gate
+  // tests that P1's output is SMOOTH AND CONTIGUOUS — it deliberately does
+  // NOT test that the vehicle is stationary, which would forbid the
+  // moving-start case this fork exists to support.
+  //
+  // On success, *v_est (when non-null) receives a world-frame velocity
+  // estimated from the window by finite difference, for callers whose
+  // message type carries no velocity (PoseStamped). Passing a real velocity
+  // matters: the optimizer's V(0) prior is only σ = 1 m/s, so seeding zero
+  // on a rolling start would be a many-sigma error on the very interval that
+  // anchors the global graph.
+  bool ins_window_push_and_check(double stamp,
+                                 const Eigen::Isometry3d& T,
+                                 Eigen::Vector3d* v_est);
 
   // Init gate thresholds (loaded from ROS params in the constructor).
   bool ins_require_rtk_fixed_ = true;
   double ins_max_position_stddev_ = 0.10;        // metres
   int ins_min_pose_window_samples_ = 10;
-  double ins_max_pose_jitter_trans_ = 0.05;      // metres
-  double ins_min_quat_dot_ = 0.999;              // |q1·q2|
+  // Max residual (m) of an INS position against a constant-velocity
+  // prediction from the two preceding samples — a SMOOTHNESS bound, not a
+  // displacement bound. Under constant acceleration a over sample spacing
+  // dt the residual is a·dt², so 0.05 m at 10 Hz tolerates ≈5 m/s² (0.5 g)
+  // of genuine vehicle dynamics before the solution is called unsettled.
+  // Raise it if mapping runs begin under harder acceleration.
+  double ins_max_pose_jitter_trans_ = 0.05;      // metres (residual)
+  // Same idea for orientation: |q_pred · q| against a constant-angular-rate
+  // prediction. 0.999 ≈ 2.5° of residual, i.e. ≈250°/s² of angular
+  // acceleration at 10 Hz — a glitch bound, not a turn-rate bound.
+  double ins_min_quat_dot_ = 0.999;              // |q_pred·q|
+  // Max gap (s) between consecutive accepted INS samples before the window
+  // is discarded as non-contiguous. Samples enter the window only after the
+  // RTK gates pass, so without this bound a flickering fix could assemble a
+  // "stable" window from moments minutes apart.
+  double ins_max_pose_gap_s_ = 0.5;              // seconds
   double ins_init_timeout_s_ = 60.0;
+  // Max age (s) of the NavSatFix backing a gating decision, measured
+  // between MESSAGE header stamps (never wall time — offline replay runs
+  // at arbitrary speed). A small negative allowance absorbs benign
+  // publisher-side stamp ordering.
+  double fix_max_age_s_ = 0.5;
+  double fix_future_tolerance_s_ = 0.05;
+  // Operator policy: exit non-zero unless the finished map is
+  // "rtk_anchored". Default false — a map with an RTK-anchored origin but
+  // no ongoing GNSS constraints is a legitimate outcome (RTK never came
+  // back), and only the operator knows whether it is acceptable.
+  bool require_rtk_anchor_ = false;
+  // Last bridge refusal reason, so a persistent cause is logged once
+  // rather than per message.
+  std::string gnss_factor_last_reject_;
 
   // GNSS factor bridge — separate gate parameters so the per-factor
   // policy can be tuned independently of the one-shot init policy.
@@ -213,10 +319,8 @@ private:
   std::atomic<int> yaw_sigma_violations_{0};
   std::atomic_bool yaw_sigma_warned_{false};
 
-  // Multi-LiDAR concatenation (primary front lidar + auxiliary rear-left/right).
-  // aux_concat holds the per-sensor buffers; aux_buffers_mutex guards them
-  // because the auxiliary subscription callbacks and points_callback_live()
-  // (which reads the buffers via merge_clouds) may run on different threads.
+  // Multi-LiDAR concatenation config and reserved live-path state. Online
+  // mapping with concat is rejected until a future-sweep release queue exists.
   glim_ros::AuxConcatConfig aux_concat;
   std::mutex aux_buffers_mutex;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_points_subs;

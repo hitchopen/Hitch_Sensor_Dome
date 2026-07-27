@@ -223,14 +223,11 @@
     localization/lidar_concat/buffer_size: 200      # per-aux ring depth (P4 parity: 20 = only ~2 s of aux history)
 
     # LiDAR sensor type for per-point timestamp handling during deskewing.
-    # Options: ouster, velodyne, hesai, livox.
-    # Seyond Robin W in coordinate_mode:=3 publishes per-point time as
-    # float32 seconds relative to scan start, which is identical to the
-    # Velodyne convention. We set "velodyne" here on purpose — the
-    # deskewer's VELODYNE branch reads `time` in float32 seconds and is
-    # the correct path for Robin W. Keeping the upstream enum unchanged
-    # (no Seyond-specific code) keeps the divergence from upstream minimal.
-    localization/sensor_type: "velodyne"
+    # Options: ouster, velodyne, seyond, hesai, livox, luminar.
+    # The pinned Seyond ROS 2 driver publishes `timestamp` as numeric FLOAT64
+    # Unix seconds. The explicit seyond path validates that wire contract and
+    # deskews directly on the absolute point times.
+    localization/sensor_type: "seyond"
 
     # --- IMU and deskewing ---
     # Deskewing uses per-point timestamps to motion-compensate each scan

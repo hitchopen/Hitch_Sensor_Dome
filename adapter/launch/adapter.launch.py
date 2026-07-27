@@ -27,26 +27,63 @@ def _launch_nodes(context, *args, **kwargs):
             "Pass p1_imu_pcap_path:=/path/to/ins.pcap, or set "
             "use_p1_imu_pcap:=false to consume the upstream IMU ROS topic."
         )
+    # [P2 FIX 2026-07-10j] Force IMU wiring ONLY in PCAP mode (the topic and
+    # stamp mode are then genuinely computed). On the live path, an unset
+    # launch argument must NOT be materialized into a parameter — the old
+    # code substituted "/atlas/imu_calibrated" for an empty argument and
+    # always injected it plus imu_stamp_mode, so YAML could never select a
+    # live IMU topic or a non-"auto" stamp mode. The node's own declared
+    # defaults already cover the unset case.
+    force_imu_keys = False
     if use_pcap:
         imu_input_topic = pcap_output_topic
         if imu_stamp_mode == "auto":
             # The PCAP replay node decodes IMU_OUTPUT.p1_time into header.stamp.
             imu_stamp_mode = "p1"
-    elif not imu_input_topic:
-        imu_input_topic = "/atlas/imu_calibrated"
+        force_imu_keys = True
 
-    adapter_params = {
-        "use_sim_time": _bool_text(_text(context, "use_sim_time")),
-        "pose_input_topic": _text(context, "pose_input_topic"),
-        "imu_input_topic": imu_input_topic,
-        "publish_gnss_pose": _bool_text(_text(context, "publish_gnss_pose")),
-        "summary_output_path": _text(context, "summary_output_path"),
-        "imu_stamp_mode": imu_stamp_mode,
-        "imu_p1_sidecar_path": _text(context, "imu_p1_sidecar_path"),
-        "imu_p1_sidecar_match_tolerance_sec": float(
-            _text(context, "imu_p1_sidecar_match_tolerance_sec")
-        ),
+    # [P3 FIX 2026-07-10] Only pass a launch value when it differs from the
+    # launch-argument default: this dict OVERRIDES params_file, so passing the
+    # defaults unconditionally silently shadowed YAML edits for these keys.
+    # (Setting a launch arg explicitly to its default value is still fine —
+    # the YAML then wins, which matches the operator's mental model.)
+    _launch_defaults = {
+        "use_sim_time": "true",
+        "pose_input_topic": "/atlas/pose_filtered",
+        "navsat_fix_topic": "/gps_p1/fix",
+        "publish_gnss_pose": "true",
+        "allow_legacy_local_enu_origin": "false",
+        "summary_output_path": "",
+        "imu_p1_sidecar_path": "",
+        "imu_p1_sidecar_match_tolerance_sec": "0.02",
     }
+    def _maybe(params, key, value, cast=None):
+        if str(value) != _launch_defaults.get(key, object()):
+            params[key] = cast(value) if cast else value
+    adapter_params = {}
+    _maybe(adapter_params, "use_sim_time", _text(context, "use_sim_time"),
+           lambda v: _bool_text(v))
+    _maybe(adapter_params, "pose_input_topic", _text(context, "pose_input_topic"))
+    _maybe(adapter_params, "navsat_fix_topic", _text(context, "navsat_fix_topic"))
+    # imu_input_topic / imu_stamp_mode: forced only in PCAP mode; on the live
+    # path pass them only when the operator set them explicitly.
+    if force_imu_keys:
+        adapter_params["imu_input_topic"] = imu_input_topic
+        adapter_params["imu_stamp_mode"] = imu_stamp_mode
+    else:
+        if imu_input_topic:
+            adapter_params["imu_input_topic"] = imu_input_topic
+        if imu_stamp_mode != "auto":
+            adapter_params["imu_stamp_mode"] = imu_stamp_mode
+    _maybe(adapter_params, "publish_gnss_pose", _text(context, "publish_gnss_pose"),
+           lambda v: _bool_text(v))
+    _maybe(adapter_params, "allow_legacy_local_enu_origin",
+           _text(context, "allow_legacy_local_enu_origin"),
+           lambda v: _bool_text(v))
+    _maybe(adapter_params, "summary_output_path", _text(context, "summary_output_path"))
+    _maybe(adapter_params, "imu_p1_sidecar_path", _text(context, "imu_p1_sidecar_path"))
+    _maybe(adapter_params, "imu_p1_sidecar_match_tolerance_sec",
+           _text(context, "imu_p1_sidecar_match_tolerance_sec"), float)
     local_enu_origin = _text(context, "local_enu_origin")
     local_enu_origin_ttl_path = _text(context, "local_enu_origin_ttl_path")
     if local_enu_origin and local_enu_origin_ttl_path:
@@ -106,6 +143,7 @@ def generate_launch_description():
             DeclareLaunchArgument("params_file", default_value=default_params),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("pose_input_topic", default_value="/atlas/pose_filtered"),
+            DeclareLaunchArgument("navsat_fix_topic", default_value="/gps_p1/fix"),
             DeclareLaunchArgument("imu_input_topic", default_value=""),
             DeclareLaunchArgument("imu_stamp_mode", default_value="auto"),
             DeclareLaunchArgument("imu_p1_sidecar_path", default_value=""),
@@ -113,6 +151,9 @@ def generate_launch_description():
             DeclareLaunchArgument("publish_gnss_pose", default_value="true"),
             DeclareLaunchArgument("local_enu_origin", default_value=""),
             DeclareLaunchArgument("local_enu_origin_ttl_path", default_value=""),
+            DeclareLaunchArgument(
+                "allow_legacy_local_enu_origin", default_value="false"
+            ),
             DeclareLaunchArgument("summary_output_path", default_value=""),
             DeclareLaunchArgument("use_p1_imu_pcap", default_value="true"),
             DeclareLaunchArgument("p1_imu_pcap_path", default_value=""),

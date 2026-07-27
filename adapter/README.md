@@ -8,12 +8,13 @@ localization (GICP++) can consume a stable, vendor-neutral contract:
 LiDAR topics are **not** touched by the adapter — multi-LiDAR merge /
 timestamp handling stays owned by GLIM++/GICP++ `lidar_concat`.
 
-On the Hitch Sensor Dome this package is **optional** — the dome's default
-driver chain (`/imu/data`, `/gps/fix`, `/pose`, and the `nav_sat_gated_odom`
-republisher's `/odom_rtk_only`) already feeds GLIM++/GICP++ directly. See
-[README_HITCH_PORT.md](README_HITCH_PORT.md) for when the adapter is the
-better choice, and the [repo root README](../README.md) for the dome's
-default pipeline.
+On the Hitch Sensor Dome this package is the production GNSS boundary for
+GLIM++ mapping: `/gps_p1/filtered_odom_rtk_fixed` preserves FusionEngine's
+authoritative `solution_type == kRtkFixed` decision, which REP-145
+`NavSatFix` cannot express. `/gps_p1/fix` supplies a synchronized WGS84,
+freshness, and covariance cross-check for that same sample. GICP++ may still
+use its separate compatibility gate. See [README_HITCH_PORT.md](README_HITCH_PORT.md) and the
+[repo root README](../README.md) for the dome wiring.
 
 The normalization contract:
 
@@ -43,9 +44,9 @@ rosdep install -i --from-paths src --rosdistro "$ROS_DISTRO" -y --skip-keys fusi
 colcon build --packages-up-to adapter
 ```
 
-The default Hitch Sensor Dome pipeline can run without `adapter`; this package
-is only needed when you want the normalized `/gps_p1/*` compatibility contract
-described below.
+The strict GLIM++ production profile requires this adapter output. A
+LiDAR-only or raw-Pose compatibility profile can run without it, but must not
+be described as Fixed-only GNSS mapping.
 
 ## Inputs
 
@@ -68,6 +69,10 @@ described below.
   [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml)).
 - `/gps_p1/filtered_odom_rtk_fixed` (`nav_msgs/msg/Odometry`): gated
   compatibility odom.
+- `/gps_p1/fix` (`sensor_msgs/msg/NavSatFix`): synchronized WGS84 gate
+  message. Exact adapter RTK-Fixed admission maps to `STATUS_GBAS_FIX`;
+  other valid solution classes map below it, and invalid covariance is
+  published as `COVARIANCE_TYPE_UNKNOWN`.
 - `/gps_p1/imu` (`sensor_msgs/msg/Imu`): retimed Atlas IMU.
 
 Set `publish_gnss_pose=false` when a prep/recording pipeline only needs the
@@ -105,17 +110,21 @@ body). Model it only if pushing high-yaw-rate segments.
 
 ## Origin
 
-Exactly one origin source must be configured:
+Configure **exactly one** origin source:
 
 - `local_enu_origin: "lat,lon,alt"`
 - `local_enu_origin_ttl_path: "/path/to/ttl.csv"`
 
 The TTL parser reads the first non-empty CSV row and uses its last three
-fields as `(lat, lon, alt)`. The checked-in default origin is a
-**placeholder from an earlier deployment** — set `local_enu_origin` to your
-own deployment datum before mapping. The one hard constraint is a **single
-shared datum**: the GLIM++ map, the seed odometry, and GICP++ must all use
-the origin the adapter defines, or the frames silently disagree.
+fields as `(lat, lon, alt)`. Neither source has a built-in deployment default:
+missing or conflicting sources are startup errors. The retired
+`39.58227391,-86.74232215,260.4` value is rejected even when supplied
+explicitly; set `allow_legacy_local_enu_origin=true` only when operating at
+that exact earlier site.
+
+The one hard constraint is a **single shared datum**: the GLIM++ map, seed
+odometry, and GICP++ must all use the origin the adapter defines, or their
+frames silently disagree.
 
 ## Example
 
@@ -131,6 +140,54 @@ ros2 launch adapter adapter.launch.py \
   local_enu_origin_ttl_path:=/path/to/ttl.csv
 ```
 
-The launch file overrides the YAML default origin when
-`local_enu_origin_ttl_path` is passed. The node fails at startup if both origin
-sources are set or both are empty.
+The launch file overrides the YAML inline origin when
+`local_enu_origin_ttl_path` is passed. The node rejects both sources being set
+and refuses to start when neither source is supplied.
+
+## Run summary and audit counters
+
+The adapter logs (and optionally writes via `summary_output_path`) a one-line
+summary designed so a run report can **prove** zero data loss instead of
+inferring it from matching in/out totals:
+
+```text
+pose_in=… navsat_fix_out=… gnss_out=… gnss_rtk_out=… odom_out=… rtk_out=… imu_in=… imu_out=…
+pose_dropped_invalid=… imu_dropped_invalid_stamp=… imu_sidecar_miss_drop=… imu_dropped_clock_not_ready=…
+p1_clock_ready=… p1_clock_drift_ms=…
+```
+
+- `pose_dropped_invalid` — NaN / invalid-solution FusionEngine poses rejected
+  before publication (cold-start samples land here); also counts poses dropped
+  for an invalid or quarantined-forward-spike P1 stamp.
+- `imu_dropped_invalid_stamp` — IMU samples dropped at ingest for a non-finite /
+  ≤0 / ≥4e9 (sentinel) header stamp, before they can reach a consumer buffer.
+- `imu_sidecar_miss_drop` — IMU samples dropped because no sidecar P1 stamp
+  matched within tolerance (sidecar replay mode only).
+- `imu_dropped_clock_not_ready` — IMU samples dropped from the bounded
+  not-ready queue before the P1→ROS clock mapper initialized.
+- `p1_clock_ready` / `p1_clock_drift_ms` — end-to-end P1→ROS retiming
+  evidence: the mapper reached readiness, and the measured offset drift over
+  the run. Together with GLIM's `gnss_global summary` line (bracket widths,
+  gap/non-monotonic rejections, factor counts) these close the RTK timing
+  audit chain from PCAP to map factors.
+
+All four drop counters (`pose_dropped_invalid`, `imu_dropped_invalid_stamp`,
+`imu_sidecar_miss_drop`, `imu_dropped_clock_not_ready`) are expected to be **0**
+on a healthy run; the sidecar match/miss/skip triple is additionally printed in
+sidecar mode.
+
+## Startup validation (fail loud, not degraded)
+
+Bad parameter overrides refuse to start rather than silently degrading
+retiming: `nominal_imu_period_sec`, `imu_flush_timeout_sec`,
+`p1_like_threshold_sec`, `imu_p1_sidecar_match_tolerance_sec`, and
+`pose_max_forward_jump_sec` must be finite and positive (a zero flush timeout strands the arrival-retime queue; a
+nonpositive nominal period breaks synthesized spacing). The RTK gate
+covariance thresholds require finite, nonnegative values per sample — the
+same contract the downstream GICP gate and the legacy
+`rtk_fixed_odom_filter.py` now enforce. The PCAP replay node also rejects IMU
+samples whose `fraction_ns >= 1e9` (a corrupt fraction would otherwise raise
+on ROS timestamp assignment or alias into a wrong stamp), alongside the
+existing `0xFFFFFFFF` sentinel rejection. The adapter also requires a
+non-empty `navsat_fix_topic` and exactly one valid local-ENU origin source;
+the retired origin placeholder needs an explicit acknowledgment.

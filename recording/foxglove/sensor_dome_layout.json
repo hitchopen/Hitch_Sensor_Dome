@@ -100,9 +100,9 @@
       "center": { "lat": 37.8719, "lon": -122.2585 },
       "zoom": 17,
       "topicColors": {
-        "/gps/fix": "#22c55e"
+        "/gps_p1/fix": "#22c55e"
       },
-      "followTopic": "/gps/fix",
+      "followTopic": "/gps_p1/fix",
       "layer": "map"
     },
     "DiagnosticSummary!rates": {
@@ -131,7 +131,7 @@
       "followingViewWidth": 30
     },
     "Indicator!lock": {
-      "path": "/gps/fix.status.status",
+      "path": "/gps_p1/fix.status.status",
       "style": "background",
       "fallbackColor": "#a3a3a3",
       "fallbackLabel": "no fix",

@@ -1,5 +1,7 @@
 #include <glim/mapping/sub_mapping.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
@@ -124,6 +126,15 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     std::vector<Eigen::Isometry3d> imu_poses;
     imu_integration->integrate_imu(odom_frame->stamp, next_frame->stamp, nav_world_imu, imu_bias, imu_stamps, imu_poses);
 
+    double trajectory_end_time = next_frame->stamp;
+    if (odom_frame->raw_frame) {
+      if (std::isfinite(odom_frame->raw_frame->scan_end_time)) {
+        trajectory_end_time = std::max(trajectory_end_time, odom_frame->raw_frame->scan_end_time);
+      } else {
+        logger->warn("non-finite scan end time; limiting the sub-mapping deskew trajectory to the next frame stamp");
+      }
+    }
+
     gtsam::Values values;
     for (int i = 0; i < imu_stamps.size(); i++) {
       values.insert(X(i), gtsam::Pose3(imu_poses[i].matrix()));
@@ -152,11 +163,29 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     });
 #endif
 
+    for (int i = 0; i < imu_stamps.size(); i++) {
+      imu_poses[i] = Eigen::Isometry3d(values.at<gtsam::Pose3>(X(i)).matrix());
+    }
+
+    // The smoothed interval is anchored at next_frame. Extend from that anchor
+    // so merged returns after next_frame->stamp retain their actual motion.
+    if (trajectory_end_time > next_frame->stamp) {
+      const gtsam::NavState tail_state(gtsam::Pose3(imu_poses.back().matrix()), next_frame->v_world_imu);
+      const gtsam::imuBias::ConstantBias tail_bias(next_frame->imu_bias);
+      std::vector<double> tail_stamps;
+      std::vector<Eigen::Isometry3d> tail_poses;
+      imu_integration->integrate_imu(next_frame->stamp, trajectory_end_time, tail_state, tail_bias, tail_stamps, tail_poses);
+
+      // integrate_imu includes its initial state, which is already the last
+      // sample in the smoothed trajectory.
+      imu_stamps.insert(imu_stamps.end(), tail_stamps.begin() + 1, tail_stamps.end());
+      imu_poses.insert(imu_poses.end(), tail_poses.begin() + 1, tail_poses.end());
+    }
+
     odom_frame->imu_rate_trajectory.resize(8, imu_stamps.size());
     for (int i = 0; i < imu_stamps.size(); i++) {
-      const gtsam::Pose3 imu_pose = values.at<gtsam::Pose3>(X(i));
-      const Eigen::Vector3d trans(imu_pose.translation());
-      const Eigen::Quaterniond quat(imu_pose.rotation().toQuaternion());
+      const Eigen::Vector3d trans = imu_poses[i].translation();
+      const Eigen::Quaterniond quat(imu_poses[i].linear());
       odom_frame->imu_rate_trajectory.col(i) << imu_stamps[i], trans, quat.x(), quat.y(), quat.z(), quat.w();
     }
   }

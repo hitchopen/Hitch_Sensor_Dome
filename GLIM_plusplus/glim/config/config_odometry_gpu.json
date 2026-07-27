@@ -11,7 +11,11 @@
   // use_isam2_dogleg            : Use the dogleg optimizer as the backend of ISAM2 that is slow but more robust
   // isam2_relinearize_skip      :
   // isam2_relinearize_thresh    :
-  // fix_imu_bias                : If true, disable IMU bias estimation and use the initial IMU bias
+  // fix_imu_bias                : If true, disable IMU bias estimation and pin all states to the
+  //                                 INITIAL bias (LOOSE initializer's estimate, or sensors/imu_bias
+  //                                 under NAIVE). Fixed 2026-07-10: previously pinned to the
+  //                                 (unconfigured = zero) sensors/imu_bias, discarding the
+  //                                 LOOSE-estimated bias after the first state.
   //
   // --- Voxel params ---
   // voxel_resolution            : Base resolution for VGICP voxels
@@ -43,8 +47,8 @@
     // Hitch Sensor Dome fork: the gravity-from-accelerometer pathway
     // has been removed in C++. GLIM ALWAYS uses an external INS pose
     // for initialization, supplied via the ROS wrapper's subscription
-    // to ins_pose_topic (default /pose, the Atlas Duo's FusionEngine
-    // output). The fields below are kept on the params struct for ABI
+    // to ins_odom_topic (default adapter Fixed-only odometry). The fields
+    // below are kept on the params struct for ABI
     // continuity with upstream GLIM but their effect is limited:
     //   - initialization_mode: ignored (always NAIVE internally)
     //   - initialization_window_size: ignored (no accumulation window)
@@ -60,6 +64,19 @@
     "initialization_window_size": 3.0,
     "init_pose_damping_scale": 1e10,
     // Optimization params
+    // smoother_lag bounds how far back the LOCAL odometry fixed-lag smoother
+    // can retroactively redistribute error. [FIX 2026-07-10] The previous
+    // 30 s value was justified by GNSS retro-correction across dropouts —
+    // but GNSS priors are inserted into the GLOBAL submap graph
+    // (gnss_global module -> on_smoother_update of GlobalMapping), NOT into
+    // this local OdometryEstimationIMU smoother, which contains only
+    // IMU + scan-matching factors. The 30 s lag therefore paid a large
+    // active-variable iSAM2 cost per update without providing the documented
+    // benefit; GNSS-denied continuity is the global graph's job (see
+    // config_gnss_global.json max_interp_gap_sec and the submap anchors).
+    // 5.0 s matches the upstream GLIM default for local odometry and is
+    // ample for IMU-bias/velocity observability. NOTE: maps produced before
+    // 2026-07-10 were built with 30.0.
     "smoother_lag": 5.0,
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,

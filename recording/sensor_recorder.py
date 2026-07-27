@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -464,11 +465,10 @@ def handle_sync_outcome(all_ok: bool, mode: str) -> bool:
 # either fails to init at replay time or inits part-way through (losing
 # the early portion of the trajectory).
 #
-# This pre-flight check briefly subscribes to /gps/fix and verifies that
-# every sample in the capture window passes the same gate the GLIM++
-# C++ wrapper uses. It mirrors the SyncVerifier pattern: a Result
-# dataclass, a show_*_report function, a handle_*_outcome function that
-# implements the prompt / hard / log modes.
+# This pre-flight check briefly subscribes to both /gps_p1/fix and the adapter's
+# Fixed-only odometry. NavSatFix supplies the synchronized freshness/covariance
+# cross-check, while arrival on the latter proves FusionEngine reported
+# solution_type == kRtkFixed. REP-145 status alone cannot distinguish Float.
 
 @dataclass
 class RtkResult:
@@ -479,6 +479,7 @@ class RtkResult:
     fix_status: Optional[int] = None
     pos_stddev: Optional[float] = None
     threshold: Optional[float] = None
+    fixed_samples: int = 0
 
 
 _FIX_NAMES = {
@@ -490,7 +491,7 @@ _FIX_NAMES = {
 
 
 class RtkVerifier:
-    """Subscribe briefly to /gps/fix and verify RTK-fixed quality.
+    """Verify both NavSatFix quality and the authoritative Fixed-only stream.
 
     Reuses rclpy. If rclpy isn't importable (no ROS environment sourced),
     we degrade to "skipped" rather than aborting — the user can still
@@ -499,7 +500,9 @@ class RtkVerifier:
 
     def __init__(self, cfg: Dict[str, Any]):
         rcfg = cfg.get("rtk", {})
-        self.topic = rcfg.get("gnss_topic", "/gps/fix")
+        self.topic = rcfg.get("gnss_topic", "/gps_p1/fix")
+        self.fixed_topic = rcfg.get(
+            "fixed_odom_topic", "/gps_p1/filtered_odom_rtk_fixed")
         self.window_s = float(rcfg.get("capture_window_s", 3.0))
         self.max_stddev = float(rcfg.get("max_position_stddev", 0.10))
         self.require_rtk_fixed = bool(rcfg.get("require_rtk_fixed", True))
@@ -509,6 +512,7 @@ class RtkVerifier:
             import rclpy
             from rclpy.qos import (QoSProfile, ReliabilityPolicy,
                                    HistoryPolicy)
+            from nav_msgs.msg import Odometry
             from sensor_msgs.msg import NavSatFix
         except ImportError as ex:
             return RtkResult("rtk_fix", False,
@@ -521,18 +525,34 @@ class RtkVerifier:
         rclpy.init()
         node = rclpy.create_node("rtk_preflight_check")
         samples: list = []
+        fixed_samples: list = []
 
         def on_fix(msg):
             cov = msg.position_covariance
-            sx, sy, sz = (max(0.0, cov[0]) ** 0.5,
-                          max(0.0, cov[4]) ** 0.5,
-                          max(0.0, cov[8]) ** 0.5)
+            diag = (cov[0], cov[4], cov[8])
+            cov_valid = (
+                msg.position_covariance_type != 0
+                and all(math.isfinite(v) and v >= 0.0 for v in diag)
+            )
+            sx, sy, sz = (
+                tuple(math.sqrt(v) for v in diag)
+                if cov_valid else (math.inf, math.inf, math.inf)
+            )
             samples.append((msg.status.status, max(sx, sy, sz),
-                            msg.latitude, msg.longitude, msg.altitude))
+                            msg.latitude, msg.longitude, msg.altitude,
+                            cov_valid))
+
+        def on_fixed_odom(msg):
+            p = msg.pose.pose.position
+            q = msg.pose.pose.orientation
+            values = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+            if all(math.isfinite(v) for v in values):
+                fixed_samples.append(msg.header.stamp)
 
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                          history=HistoryPolicy.KEEP_LAST, depth=10)
         node.create_subscription(NavSatFix, self.topic, on_fix, qos)
+        node.create_subscription(Odometry, self.fixed_topic, on_fixed_odom, qos)
         end = time.monotonic() + self.window_s
         while time.monotonic() < end and rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.05)
@@ -554,16 +574,21 @@ class RtkVerifier:
 
         status_ok = (not self.require_rtk_fixed) or (worst_status >= STATUS_GBAS_FIX)
         cov_ok = worst_stddev <= self.max_stddev
-        ok = status_ok and cov_ok
+        finite_position_ok = all(
+            math.isfinite(v) for v in (last_lat, last_lon, last_alt))
+        fixed_stream_ok = (not self.require_rtk_fixed) or bool(fixed_samples)
+        ok = status_ok and cov_ok and finite_position_ok and fixed_stream_ok
 
         detail = (
             f"{len(samples)} samples, worst status={_FIX_NAMES.get(worst_status,'?')}, "
             f"worst σ={worst_stddev:.3f} m (threshold {self.max_stddev:.2f} m); "
+            f"Fixed-only odom={len(fixed_samples)} samples on {self.fixed_topic}; "
             f"last fix=({last_lat:.6f}, {last_lon:.6f}, {last_alt:.2f})"
         )
         return RtkResult("rtk_fix", ok, detail,
                          samples=len(samples), fix_status=worst_status,
-                         pos_stddev=worst_stddev, threshold=self.max_stddev)
+                         pos_stddev=worst_stddev, threshold=self.max_stddev,
+                         fixed_samples=len(fixed_samples))
 
 
 def show_rtk_report(result: RtkResult) -> bool:
@@ -582,8 +607,8 @@ def handle_rtk_outcome(ok: bool, mode: str) -> bool:
       - "log"   : note in metadata and continue
     """
     if ok:
-        info("RTK-fix check passed — Atlas Duo reports RTK-fixed with "
-             "cm-grade covariance.")
+        info("RTK-fix check passed — the adapter emitted Fixed-only odometry "
+             "and NavSatFix passed the synchronized covariance gate.")
         return True
     if mode == "hard":
         err("RTK not at fixed quality — aborting (mode=hard).")
@@ -598,11 +623,11 @@ def handle_rtk_outcome(ok: bool, mode: str) -> bool:
     print(color(bar, "red"))
     print()
     print("  GLIM++ requires Atlas Duo RTK-fixed status with cm-grade")
-    print("  covariance to start a mapping session. If you record now, the")
-    print("  bag will need either:")
-    print("    - To run long enough that RTK locks mid-bag (early data lost)")
-    print("    - Or to be replayed with the GLIM++ gate relaxed:")
-    print("        ros2 launch ... ins_require_rtk_fixed:=false")
+    print("  covariance to start a globally referenced mapping session.")
+    print("  The adapter must be running so the bag records:")
+    print("    /gps_p1/filtered_odom_rtk_fixed")
+    print("  If you record now, let the session run until that topic appears,")
+    print("  or use a deliberately degraded LiDAR-only/compatibility config.")
     print()
     print("  Common remediations before recording:")
     print("    1. Park with clear sky view; wait 30–120 s for RTK convergence.")

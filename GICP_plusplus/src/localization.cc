@@ -609,6 +609,40 @@ bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
   return false;
 }
 
+bool hasSeyondAbsoluteTimeAxis(const sensor_msgs::msg::PointCloud2& msg,
+                               int time_off) {
+  const size_t num_points = static_cast<size_t>(msg.width) * msg.height;
+  if (msg.is_bigendian || num_points == 0 || msg.point_step == 0 ||
+      time_off < 0 ||
+      static_cast<size_t>(time_off) + sizeof(double) > msg.point_step ||
+      num_points > std::numeric_limits<size_t>::max() / msg.point_step ||
+      msg.data.size() < num_points * static_cast<size_t>(msg.point_step)) {
+    return false;
+  }
+
+  constexpr double kMinEpochSeconds = 1.0e6;
+  constexpr double kMaxEpochSeconds = 3.0e9;
+  double first_point_s = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < num_points; ++i) {
+    double point_s = 0.0;
+    std::memcpy(
+        &point_s,
+        msg.data.data() + i * static_cast<size_t>(msg.point_step) + time_off,
+        sizeof(double));
+    if (!std::isfinite(point_s) || point_s < kMinEpochSeconds ||
+        point_s > kMaxEpochSeconds) {
+      return false;
+    }
+    first_point_s = std::min(first_point_s, point_s);
+  }
+  if (!std::isfinite(first_point_s)) return false;
+
+  const double header_s =
+      static_cast<double>(msg.header.stamp.sec) +
+      static_cast<double>(msg.header.stamp.nanosec) * 1.0e-9;
+  return std::isfinite(header_s) && std::abs(first_point_s - header_s) <= 1.0;
+}
+
 // Luminar stores hardware-clock ns in the timestamp union slot (8 raw bytes, not IEEE double).
 inline uint64_t luminarPointTimestampNs(const PointType& pt) {
   uint64_t ts = 0;
@@ -709,16 +743,21 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
       dst.time = t_s;
       return;
     }
+    case dlio::SensorType::SEYOND:
     case dlio::SensorType::HESAI: {
       double t_s = 0.;
       switch (time_datatype) {
         case sensor_msgs::msg::PointField::FLOAT64:
-          std::memcpy(&t_s, tp, sizeof(double));
+          if (bytes_avail >= sizeof(double)) {
+            std::memcpy(&t_s, tp, sizeof(double));
+          }
           break;
         case sensor_msgs::msg::PointField::FLOAT32: {
           float t_f = 0.f;
-          std::memcpy(&t_f, tp, sizeof(float));
-          t_s = static_cast<double>(t_f);
+          if (bytes_avail >= sizeof(float)) {
+            std::memcpy(&t_f, tp, sizeof(float));
+            t_s = static_cast<double>(t_f);
+          }
           break;
         }
         default:
@@ -808,10 +847,9 @@ void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType
 // uint64 regardless of declared datatype, because Luminar publishes the raw
 // uint64 bits even when the field is mislabelled FLOAT64; generic FP
 // arithmetic on those bits would scramble them.
-// Hitch Sensor Dome note: the Seyond Robin W (coordinate_mode:=3) emits
-// FLOAT32 seconds-since-sweep-start per point ('velodyne'-compatible), so
-// the Luminar-specific helpers above are INERT on this platform — they are
-// retained verbatim from the art-jazzy upstream so future diffs stay clean.
+// Hitch Sensor Dome note: Seyond Robin W emits numeric FLOAT64 Unix seconds.
+// The decoded-magnitude gate below therefore leaves its absolute point times
+// unchanged during concatenation.
 void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
                           double dt, bool luminar_uint64) {
@@ -828,24 +866,32 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
   }
 
   // FLOAT64 magnitude gate (parity with GLIM's shift_cloud_timestamps): a
-  // FLOAT64 time field can carry either scan-relative seconds (shiftable)
-  // or ABSOLUTE epoch seconds (must not be shifted — e.g. the stock
-  // seyond_ros_driver point layout carries a FLOAT64 absolute-Unix-seconds
-  // `timestamp`; shifting would double-apply the inter-scan dt on top of an
-  // already-absolute axis). Decide once from the first point: no
-  // scan-relative offset can exceed the threshold.
+  // FLOAT64 time field can carry scan-relative seconds (shiftable), Hesai
+  // absolute epoch seconds, or Livox numeric epoch nanoseconds (both
+  // unshifted). Scan all finite, non-zero points so a leading zero sentinel
+  // cannot misclassify an absolute cloud as relative.
   if (time_datatype == sensor_msgs::msg::PointField::FLOAT64 && num_points > 0 &&
       static_cast<uint32_t>(time_off) + sizeof(double) <= point_step) {
-    double first_val = 0.0;
-    std::memcpy(&first_val, data + time_off, sizeof(double));
     constexpr double kMaxRelativeSeconds = 1e6;  // ~11.6 days; real sweeps are < 1 s
-    if (std::isfinite(first_val) && std::abs(first_val) > kMaxRelativeSeconds) {
+    double absolute_sample = 0.0;
+    bool looks_absolute = false;
+    for (size_t i = 0; i < num_points; ++i) {
+      double value = 0.0;
+      std::memcpy(&value, data + i * point_step + time_off, sizeof(double));
+      if (!std::isfinite(value) || value == 0.0) continue;
+      if (std::abs(value) > kMaxRelativeSeconds) {
+        absolute_sample = value;
+        looks_absolute = true;
+        break;
+      }
+    }
+    if (looks_absolute) {
       static bool warned_absolute_f64 = false;
       if (!warned_absolute_f64) {
         RCLCPP_WARN(rclcpp::get_logger("gicp_localization"),
-                    "shiftCloudTimestamps: FLOAT64 time field looks ABSOLUTE (first value %.3f); "
+                    "shiftCloudTimestamps: FLOAT64 time field looks ABSOLUTE (sample %.3f); "
                     "leaving unshifted — absolute per-point times need no rebase onto the primary clock",
-                    first_val);
+                    absolute_sample);
         warned_absolute_f64 = true;
       }
       return;
@@ -1839,16 +1885,15 @@ void gicp_localization::LocalizationNode::getParams() {
               this->rtk_calib_window_sec_, this->rtk_fallback_timeout_sec_);
 
   // Sensor type for per-point timestamp handling during deskewing.
-  // Hitch Sensor Dome default: velodyne. Seyond Robin W in
-  // coordinate_mode:=3 publishes per-point time as float32 seconds
-  // relative to scan start, which is the same convention Velodyne uses;
-  // the VELODYNE branch in the deskewer handles it correctly without
-  // any Seyond-specific code path.
-  this->declare_parameter<std::string>("localization/sensor_type", "velodyne");
+  // Hitch Sensor Dome default: the pinned Seyond driver publishes
+  // timestamp/FLOAT64 as absolute Unix seconds.
+  this->declare_parameter<std::string>("localization/sensor_type", "seyond");
   std::string sensor_type_str;
   this->get_parameter("localization/sensor_type", sensor_type_str);
   if (sensor_type_str == "velodyne") {
     this->sensor = dlio::SensorType::VELODYNE;
+  } else if (sensor_type_str == "seyond") {
+    this->sensor = dlio::SensorType::SEYOND;
   } else if (sensor_type_str == "hesai") {
     this->sensor = dlio::SensorType::HESAI;
   } else if (sensor_type_str == "livox") {
@@ -1861,7 +1906,7 @@ void gicp_localization::LocalizationNode::getParams() {
     this->sensor = dlio::SensorType::UNKNOWN;
     RCLCPP_WARN(this->get_logger(),
                 "Unknown localization/sensor_type '%s'; per-point deskew needs ouster, velodyne, "
-                "hesai, livox, or luminar",
+                "seyond, hesai, livox, or luminar",
                 sensor_type_str.c_str());
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
@@ -2403,6 +2448,52 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   int time_count = 0;
   const bool has_time_field = findTimeField(*pc, time_off, time_datatype, time_count);
 
+  // Enforce the documented sensor contract before any union decode.
+  const auto matches_time_contract =
+      [&pc](const char* name, uint8_t datatype) {
+        for (const auto& field : pc->fields) {
+          if (field.name == name) {
+            return field.datatype == datatype && field.count == 1;
+          }
+        }
+        return false;
+      };
+  const char* expected_time_contract = nullptr;
+  bool time_contract_ok = true;
+  if (this->sensor == dlio::SensorType::OUSTER) {
+    expected_time_contract = "t/UINT32/count=1 (nanoseconds from sweep start)";
+    time_contract_ok = matches_time_contract(
+        "t", sensor_msgs::msg::PointField::UINT32);
+  } else if (this->sensor == dlio::SensorType::VELODYNE) {
+    expected_time_contract = "time/FLOAT32/count=1 (seconds from sweep start)";
+    time_contract_ok = matches_time_contract(
+        "time", sensor_msgs::msg::PointField::FLOAT32);
+  } else if (this->sensor == dlio::SensorType::SEYOND) {
+    expected_time_contract =
+        "timestamp/FLOAT64/count=1 (absolute Unix seconds)";
+    time_contract_ok = matches_time_contract(
+        "timestamp", sensor_msgs::msg::PointField::FLOAT64);
+  } else if (this->sensor == dlio::SensorType::HESAI ||
+             this->sensor == dlio::SensorType::LIVOX) {
+    expected_time_contract =
+        "timestamp/FLOAT64/count=1 (absolute seconds for Hesai; numeric "
+        "epoch nanoseconds for Livox)";
+    time_contract_ok = matches_time_contract(
+        "timestamp", sensor_msgs::msg::PointField::FLOAT64);
+  }
+  if (time_contract_ok && this->sensor == dlio::SensorType::SEYOND) {
+    time_contract_ok = hasSeyondAbsoluteTimeAxis(*pc, time_off);
+  }
+  if (!time_contract_ok) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Rejecting point cloud: configured sensor timestamp contract is %s. "
+        "For Robin W, install the pinned driver with "
+        "PTP_sync/4_setup_lidar_ptp.sh.",
+        expected_time_contract);
+    return;
+  }
+
   // One-shot timestamp-field diagnostic. Fires exactly once across the whole
   // node lifetime (std::call_once) and dumps every PointField + the first few
   // points' timestamp bytes interpreted four ways. The developer reads the
@@ -2416,6 +2507,7 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
         this->sensor == dlio::SensorType::LUMINAR  ? "luminar"
         : this->sensor == dlio::SensorType::OUSTER ? "ouster"
         : this->sensor == dlio::SensorType::VELODYNE ? "velodyne"
+        : this->sensor == dlio::SensorType::SEYOND ? "seyond"
         : this->sensor == dlio::SensorType::HESAI   ? "hesai"
         : this->sensor == dlio::SensorType::LIVOX   ? "livox"
                                                     : "unknown";
@@ -2928,8 +3020,8 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
       const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
-      // luminar_uint64=false on the Hitch Sensor Dome (Seyond Robin W emits
-      // FLOAT32 scan-relative seconds, which DO get rebased by dt).
+      // Robin W's numeric FLOAT64 Unix seconds are detected as absolute and
+      // remain unchanged; relative timestamp layouts are rebased by dt.
       shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt,
                            this->sensor == dlio::SensorType::LUMINAR);
     } else if (this->deskew_) {
@@ -3063,7 +3155,8 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
       return sweep_ref_time + static_cast<double>(pt.time);
     };
     deskew_time_ready = true;
-  } else if (this->sensor == dlio::SensorType::HESAI) {
+  } else if (this->sensor == dlio::SensorType::SEYOND ||
+             this->sensor == dlio::SensorType::HESAI) {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
     extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp; };
     deskew_time_ready = true;
@@ -3129,10 +3222,6 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     this->prev_scan_stamp = this->scan_stamp.seconds();
     return;
   }
-  // Note: on the Hitch Sensor Dome, Seyond Robin W (coordinate_mode:=3)
-  // is consumed via the VELODYNE branch above — its per-point time
-  // encoding is identical to Velodyne (float32 seconds since sweep start).
-
   // Copy points into deskewed_scan_ in order of timestamp
   std::partial_sort_copy(this->original_scan->points.begin(), this->original_scan->points.end(),
                          deskewed_scan_->points.begin(), deskewed_scan_->points.end(), point_time_cmp);

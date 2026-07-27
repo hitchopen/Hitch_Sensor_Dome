@@ -35,7 +35,18 @@ public:
 
   void addPosePair(double arrival_ros, double p1_time);
   bool ready() const;
-  double toRos(double p1_time) const;
+  // [P1 FIX 2026-07-15] Force a re-anchor (clear bins + slew + streaks). The
+  // node calls this when it accepts an epoch change (backward power-cycle OR a
+  // persistence-confirmed forward epoch), so the mapper never carries a stale
+  // min-lag from the previous epoch into the new one.
+  void reset();
+  // [P3 FIX 2026-07-10] Non-const: applies a SLEW-LIMITED offset. Online
+  // bin refinement moves the raw offset in steps (each new bin contributes
+  // its first sample's full transport latency before min_lag converges);
+  // stepping the output stamp domain mid-stream produced anomalous dt for
+  // consumers. The applied offset now moves toward the target at a bounded
+  // rate; mapper resets (epoch change) re-anchor it instantly.
+  double toRos(double p1_time);
   double driftMs() const;
 
 private:
@@ -48,8 +59,14 @@ private:
   static double offsetDrift(const std::vector<std::pair<double, double>>& envelope);
 
   double bin_seconds_;
+  double applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: slewed offset
+  double last_slew_p1_ = std::numeric_limits<double>::quiet_NaN();
   double first_p1_ = std::numeric_limits<double>::quiet_NaN();
   std::vector<Bin> bins_;
+  // [P2 FIX 2026-07-09] consecutive forward-glitch counter: a persistent
+  // forward jump (device epoch change) resets the mapper after
+  // kGlitchResetCount rejects instead of freezing it forever.
+  int forward_glitch_streak_ = 0;
 };
 
 }  // namespace adapter

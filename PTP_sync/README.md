@@ -406,7 +406,12 @@ What it does:
 - Verifies the PTP grandmaster from Section 3 is running.
 - Pings each LiDAR at its post-provisioning IP.
 - Enables PTP on each Robin W via `innovusion_lidar_util` (standard IEEE 1588 mode, not automotive gPTP).
-- Clones and builds the Seyond ROS 2 driver (`./build.bash` inside `seyond_ros_driver/`, since `colcon build` from the workspace root doesn't work for Seyond).
+- Clones the Seyond ROS 2 driver and pins the reviewed commit. It removes the
+  obsolete repository relative-time override if an older installation has it,
+  then verifies that PointCloud2 publishes `timestamp/FLOAT64` numeric Unix
+  seconds reconstructed as packet-start time plus the per-point offset.
+- Builds with `./build.bash` inside `seyond_ros_driver/` (workspace-root
+  `colcon build` does not work for this driver).
 - Self-tests PTP slave sync status on each LiDAR.
 
 Expected post-sync accuracy:

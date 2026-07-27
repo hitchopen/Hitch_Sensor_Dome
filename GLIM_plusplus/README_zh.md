@@ -4,6 +4,18 @@
 
 本文档是 GLIM++ 与上游 `koide3/glim` 之间的**完整变更日志**。结构按机制分节，方便采用者逐项判断哪些改动适合自己的使用场景，哪些需要回退。
 
+> **⚠ 本中文文档落后于英文版。** 以下章节目前**仅存在于**
+> [`README.md`](README.md)，尚未翻译：
+>
+> - §12 按文件汇总的差异（file-by-file diff summary）
+> - §13 2026-07 P1–P5 改进（合并证据、yaw 质量门控、GNSS 回填）
+> - §14 2026-07-27 上游重新合并（逐点时间戳的扫描匹配、GNSS 锚定健康门控、PR #15）
+> - 快速开始中的单元测试与建图 profile 生成器用法
+>
+> Robin W 的规范现已确认：驱动把原始相对点偏移补全为
+> `timestamp/FLOAT64` 绝对 Unix 秒。详情请以英文版 §14 为准。
+> 涉及配置或时间戳行为的改动，请以英文版为准。
+
 ## 变更索引
 
 1. [面向 Hitch Sensor Dome 的传感器适配](#1-面向-hitch-sensor-dome-的传感器适配)
@@ -27,7 +39,7 @@ topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond R
 | IMU topic | `/gps_bot/imu` | `/imu/data` |
 | 主 LiDAR | `/luminar_front/points` | `/robin_w_front/points` |
 | 辅 LiDAR | `/luminar_left/points`、`/luminar_right/points` | `/robin_w_rear_left/points`、`/robin_w_rear_right/points` |
-| GNSS | `/gps_nav/odom` | `/gps/fix`（NavSatFix 门控信号） |
+| GNSS | `/gps_nav/odom` | `/gps_p1/fix`（适配器同步 NavSatFix 门控信号） |
 | 摄像头 | `/cam_front_left/image_raw` |（同名保留） |
 | `intensity_field` | `reflectance` (Luminar) | `intensity` (Robin W 默认) |
 | `ring_field` | `line_index` (Luminar) | `ring` (Robin W 默认) |
@@ -79,7 +91,7 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 | **初始化** | `config_odometry_gpu.json` | 窗口 `1.0 → 3.0` s（后已被完全替换 —— 见 §5）。 |
 | **GNSS 先验** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]`（上游默认值相当于禁用 GNSS）。`min_baseline: 1.0 → 0.5`。 |
 | **运动畸变补偿** | `config_sensors.json` | `global_shutter_lidar: true → false`。重新启用畸变补偿（上游多 LiDAR 时间戳重基 bug 已被修复，无需再绕开）。 |
-| **每点时间戳** | `config_sensors.json` | `autoconf_perpoint_times: false → true`、`perpoint_relative_time: false → true`。Robin W 驱动输出相对帧时间戳。 |
+| **每点时间戳** | `config_sensors.json` | Robin W 使用 `timestamp/FLOAT64` 绝对 Unix 秒；`autoconf_perpoint_times: false`、`perpoint_relative_time: false`、比例 `1.0`。 |
 | **下采样** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`、`k_correspondences: 10 → 20`。3 路传感器拼成的 360° 点云需更高密度；3× 上游值之所以可接受，是因为穹顶数据流程是**离线**针对录制 MCAP 包跑 GLIM —— 没有实时单帧时间预算。如果改为在线建图，建议降回 15-20K。 |
 | **VGICP voxel** | `config_odometry_gpu.json`、`config_sub_mapping_gpu.json` | 户外尺度提高基础分辨率：`voxel_resolution 0.25 → 0.5`、`voxel_resolution_max 0.5 → 1.0`。submap 内 `keyframe_voxel_resolution 0.25 → 0.15` 更紧。 |
 | **smoother 窗口** | `config_odometry_gpu.json` | `full_connection_window_size: 2 → 4`。适应车辆剧烈机动。 |
@@ -121,7 +133,7 @@ GLIM++ 完全移除了"由加速度计估计重力"这条路径，并要求在�
 
 | 文件 | 改动 |
 |------|--------|
-| [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) 与 [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | 新增对 `ins_pose_topic`（默认 `/pose`，`geometry_msgs/PoseStamped`）和 `ins_odom_topic`（默认空，`nav_msgs/Odometry`）的订阅。第一条通过 §6 门控的消息会调用 `odometry_estimation->set_init_state(T, v)`，把优化器的重力参考一次性钉死。 |
+| [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) 与 [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | 支持兼容模式 `ins_pose_topic`（生产默认空）和 `ins_odom_topic`（生产默认 `/gps_p1/filtered_odom_rtk_fixed`，`nav_msgs/Odometry`）。第一条通过 §6 门控的消息会调用 `odometry_estimation->set_init_state(T, v)`。 |
 
 完整数据通路见 [`docs/moving_start_initialization.md`](docs/moving_start_initialization.md)。
 
@@ -131,12 +143,13 @@ GLIM++ 完全移除了"由加速度计估计重力"这条路径，并要求在�
 
 朴素的"接受第一条 pose"会愉快地咬住一个仍处于冷启动、IMU dead-reckoning、或 RTK-float 的 INS。整张 SLAM 地图都钉在这一条 pose 上，错一次就要重录。
 
-wrapper 在调用 `set_init_state` 之前强制走**三阶段门控**：
+wrapper 在调用 `set_init_state` 之前先要求 adapter 的权威 Fixed-only 数据源，再走三项独立门控：
 
 | 阶段 | 检查 | 默认阈值 |
 |------|------|----------|
-| 1. fix 状态 | `NavSatFix.status.status ≥ STATUS_GBAS_FIX`（RTK 级） | `ins_require_rtk_fixed = true` |
-| 2. 协方差 | `position_covariance` 对角线最大 σ ≤ 阈值 | `0.10 m` |
+| 0. 解类型 | 消息来自 adapter 的 Fixed-only odometry | FusionEngine `kRtkFixed` |
+| 1. fix 状态 | `NavSatFix.status.status ≥ STATUS_GBAS_FIX`（独立 RTK 级交叉检查） | `ins_require_rtk_fixed = true` |
+| 2. 协方差 | 类型已知、对角线有限且为正、最大 σ ≤ 阈值 | `0.10 m` |
 | 3. 稳定性 | 最近 N 条 INS pose 互相一致（平移 jitter、`\|q1·q2\|`） | `N=10`、`0.05 m`、`0.999` |
 
 只要任一阶段未通过，2 秒钟一次的 wall-timer 就会触发 `ins_init_timeout_tick()`，**每 10 秒打印一次粗体红色多行警告**，列明最近一次拒绝的原因和补救步骤。`ins_init_timeout_s = 60 s` 后警告升级为"TIMEOUT" —— 但 **GLIM 永远不会自动 abort**，由操作员决定。
@@ -144,9 +157,9 @@ wrapper 在调用 `set_init_state` 之前强制走**三阶段门控**：
 新增的八个 ROS 参数（在 [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py) 中声明、在 [`glim/config/config_ros.json`](glim/config/config_ros.json) 中注释）：
 
 ```
-ins_pose_topic                    默认 /pose
-ins_odom_topic                    默认 ""
-ins_fix_topic                     默认 /gps/fix
+ins_pose_topic                    默认 ""
+ins_odom_topic                    默认 /gps_p1/filtered_odom_rtk_fixed
+ins_fix_topic                     默认 /gps_p1/fix
 ins_require_rtk_fixed             默认 true
 ins_max_position_stddev           默认 0.10
 ins_min_pose_window_samples       默认 10
@@ -164,9 +177,9 @@ ins_init_timeout_s                默认 60.0
 fork 在 wrapper 内增加了一个进程内桥：
 
 ```
-fusion_engine_driver
-   ├── /pose          (PoseStamped)
-   └── /gps/fix       (NavSatFix, RTK 门控信号)
+fusion_engine_driver + adapter
+   ├── /gps_p1/filtered_odom_rtk_fixed (Odometry，仅 kRtkFixed)
+   └── /gps_p1/fix    (适配器 NavSatFix, RTK 门控信号)
                   │
                   ▼
        GlimROS::try_publish_gnss_factor
@@ -192,7 +205,7 @@ fusion_engine_driver
 
 每 10 秒的状态日志会打印 `N published, M rejected`，方便操作员实时观察桥是否在正常工作。
 
-**RTK 失锁时的行为。** 当 RTK 退化为 float / no-fix（隧道、城市峡谷），桥会静默暂停；`gnss_global` 看到一个安静的 topic，本段时间不加任何因子。优化器靠 LiDAR 代价撑过这段空档。RTK 重新锁定后，下一条 `/pose` 起又开始发因子。**会话期间的 RTK 要求只对初始位姿（§6）是硬性的；后续每条消息的门控只是软暂停，不是硬阻塞。**
+**RTK 失锁时的行为。** 当 RTK 退化为 float / no-fix（隧道、城市峡谷），adapter 的 Fixed-only topic 会停止发布；`gnss_global` 本段时间不加任何因子，优化器靠 LiDAR-IMU SLAM 撑过空档。RTK 重新锁定后，下一条 Fixed odometry 起恢复因子。
 
 涉及文件：[`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp)、[`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp)、[`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json)、[`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py)。
 
