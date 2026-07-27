@@ -48,3 +48,29 @@ recording/data/*
 *.ppt
 ~$*.pptx
 ~$*.ppt
+
+# Working review / analysis notes — private, not part of the shipped package.
+#
+# Every README in this repository is deliberately SELF-CONTAINED: no README
+# links into these folders, so ignoring them cannot produce a broken link.
+# Relative links in the READMEs point only at tracked source/config files;
+# everything else is an external URL. Keep it that way — if a README ever needs
+# something that lives here, inline the content rather than adding a link.
+#
+# These patterns are ANCHORED with a leading slash on purpose. An unanchored
+# `docs/` matches a directory named `docs` at ANY depth, which silently
+# swallowed upstream GLIM's own documentation site at
+# GLIM_plusplus/glim/docs/ — harmless only for as long as those files stayed
+# tracked, and a silent data-loss trap on the next upstream re-sync.
+/docs/
+/GLIM_plusplus/docs/
+/adapter/MERGE_NOTES_*.md
+
+# Staging area for files queued for deletion. Cowork's device bridge cannot
+# unlink files inside a connected folder, so anything to be removed is moved
+# here instead and deleted by hand afterwards. Never commit it.
+#
+# Deliberately UNANCHORED, unlike the patterns above: one of these can be
+# created next to whatever file is being retired, at any depth. There is no
+# upstream directory by this name to collide with.
+_to_delete/

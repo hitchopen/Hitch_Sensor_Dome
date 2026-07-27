@@ -135,7 +135,8 @@
     //                                0.10 ≈ RTK-fixed; raise for SBAS-class.
     // ins_min_pose_window_samples  — consecutive consistent samples required.
     // ins_max_pose_jitter_trans    — max translation drift (m) between samples.
-    // ins_min_quat_dot             — min |q1·q2| between samples (0.999 ≈ 2.5°).
+    // ins_max_attitude_residual_deg — max attitude RESIDUAL (deg) against a
+    //   constant-angular-rate prediction. See the detailed block below.
     // ins_init_timeout_s           — seconds before warning escalates to "TIMEOUT".
     // NOTE (B4 fix): these settings apply in BOTH modes — offline replay
     // (glim_rosbag / glim_pcap_rosbag reads the same topics from the bag
@@ -187,11 +188,26 @@
     //   solution is called unsettled. Raise it if mapping runs start under
     //   harder acceleration; lower it to demand a calmer start.
     "ins_max_pose_jitter_trans": 0.05,
-    // ins_min_quat_dot — same idea for attitude: |q_pred . q| against a
-    //   constant-angular-rate prediction. 0.999 ~ 2.5 deg of residual, i.e.
-    //   ~250 deg/s^2 of angular acceleration at 10 Hz. A steady turn passes
-    //   at any rate; an attitude snap does not.
-    "ins_min_quat_dot": 0.999,
+    // ins_max_attitude_residual_deg — same idea for attitude: the angle
+    //   between the measured attitude and a constant-angular-rate prediction
+    //   from the two preceding samples. Under constant angular acceleration
+    //   alpha the residual is alpha*dt^2, so 2.5 deg at 10 Hz tolerates
+    //   ~250 deg/s^2. A steady turn passes at any rate; an attitude snap does
+    //   not. Dual-antenna mode tightens this to 0.8 deg automatically.
+    //
+    //   [P2 FIX 2026-07-27] This replaces `ins_min_quat_dot`, which was a raw
+    //   quaternion dot product. Because |q_a . q_b| = cos(theta/2), every
+    //   angle ever documented for that key was HALF the residual actually
+    //   admitted: 0.999 was annotated "2.5 deg" but admitted 5.125 deg, and
+    //   the dual-antenna 0.9999 was annotated "0.8 deg" but admitted
+    //   1.621 deg. The gate is therefore genuinely 2x tighter than every run
+    //   recorded before this date. If an existing bag now fails to initialize
+    //   on attitude, raise this value deliberately rather than reverting --
+    //   5.125 was never an intended bound.
+    //
+    //   The deprecated key is still read if this one is absent, and is
+    //   converted with a warning. Setting both is a warning and this key wins.
+    "ins_max_attitude_residual_deg": 2.5,
     // ins_max_pose_gap_s — max gap (s) between consecutive accepted samples
     //   before the window is discarded as non-contiguous. Samples enter the
     //   window only after the RTK gates pass, so without this a fix that

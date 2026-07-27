@@ -73,7 +73,8 @@ Eigen::Vector4d get_vec4(const void* x, const void* y, const void* z) {
 // single sensor it is left at -1 and the global minimum is used (unchanged).
 // `float64_time_is_epoch_ns` (default false): when the per-point time field is
 // FLOAT64, treat its raw bytes as a uint64 PTP epoch-NANOSECOND value (the
-// documented Luminar driver variant) instead of IEEE-754 seconds. This is an
+// documented raw-epoch-ns driver variant) instead of IEEE-754 seconds. It is
+// FALSE on the Hitch dome: Robin W emits IEEE-754 epoch seconds. This is an
 // EXPLICIT operator/driver contract, never inferred from value magnitude — see
 // the FLOAT64 case below.
 static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const std::string& intensity_channel, const std::string& ring_channel, int epoch_anchor_count = -1, bool float64_time_is_epoch_ns = false) {
@@ -175,12 +176,12 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
           break;
         case PointField::FLOAT64: {
           // [P2 FIX 2026-07-15] Decode FLOAT64 as genuine IEEE-754 seconds by
-          // default. A previous attempt disambiguated the Luminar FLOAT64-epoch-
+          // default. A previous attempt disambiguated the raw FLOAT64-epoch-
           // ns driver variant from a magnitude heuristic, but that is unsound:
           // the IEEE-754 bit pattern of an ordinary small relative offset (e.g.
           // 1e-5 s -> 0x3EE5798EE2308C3A ~= 4.53e18 as uint64) falls inside the
           // epoch-ns range, so 10 us point offsets were misread as year-2113
-          // stamps. The raw-uint64 decode is now an EXPLICIT Luminar-contract
+          // stamps. The raw-uint64 decode is now an EXPLICIT driver-contract
           // opt-in (float64_time_is_epoch_ns), never guessed from magnitude.
           if (float64_time_is_epoch_ns) {
             std::uint64_t time_ns = 0;
@@ -193,8 +194,8 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         }
         case PointField::UINT8:
           if (time_count == 8) {
-            // Luminar Iris: little-endian uint64 PTP epoch nanoseconds.
-            // Per the Luminar Iris Data Output Specification v1.3.0 the
+            // Raw layout: little-endian uint64 PTP epoch nanoseconds.
+            // Per the upstream Iris Data Output Specification v1.3.0 the
             // sensor splits this into 48-bit epoch seconds in the packet
             // header (§2.1) and a 32-bit sub-second nanosecond count per ray
             // (§2.2/§2.6.3); the single uint64 epoch-ns read here is the
@@ -217,8 +218,9 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
       }
     }
 
-    // Epoch-axis safeguard (Luminar / absolute per-point times on the live path).
-    // Absolute per-point timestamps (e.g. Luminar UINT8[8] epoch ns) can sit on
+    // Epoch-axis safeguard (absolute per-point times on the live path).
+    // Absolute per-point timestamps (Robin W FLOAT64 epoch seconds, or a raw
+    // UINT8[8] epoch-ns layout) can sit on
     // the sensor's own clock rather than the ROS/header epoch when the sensor is
     // not PTP-locked to an epoch grandmaster (observed in raw bags: point times
     // ~2e13 ns while header.stamp / IMU were on the Unix epoch). GLIM's TimeKeeper

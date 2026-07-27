@@ -31,7 +31,7 @@
 
 namespace glim_ros {
 
-struct LuminarTimestampRangeNs {
+struct PointTimeRangeNs {
   bool valid = false;
   uint64_t min_ns = 0;
   uint64_t max_ns = 0;
@@ -40,7 +40,7 @@ struct LuminarTimestampRangeNs {
 
 struct BufferedAuxCloud {
   sensor_msgs::msg::PointCloud2::SharedPtr msg;
-  LuminarTimestampRangeNs luminar_range;
+  PointTimeRangeNs point_time_range;
 };
 
 struct AuxLidarSensor {
@@ -51,8 +51,10 @@ struct AuxLidarSensor {
   // Header phase is only a scheduling/matching hint. It must never be copied
   // into absolute point timestamps.
   double match_time_offset = 0.0;
-  // A measured residual point-clock correction. This is applied to Luminar
-  // UINT8[8] point ranges for matching and to the merged point timestamps.
+  // A measured residual point-clock correction. Applied to the aux sweep's
+  // ABSOLUTE point-time range for matching and to the merged point timestamps.
+  // On Robin W (FLOAT64 epoch seconds) in the seconds domain; on a raw uint64
+  // epoch-ns layout, in the ns domain.
   double point_time_offset = 0.0;
   // Signed raw header phase vs primary, over merged scans. This is acquisition
   // phase evidence, not by itself a PTP/point-clock measurement.
@@ -63,7 +65,7 @@ struct AuxLidarSensor {
   // Best absolute point-time ENDPOINT DELTA vs the primary sweep, recorded on
   // EVERY candidate evaluation — accepted or rejected.
   //
-  // This is the quantity `luminar_time_threshold` actually gates on, and it
+  // This is the quantity `sweep_time_threshold` actually gates on, and it
   // is the only number that can tell an operator whether that threshold is
   // correctly configured for this rig. Without it a run that rejects every
   // aux is indistinguishable in the logs from a run with no aux configured:
@@ -121,27 +123,27 @@ inline uint64_t shifted_timestamp_ns(uint64_t timestamp_ns, int64_t shift_ns) {
   return timestamp_ns >= sub ? timestamp_ns - sub : 0;
 }
 
-inline LuminarTimestampRangeNs shifted_range(
-  const LuminarTimestampRangeNs& range, double clock_offset_s) {
+inline PointTimeRangeNs shifted_range(
+  const PointTimeRangeNs& range, double clock_offset_s) {
   if (!range.valid) return range;
   const int64_t shift_ns = seconds_to_nanoseconds(clock_offset_s);
-  LuminarTimestampRangeNs shifted = range;
+  PointTimeRangeNs shifted = range;
   shifted.min_ns = shifted_timestamp_ns(range.min_ns, shift_ns);
   shifted.max_ns = shifted_timestamp_ns(range.max_ns, shift_ns);
   return shifted;
 }
 
 inline double endpoint_delta_seconds(
-  const LuminarTimestampRangeNs& lhs,
-  const LuminarTimestampRangeNs& rhs) {
+  const PointTimeRangeNs& lhs,
+  const PointTimeRangeNs& rhs) {
   if (!lhs.valid || !rhs.valid) return std::numeric_limits<double>::infinity();
   return static_cast<double>(std::max(
     abs_diff_ns(lhs.min_ns, rhs.min_ns), abs_diff_ns(lhs.max_ns, rhs.max_ns))) * 1.0e-9;
 }
 
-inline bool luminar_watermark_passed(
-  const LuminarTimestampRangeNs& primary,
-  const LuminarTimestampRangeNs& newest_aux,
+inline bool sweep_watermark_passed(
+  const PointTimeRangeNs& primary,
+  const PointTimeRangeNs& newest_aux,
   double threshold_s) {
   if (!primary.valid || !newest_aux.valid) return false;
   const uint64_t threshold_ns = static_cast<uint64_t>(
@@ -180,7 +182,7 @@ inline bool find_xyz_offsets(const sensor_msgs::msg::PointCloud2& msg, int& x_of
 // the primary: same point_step, same endianness, and the same ordered set of
 // field {name, offset, datatype, count}. A same-point_step cloud with different
 // offsets/datatypes would otherwise be silently misread. O(#fields) (~10-20 per
-// Luminar scan) -- negligible next to deskew / voxelisation / registration.
+// typical scan) -- negligible next to deskew / voxelisation / registration.
 // Returns true on match; on mismatch returns false and sets `reason` for logging.
 inline bool schema_matches_primary(const sensor_msgs::msg::PointCloud2& aux,
                                    const sensor_msgs::msg::PointCloud2& primary,
@@ -283,9 +285,11 @@ constexpr double kMinAbsoluteEpochNanoseconds = 1e15;
 
 // Decode the authoritative absolute point-time range carried by the primary
 // LiDAR driver. Supported encodings:
-//   * UINT8[8] — Luminar Iris uint64 PTP epoch nanoseconds (upstream).
+//   * UINT8[8] — raw uint64 PTP epoch nanoseconds. NOT emitted by Robin W;
+//     retained for upstream-bag compatibility.
 //   * FLOAT64 (count 1), float64_time_is_epoch_ns=true — raw uint64 epoch-ns
-//     bytes under the explicit Luminar driver contract (upstream).
+//     bytes under the explicit float64_time_is_epoch_ns contract. NOT the
+//     Robin W layout — Robin W emits IEEE-754 epoch SECONDS.
 //   * FLOAT64 (count 1), float64_time_is_epoch_ns=false — either IEEE-754
 //     absolute epoch seconds (Hesai) or numeric epoch nanoseconds (Livox).
 //     Scan-relative FLOAT64 seconds fail closed to the header-based fallback.
@@ -293,10 +297,10 @@ constexpr double kMinAbsoluteEpochNanoseconds = 1e15;
 // absolute range path directly.
 // Other timestamp layouts deliberately return invalid so they continue
 // through the generic header-based fallback.
-inline LuminarTimestampRangeNs luminar_timestamp_range(
+inline PointTimeRangeNs decode_point_time_range(
   const sensor_msgs::msg::PointCloud2& msg,
   bool float64_time_is_epoch_ns = false) {
-  LuminarTimestampRangeNs range;
+  PointTimeRangeNs range;
   // The decode below memcpy's little-endian payloads. A big-endian
   // payload would produce garbage ranges that could still fall inside the
   // matching gate by chance — reject it before matching (fail closed).
@@ -335,20 +339,20 @@ inline LuminarTimestampRangeNs luminar_timestamp_range(
       std::memcpy(&value, msg.data.data() + i * msg.point_step + time_off, sizeof(double));
       if (value == 0.0) continue;
       if (!std::isfinite(value) || value < kMinAbsoluteEpochSeconds) {
-        return LuminarTimestampRangeNs{};
+        return PointTimeRangeNs{};
       }
       const Float64Axis sample_axis =
         value >= kMinAbsoluteEpochNanoseconds
           ? Float64Axis::EPOCH_NANOSECONDS
           : Float64Axis::EPOCH_SECONDS;
       if (float64_axis != Float64Axis::UNKNOWN && float64_axis != sample_axis) {
-        return LuminarTimestampRangeNs{};
+        return PointTimeRangeNs{};
       }
       float64_axis = sample_axis;
       const double ns =
         sample_axis == Float64Axis::EPOCH_NANOSECONDS ? value : value * 1e9;
       if (ns >= static_cast<double>(std::numeric_limits<uint64_t>::max())) {
-        return LuminarTimestampRangeNs{};
+        return PointTimeRangeNs{};
       }
       timestamp_ns = static_cast<uint64_t>(ns);
     } else {
@@ -369,34 +373,34 @@ inline BufferedAuxCloud buffer_aux_cloud(
   sensor_msgs::msg::PointCloud2::SharedPtr msg,
   bool float64_time_is_epoch_ns = false) {
   BufferedAuxCloud buffered;
-  buffered.luminar_range = luminar_timestamp_range(*msg, float64_time_is_epoch_ns);
+  buffered.point_time_range = decode_point_time_range(*msg, float64_time_is_epoch_ns);
   buffered.msg = std::move(msg);
   return buffered;
 }
 
-struct LuminarSweepMatch {
+struct SweepMatch {
   sensor_msgs::msg::PointCloud2::SharedPtr msg;
   double range_delta_s = std::numeric_limits<double>::infinity();
   double header_abs_delta_s = std::numeric_limits<double>::infinity();
 };
 
-inline std::optional<LuminarSweepMatch> find_closest_luminar_sweep(
+inline std::optional<SweepMatch> find_closest_sweep(
   const std::deque<BufferedAuxCloud>& buffer,
-  const LuminarTimestampRangeNs& primary_range,
+  const PointTimeRangeNs& primary_range,
   double point_time_offset,
   double primary_header_s,
   double match_time_offset) {
-  std::optional<LuminarSweepMatch> best;
+  std::optional<SweepMatch> best;
   for (const auto& buffered : buffer) {
-    if (!buffered.luminar_range.valid) continue;
-    const auto candidate_range = shifted_range(buffered.luminar_range, point_time_offset);
+    if (!buffered.point_time_range.valid) continue;
+    const auto candidate_range = shifted_range(buffered.point_time_range, point_time_offset);
     const double range_delta_s = endpoint_delta_seconds(primary_range, candidate_range);
     const double header_abs_delta_s = std::abs(
       stamp_to_sec(buffered.msg->header.stamp) + match_time_offset - primary_header_s);
     if (!best || range_delta_s < best->range_delta_s ||
         (range_delta_s == best->range_delta_s &&
          header_abs_delta_s < best->header_abs_delta_s)) {
-      best = LuminarSweepMatch{buffered.msg, range_delta_s, header_abs_delta_s};
+      best = SweepMatch{buffered.msg, range_delta_s, header_abs_delta_s};
     }
   }
   return best;
@@ -411,10 +415,10 @@ inline std::optional<LuminarSweepMatch> find_closest_luminar_sweep(
 // ~10^5 points per poll. Callers cache the range once at enqueue and pass it
 // here.
 inline bool aux_buffers_ready_for_primary(
-  const LuminarTimestampRangeNs& primary_range,
+  const PointTimeRangeNs& primary_range,
   double primary_header_s,
   const std::vector<AuxLidarSensor>& aux_sensors,
-  double luminar_time_threshold) {
+  double sweep_time_threshold) {
   if (!primary_range.valid) {
     // Relative per-point time layouts (for example the Laguna decoder's
     // FLOAT64 seconds-since-sweep-start field) cannot use the absolute
@@ -441,19 +445,19 @@ inline bool aux_buffers_ready_for_primary(
   }
   for (const auto& aux : aux_sensors) {
     if (aux.buffer.empty()) return false;
-    const auto match = find_closest_luminar_sweep(
+    const auto match = find_closest_sweep(
       aux.buffer, primary_range, aux.point_time_offset,
       primary_header_s, aux.match_time_offset);
-    if (match && match->range_delta_s <= luminar_time_threshold) continue;
+    if (match && match->range_delta_s <= sweep_time_threshold) continue;
 
-    LuminarTimestampRangeNs newest;
+    PointTimeRangeNs newest;
     for (const auto& buffered : aux.buffer) {
-      const auto candidate = shifted_range(buffered.luminar_range, aux.point_time_offset);
+      const auto candidate = shifted_range(buffered.point_time_range, aux.point_time_offset);
       if (candidate.valid && (!newest.valid || candidate.min_ns > newest.min_ns)) {
         newest = candidate;
       }
     }
-    if (!luminar_watermark_passed(primary_range, newest, luminar_time_threshold)) {
+    if (!sweep_watermark_passed(primary_range, newest, sweep_time_threshold)) {
       return false;
     }
   }
@@ -465,11 +469,11 @@ inline bool aux_buffers_ready_for_primary(
 inline bool aux_buffers_ready_for_primary(
   const sensor_msgs::msg::PointCloud2& primary,
   const std::vector<AuxLidarSensor>& aux_sensors,
-  double luminar_time_threshold,
+  double sweep_time_threshold,
   bool float64_time_is_epoch_ns = false) {
   return aux_buffers_ready_for_primary(
-    luminar_timestamp_range(primary, float64_time_is_epoch_ns), stamp_to_sec(primary.header.stamp),
-    aux_sensors, luminar_time_threshold);
+    decode_point_time_range(primary, float64_time_is_epoch_ns), stamp_to_sec(primary.header.stamp),
+    aux_sensors, sweep_time_threshold);
 }
 
 // Shift per-point timestamps by `dt` seconds to rebase an aux scan from its
@@ -485,20 +489,19 @@ inline bool aux_buffers_ready_for_primary(
 // float64_time_is_epoch_ns driver contract instead routes raw uint64 bits
 // through the absolute path; never infer that raw-bit choice from magnitude.
 //
-// ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns):
+// ABSOLUTE-EPOCH encodings (raw UINT8[8] = uint64 PTP epoch ns, and the
+// Robin W FLOAT64 epoch-seconds layout):
 // do not get the header-relative dt shift. They are shifted only by the
 // configured constant aux clock correction, if any, because TimeKeeper uses
 // absolute epoch values directly for deskew.
 //
-// Luminar timestamp format (Luminar Iris Data Output Specification v1.3.0):
-// the sensor does NOT emit a single uint64 epoch-ns field -- it carries
-// 48-bit integer epoch SECONDS once per packet header (§2.1, UQ48.0) and a
-// 32-bit SUB-SECOND NANOSECOND count per ray (§2.2/§2.6.3, UQ32.0) that
-// wraps every 1 s; all fields little-endian (§2). The uint64 epoch-ns used
-// here is the upstream ROS driver's reconstruction (seconds*1e9 + ns), so
-// this depends on the driver, not the datasheet -- verify against the
-// actual Luminar driver. (The "epoch time" guidance lives in the PTP
-// sections of the Product Information Guide, not the data layout.)
+// Provenance: the raw uint64 epoch-ns handling below was inherited from the
+// upstream Iris platform, whose driver reconstructs an absolute epoch from
+// header seconds + per-ray nanoseconds. The Hitch dome does NOT use that
+// encoding — Robin W emits FLOAT64 absolute epoch SECONDS — but the branch is
+// kept so upstream bags still replay and a future absolute-ns sensor needs no
+// second decoder.
+//
 inline void shift_cloud_timestamps(
   std::vector<uint8_t>& data,
   uint32_t point_step,
@@ -513,7 +516,7 @@ inline void shift_cloud_timestamps(
   // Raw uint64 PTP epoch nanoseconds are ABSOLUTE: skip the header-relative dt
   // shift, but apply a configured constant clock correction so aux clouds align
   // with the primary/IMU timebase before GLIM deskew. The explicitly configured
-  // Luminar FLOAT64 variant holds those same raw bytes, so doing IEEE-754
+  // opt-in FLOAT64-as-raw-bytes variant holds those same raw bytes, so IEEE-754
   // arithmetic on it would corrupt every merged auxiliary timestamp.
   const bool raw_epoch_ns =
     (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8) ||
@@ -724,7 +727,7 @@ inline double cloud_time_span_seconds(const sensor_msgs::msg::PointCloud2& cloud
   const size_t avail = step - static_cast<uint32_t>(off);
 
   switch (datatype) {
-    case sensor_msgs::msg::PointField::UINT8: {  // Luminar uint64 epoch ns
+    case sensor_msgs::msg::PointField::UINT8: {  // raw uint64 epoch ns
       if (count != 8 || avail < 8) return nan;
       uint64_t mn = std::numeric_limits<uint64_t>::max(), mx = 0;
       for (size_t i = 0; i < n; i++) {
@@ -808,10 +811,10 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   int* consec_fail = nullptr,
   bool abort_on_merge_failure = true,
   bool frame_diag_log = false,
-  double luminar_time_threshold = 0.010,
+  double sweep_time_threshold = 0.010,
   bool float64_time_is_epoch_ns = false) {
   const double t_primary = stamp_to_sec(primary->header.stamp);
-  const auto primary_luminar_range = luminar_timestamp_range(*primary, float64_time_is_epoch_ns);
+  const auto primary_point_time_range = decode_point_time_range(*primary, float64_time_is_epoch_ns);
   const uint32_t point_step = primary->point_step;
   size_t merged_aux_count = 0;
 
@@ -877,7 +880,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   // (it byte-appends aux data and re-counts by point_step). Reject a row-padded
   // primary (data.size() != width*height*point_step) loudly rather than silently
   // counting padding as points. Organized-but-tight (height>1, no padding) is
-  // fine to flatten; only padding is rejected. Luminar clouds are unorganized and
+  // fine to flatten; only padding is rejected. Robin W clouds are unorganized and
   // tight (PCAP reader emits height=1, row_step=point_step*width).
   if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
     spdlog::warn("lidar_concat: primary cloud is organized/padded (data={}, width={}, height={}, step={}); skipping concat",
@@ -896,7 +899,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     auto& aux = aux_sensors[aux_i];
     sensor_msgs::msg::PointCloud2::SharedPtr match;
     double point_range_delta_s = std::numeric_limits<double>::infinity();
-    if (primary_luminar_range.valid) {
+    if (primary_point_time_range.valid) {
       // Hardening: an aux whose clouds carry NO decodable absolute point-time
       // range (unsupported layout, big-endian payload) can never be selected
       // under an absolute-time primary — and header matching is NOT a usable
@@ -906,7 +909,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       // generic "no point-time-aligned match" every frame.
       bool any_valid_range = false;
       for (const auto& buffered : aux.buffer) {
-        if (buffered.luminar_range.valid) {
+        if (buffered.point_time_range.valid) {
           any_valid_range = true;
           break;
         }
@@ -925,24 +928,24 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         }
         continue;
       }
-      const auto luminar_match = find_closest_luminar_sweep(
-        aux.buffer, primary_luminar_range, aux.point_time_offset,
+      const auto sweep_match = find_closest_sweep(
+        aux.buffer, primary_point_time_range, aux.point_time_offset,
         t_primary, aux.match_time_offset);
       // Record the best achievable endpoint delta BEFORE the accept test, so
       // near-misses and outright rejections are measured too (see the stats
       // block in AuxLidarSensor). This is what makes a misconfigured gate
       // diagnosable instead of silent.
-      if (luminar_match && std::isfinite(luminar_match->range_delta_s)) {
-        const double rd = luminar_match->range_delta_s;
+      if (sweep_match && std::isfinite(sweep_match->range_delta_s)) {
+        const double rd = sweep_match->range_delta_s;
         aux.range_delta_sum += rd;
         aux.range_delta_min = std::min(aux.range_delta_min, rd);
         aux.range_delta_max = std::max(aux.range_delta_max, rd);
         ++aux.range_delta_count;
-        if (rd > luminar_time_threshold) ++aux.range_gate_rejects;
+        if (rd > sweep_time_threshold) ++aux.range_gate_rejects;
         point_range_delta_s = rd;  // reported in diagnostics even on reject
       }
-      if (luminar_match && luminar_match->range_delta_s <= luminar_time_threshold) {
-        match = luminar_match->msg;
+      if (sweep_match && sweep_match->range_delta_s <= sweep_time_threshold) {
+        match = sweep_match->msg;
       }
     } else {
       // [P2 FIX 2026-07-14] Primary point-time range is undecodable. Header-
@@ -954,7 +957,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       // two-pass staging path is already protected.)
       bool aux_has_abs_time = false;
       for (const auto& buffered : aux.buffer) {
-        if (buffered.luminar_range.valid) { aux_has_abs_time = true; break; }
+        if (buffered.point_time_range.valid) { aux_has_abs_time = true; break; }
       }
       if (aux_has_abs_time) {
         static std::atomic<uint64_t> mismatch_warns{0};
@@ -971,15 +974,15 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         aux.buffer, t_primary, time_threshold, aux.match_time_offset);
     }
     if (!match) {
-      if (primary_luminar_range.valid) {
+      if (primary_point_time_range.valid) {
         spdlog::warn(
           "lidar_concat: no point-time-aligned match for {} — best endpoint "
-          "delta {:.4f}s exceeds luminar_time_threshold {:.3f}s; dropping aux "
+          "delta {:.4f}s exceeds sweep_time_threshold {:.3f}s; dropping aux "
           "instead of appending a non-contemporaneous sweep",
           aux.topic,
           std::isfinite(point_range_delta_s) ? point_range_delta_s
                                              : std::numeric_limits<double>::quiet_NaN(),
-          luminar_time_threshold);
+          sweep_time_threshold);
       } else {
         spdlog::debug("lidar_concat: no header match for {} (t={:.3f})", aux.topic, t_primary);
       }
@@ -1058,7 +1061,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         aux.topic, aux.dt_count, 1e3 * mean, 1e3 * aux.dt_min, 1e3 * aux.dt_max);
       // The gated quantity, over EVERY candidate evaluation including
       // rejections — this is the one to compare against
-      // luminar_time_threshold when deciding whether the gate fits the rig.
+      // sweep_time_threshold when deciding whether the gate fits the rig.
       if (aux.range_delta_count > 0) {
         const double rd_mean =
           aux.range_delta_sum / static_cast<double>(aux.range_delta_count);
@@ -1067,21 +1070,21 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         spdlog::info(
           "lidar_concat: '{}' sweep endpoint delta over {} evaluations: "
           "mean={:.1f} ms, min={:.1f} ms, max={:.1f} ms, gate={:.1f} ms, "
-          "rejected={:.1f}% — this is the quantity luminar_time_threshold gates",
+          "rejected={:.1f}% — this is the quantity sweep_time_threshold gates",
           aux.topic, aux.range_delta_count, 1e3 * rd_mean,
           1e3 * aux.range_delta_min, 1e3 * aux.range_delta_max,
-          1e3 * luminar_time_threshold, 100.0 * reject_frac);
+          1e3 * sweep_time_threshold, 100.0 * reject_frac);
         if (reject_frac > 0.10) {
           spdlog::warn(
             "lidar_concat: '{}' is failing the endpoint gate on {:.1f}% of "
             "scans (mean delta {:.1f} ms vs gate {:.1f} ms). Sweep phase is a "
             "DEPLOYMENT property — PTP disciplines clocks, not frame "
             "scheduling, and Robin W exposes no frame-trigger contract. Either "
-            "widen luminar_time_threshold (keeping it well under HALF the "
+            "widen sweep_time_threshold (keeping it well under HALF the "
             "sweep period: 50 ms at 10 FPS, 25 ms at 20 FPS) or accept "
             "front-only coverage.",
             aux.topic, 100.0 * reject_frac, 1e3 * rd_mean,
-            1e3 * luminar_time_threshold);
+            1e3 * sweep_time_threshold);
         }
       }
     }
@@ -1110,7 +1113,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 struct AuxConcatConfig {
   bool enabled = false;
   double time_threshold = 0.05;
-  double luminar_time_threshold = 0.010;
+  double sweep_time_threshold = 0.010;
   // Bag-time bound on how long an offline reader may hold a queued primary
   // waiting for a point-coherent aux match/watermark. Once the bag stream has
   // advanced this far past the primary's enqueue time, the primary is released
@@ -1177,8 +1180,43 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   AuxConcatConfig out;
   out.enabled = config_sensors.param<bool>("lidar_concat", "enabled", false);
   out.time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
-  out.luminar_time_threshold =
-    config_sensors.param<double>("lidar_concat", "luminar_time_threshold", 0.010);
+  // [2026-07-27] Renamed from the upstream vendor-branded
+  // "luminar_time_threshold": this platform is Seyond Robin W, and the gate
+  // applies to ANY absolute point-time carrier. The old key is still honoured
+  // so an existing run config does not silently fall back to the default.
+  // [P2 FIX 2026-07-27] Key PRESENCE decides which source wins, never the
+  // value. The previous form read the key with a -1.0 default and treated any
+  // negative result as "absent", so an explicitly configured
+  // `sweep_time_threshold: -0.1` was silently replaced by the legacy key or by
+  // 0.010 and never reached the negative-value validation below. Presence and
+  // validity are now separate questions: has_param() answers the first, and
+  // every path falls through to the same fail-loud check.
+  const bool has_sweep_key =
+    config_sensors.has_param("lidar_concat", "sweep_time_threshold");
+  const bool has_legacy_key =
+    config_sensors.has_param("lidar_concat", "luminar_time_threshold");
+  if (has_sweep_key) {
+    out.sweep_time_threshold =
+      config_sensors.param<double>("lidar_concat", "sweep_time_threshold", 0.010);
+    if (has_legacy_key) {
+      spdlog::warn(
+        "lidar_concat: both 'sweep_time_threshold' and the deprecated "
+        "'luminar_time_threshold' are present — using 'sweep_time_threshold'="
+        "{:.4f}s and IGNORING the deprecated key. Please delete it from your "
+        "run config so the effective value is unambiguous.",
+        out.sweep_time_threshold);
+    }
+  } else if (has_legacy_key) {
+    out.sweep_time_threshold =
+      config_sensors.param<double>("lidar_concat", "luminar_time_threshold", 0.010);
+    spdlog::warn(
+      "lidar_concat: 'luminar_time_threshold' is deprecated (this platform is "
+      "Seyond Robin W; the gate is vendor-neutral) — using it as "
+      "'sweep_time_threshold'={:.4f}s. Please rename the key in your run config.",
+      out.sweep_time_threshold);
+  } else {
+    out.sweep_time_threshold = 0.010;
+  }
   out.future_sweep_wait_timeout =
     config_sensors.param<double>("lidar_concat", "future_sweep_wait_timeout", 0.150);
   out.two_pass_point_time_join =
@@ -1191,11 +1229,11 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     throw std::runtime_error("lidar_concat: time_threshold = " + std::to_string(out.time_threshold) +
                              " is invalid (must be finite and >= 0)");
   }
-  if (!std::isfinite(out.luminar_time_threshold) ||
-      out.luminar_time_threshold < 0.0) {
+  if (!std::isfinite(out.sweep_time_threshold) ||
+      out.sweep_time_threshold < 0.0) {
     throw std::runtime_error(
-      "lidar_concat: luminar_time_threshold = " +
-      std::to_string(out.luminar_time_threshold) +
+      "lidar_concat: sweep_time_threshold = " +
+      std::to_string(out.sweep_time_threshold) +
       " is invalid (must be finite and >= 0)");
   }
   if (!std::isfinite(out.future_sweep_wait_timeout) ||
@@ -1337,7 +1375,7 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   spdlog::info(
     "lidar_concat: {} auxiliary sensors, header_threshold={:.3f}s, "
     "point_range_threshold={:.3f}s",
-    out.aux_sensors.size(), out.time_threshold, out.luminar_time_threshold);
+    out.aux_sensors.size(), out.time_threshold, out.sweep_time_threshold);
 
   // Startup strict guard: if a complete multi-LiDAR merge is REQUIRED and set to
   // abort, but some aux sensors could not even be set up (missing/invalid extrinsic,

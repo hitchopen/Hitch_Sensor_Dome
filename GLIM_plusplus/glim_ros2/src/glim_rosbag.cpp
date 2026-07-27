@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
   // Preferred mode (two_pass_point_time_join): pass 1 below indexes every
   // LiDAR scan's absolute point-time range and bag location, then plans each
   // primary's aux selection by minimum endpoint-range delta within
-  // luminar_time_threshold (header time only as tie-break). The streaming pass
+  // sweep_time_threshold (header time only as tie-break). The streaming pass
   // merges a primary exactly when its planned sweeps have arrived — a known
   // bag time, not a heuristic wait — and maps unmatched primaries front-only
   // immediately with the miss reason recorded at planning time.
@@ -345,7 +345,7 @@ int main(int argc, char** argv) {
     // [P3 FIX 2026-07-14] Cache the primary's point-time range + header time at
     // enqueue so the streaming-fallback readiness poll never re-walks ~10^5
     // points per bag event.
-    glim_ros::LuminarTimestampRangeNs range;
+    glim_ros::PointTimeRangeNs range;
     double header_s = 0.0;
   };
   std::deque<PendingPrimaryScan> pending_primary_scans;
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
         }
       } else if (!force && !glim_ros::aux_buffers_ready_for_primary(
                              pending.range, pending.header_s, aux_sensors,
-                             concat_config.luminar_time_threshold)) {
+                             concat_config.sweep_time_threshold)) {
         if (latest_bag_time_s - pending.enqueue_bag_time_s <
             concat_config.future_sweep_wait_timeout) {
           break;  // still inside the wait window; keep primary order
@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
         }
       } else if (
         !two_pass_active && force && concat_config.require_all_aux &&
-        !glim_ros::aux_buffers_ready_for_primary(pending.range, pending.header_s, aux_sensors, concat_config.luminar_time_threshold)) {
+        !glim_ros::aux_buffers_ready_for_primary(pending.range, pending.header_s, aux_sensors, concat_config.sweep_time_threshold)) {
         // At a playback-duration/EOF boundary the future side sweep needed by
         // a relative-time primary may be outside the selected window. Never
         // append an older, merely in-header-threshold sweep just to make the
@@ -478,7 +478,7 @@ int main(int argc, char** argv) {
           &concat_config.consecutive_merge_failures,
           concat_config.abort_on_merge_failure,
           concat_config.frame_diag_log,
-          concat_config.luminar_time_threshold,
+          concat_config.sweep_time_threshold,
           concat_config.float64_time_is_epoch_ns);
       } catch (const std::exception& e) {
         g_bag_hard_error = true;
@@ -866,7 +866,7 @@ int main(int argc, char** argv) {
           scan.msg = points_msg;
           scan.enqueue_bag_time_s = latest_bag_time_s;
           scan.ordinal = primary_ordinal_next++;
-          scan.range = glim_ros::luminar_timestamp_range(
+          scan.range = glim_ros::decode_point_time_range(
             *points_msg, concat_config.float64_time_is_epoch_ns);  // decode once
           scan.header_s = glim_ros::stamp_to_sec(points_msg->header.stamp);
           pending_primary_scans.push_back(std::move(scan));
@@ -955,7 +955,7 @@ int main(int argc, char** argv) {
     struct IndexedScan {
       double bag_time_s = 0.0;
       uint64_t header_ns = 0;  // diagnostic only (duplicate detection), not identity
-      glim_ros::LuminarTimestampRangeNs range;
+      glim_ros::PointTimeRangeNs range;
     };
     std::vector<IndexedScan> primary_index;
     std::vector<std::vector<IndexedScan>> aux_index(aux_sensors.size());
@@ -1037,7 +1037,7 @@ int main(int argc, char** argv) {
             const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
             pc2_ser.deserialize_message(&serialized_msg, pc.get());
             s.header_ns = header_stamp_ns(pc->header.stamp);
-            s.range = glim_ros::luminar_timestamp_range(
+            s.range = glim_ros::decode_point_time_range(
               *pc, concat_config.float64_time_is_epoch_ns);
           } catch (const std::exception&) {
             // Malformed message: still consumes an ordinal (invalid range);
@@ -1113,7 +1113,7 @@ int main(int argc, char** argv) {
       // each carries its per-topic ordinal (= position in aux_index).
       struct AuxCandidate {
         uint64_t shifted_min_ns = 0;
-        glim_ros::LuminarTimestampRangeNs shifted;
+        glim_ros::PointTimeRangeNs shifted;
         uint64_t ordinal = 0;
         double header_s = 0.0;
         double bag_time_s = 0.0;
@@ -1153,7 +1153,7 @@ int main(int argc, char** argv) {
           spdlog::warn(
             "two-pass join: aux topic {} has {} message(s) but none carry a "
             "decodable absolute UINT8[8] point-time range — it cannot merge "
-            "under a Luminar primary (the byte-append merge also requires an "
+            "under an absolute-time primary (the byte-append merge also requires an "
             "identical schema, so header matching is not a usable fallback); "
             "normalize the sensor layout upstream",
             aux_sensors[i].topic, aux_index[i].size());
@@ -1206,7 +1206,7 @@ int main(int argc, char** argv) {
           for (size_t k = lo; k < hi; ++k) {
             const double delta = glim_ros::endpoint_delta_seconds(p.range, cands[k].shifted);
             if (planned_aux_ordinals[i].count(cands[k].ordinal)) {
-              if (delta <= concat_config.luminar_time_threshold) {
+              if (delta <= concat_config.sweep_time_threshold) {
                 in_gate_reserved = true;
               }
               continue;  // reserved by an earlier primary
@@ -1220,7 +1220,7 @@ int main(int argc, char** argv) {
               best_header = header_abs;
             }
           }
-          if (best && best_delta <= concat_config.luminar_time_threshold) {
+          if (best && best_delta <= concat_config.sweep_time_threshold) {
             pa.selected = true;
             pa.aux_ordinal = best->ordinal;
             pa.aux_bag_time_s = best->bag_time_s;
@@ -1253,7 +1253,7 @@ int main(int argc, char** argv) {
           "(gate {:.3f}s, header only tie-break, one primary per sweep)",
           aux_sensors[i].topic, planned_matched[i], planned_no_candidate[i],
           planned_exceeds_gate[i], planned_reserved[i], planned_no_absolute_time[i],
-          concat_config.luminar_time_threshold);
+          concat_config.sweep_time_threshold);
         if (planned_reserved[i] > 0) {
           spdlog::warn(
             "two-pass join: {} primary scan(s) lost the in-gate {} sweep to an "
@@ -1336,15 +1336,21 @@ int main(int argc, char** argv) {
       glim->map_anchor_state());
     return 1;
   }
-  if (glim->require_rtk_anchor() && glim->gnss_factors_published() <= 0) {
+  // [P1 FIX 2026-07-27] Gate on CONFIRMED optimizer delivery, not on how many
+  // poses the RTK bridge published. Publication proves only that a message hit
+  // a topic; a missing/failed/mismatched GNSS extension published just the
+  // same and used to satisfy require_rtk_anchor on an unanchored map.
+  if (glim->require_rtk_anchor() && glim->gnss_factors_delivered() == 0) {
     spdlog::error(
-      "require_rtk_anchor=true but the map is {} with {} GNSS factors — "
-      "exiting nonzero.",
-      glim->map_anchor_state(), glim->gnss_factors_published());
+      "require_rtk_anchor=true but the map is {} — {} GNSS factor(s) CONFIRMED into the "
+      "graph (bridge published {}). Exiting nonzero.",
+      glim->map_anchor_state(), glim->gnss_factors_delivered(),
+      glim->gnss_factors_published());
     return 1;
   }
-  spdlog::info("run accepted: map state={} ({} GNSS factors)",
-               glim->map_anchor_state(), glim->gnss_factors_published());
+  spdlog::info("run accepted: map state={} ({} GNSS factors confirmed, {} bridge-published)",
+               glim->map_anchor_state(), glim->gnss_factors_delivered(),
+               glim->gnss_factors_published());
 
   // [P3 FIX 2026-07-10] partial dump is kept, but exit nonzero on hard errors.
   if (g_bag_hard_error) {

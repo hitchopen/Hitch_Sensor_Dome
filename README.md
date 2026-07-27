@@ -108,7 +108,6 @@ GLIM_plusplus/                LiDAR-Inertial mapping (fork of koide3/glim)
   config/                 sensor_dome.urdf + URDF generator
   launch/                 hitch_sensor_dome.launch.py
   scripts/                init-pose helpers, mapping-profile generator, PCD export
-  docs/                   Loop-closure guide, merge record, TF verification
   glim/                   Upstream GLIM core (with project tuning)
   glim_ext/               Upstream extensions (GNSS prior re-enabled)
   glim_ros2/              ROS 2 wrapper (multi-LiDAR concat, INS/GNSS bag feed)
@@ -174,10 +173,11 @@ README's "2026-07 P1–P5 improvements" section:
 `GLIM_plusplus/` was re-synced against upstream `augcog/DLIO_plusplus`
 (`ucb-roar`) plus its open PR #15, keeping **P1 as the GNSS source and
 Robin W as the LiDAR** — only algorithm hardening was taken, not upstream's
-different GNSS topic contract. Headlines (full list in
-[`GLIM_plusplus/README.md` §14](GLIM_plusplus/README.md#14-2026-07-27-upstream-re-merge),
-merge record in
-[`GLIM_plusplus/docs/upstream_merge_2026-07-27.md`](GLIM_plusplus/docs/upstream_merge_2026-07-27.md)):
+different GNSS topic contract. Headlines (full list and merge record in
+[`GLIM_plusplus/README.md` §14](GLIM_plusplus/README.md#14-2026-07-27-upstream-re-merge)
+and [§10 "Design notes"](GLIM_plusplus/README.md#10-design-notes); upstream
+sources are [`koide3/glim`](https://github.com/koide3/glim) and
+[`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus)):
 
 - **Multi-LiDAR sweep matching no longer trusts header time.** Where an
   absolute per-point time axis exists, aux sweeps are selected by point-time
@@ -199,8 +199,15 @@ merge record in
   generator, and a PCD exporter under `GLIM_plusplus/scripts/`.
 
 The dome's P1 and Robin W extrinsics were re-verified against the 3D design
-files after the merge —
-[`GLIM_plusplus/docs/tf_verification_2026-07-27.md`](GLIM_plusplus/docs/tf_verification_2026-07-27.md).
+files after the merge, tracing the chain from `3D files/sensor_dome.scad`
+through [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) and the
+generated URDF into the GLIM configs. All three LiDAR mounts measured within
+**0.05 mm** of nominal in the unibody STL (80 mm ring radius at 0° / 120° /
+240°, z = 114.5 mm above the Atlas Center of Navigation), and the four Atlas
+M4 mount features within **0.1 mm** of their SCAD positions. The URDF is
+byte-identical to a fresh regeneration from the YAML, so the two cannot drift
+apart. Full table, derivations, and the two standing caveats are in
+[`GLIM_plusplus/README.md` §10 "TF verification"](GLIM_plusplus/README.md#10-design-notes).
 
 ### LiDAR per-point timestamp standard
 
@@ -323,7 +330,7 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 > - **Plan for RTK convergence.** Park with clear sky view and wait for RTK-fixed lock before launching GLIM++. Outdoor convergence is typically 30–120 s; longer in marginal conditions. Verify in the Atlas Duo web UI before starting.
 > - **NTRIP corrections must be flowing.** The Atlas Duo's Ethernet path to the cellular router (see [`PTP_sync/README.md`](PTP_sync/README.md) §3.1) must reach an NTRIP caster. RTK-fixed without NTRIP is not achievable.
 > - **Tunnels and urban canyons during the session are fine** — the per-message RTK gate suspends factor publishing during outages and resumes on re-fix. The session is *not* re-started; only the *initial* pose requires RTK-fixed.
-> - **Without RTK** (no base station, no NTRIP) — use an explicitly degraded run configuration that selects a continuous INS source and sets `"ins_require_rtk_fixed": false` plus `"ins_max_position_stddev": 0.5` in `config_ros.json`. These are configuration keys, not launch arguments. The production profile remains Fixed-only and otherwise lets LiDAR-IMU SLAM carry RTK outages. See [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) §"Operating without RTK".
+> - **Without RTK** (no base station, no NTRIP) — this is a **diagnostics-only** configuration, not a supported mapping mode. Point the run at a continuous INS source and set `"ins_require_rtk_fixed": false` with `"ins_max_position_stddev": 0.5` in `config_ros.json`. These are configuration keys, not launch arguments. The map still builds, but the world-frame anchor degrades from centimetre-grade to metre-grade, and the run is reported as `rtk_origin_only` rather than `rtk_anchored`. The production profile stays Fixed-only. Note that loosening the NavSatFix covariance threshold alone does **not** open the gate: the gate reads the Atlas solution type, so a Float fix is refused regardless of how good its reported covariance looks.
 
 > ### ⚙ GLIM++ GNSS antenna lever-arm compensation — OFF by default (Atlas Duo only)
 >

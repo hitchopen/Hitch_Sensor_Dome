@@ -140,7 +140,7 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
     // per-point times -- this DISABLES motion deskew. Points are time-sorted
     // above, so a nonzero span means the cloud actually carried per-point
     // timestamps; warn once that they are being discarded, since for a scanning
-    // LiDAR (e.g. Luminar) this silently defeats the per-point-time deskew the
+    // LiDAR (Robin W included) this silently defeats the per-point-time deskew the
     // rest of the pipeline implements.
     static bool warned_global_shutter = false;
     if (!warned_global_shutter && frame->size() > 1 && frame->times[frame->size() - 1] > frame->times[0]) {

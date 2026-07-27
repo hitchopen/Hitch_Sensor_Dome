@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace glim {
 
@@ -21,6 +23,19 @@ public:
    * @brief Check if the module is alive. (If it returns false, the system will be shutdown)
    */
   virtual bool ok() const { return true; }
+
+  /**
+   * @brief Number of global constraints this module has CONFIRMED into the
+   *        optimizer's factor graph.
+   *
+   * Returns std::nullopt when the module does not contribute global
+   * constraints (the default), which lets a caller distinguish "no such
+   * module is loaded" from "the module is loaded and delivered nothing".
+   * A module that answers must count only constraints it has verified
+   * actually reached the graph -- NOT messages it published or factors it
+   * queued, since neither proves the optimizer accepted them.
+   */
+  virtual std::optional<std::uint64_t> delivered_global_constraints() const { return std::nullopt; }
 
   /**
    * @brief Called when the system is quitting.

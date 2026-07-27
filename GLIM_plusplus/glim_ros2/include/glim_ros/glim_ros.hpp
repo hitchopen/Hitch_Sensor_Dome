@@ -2,6 +2,7 @@
 
 #include <any>
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -54,9 +55,12 @@ public:
   //      relaxed.
   //   2. position_covariance diagonal stddev <= ins_max_position_stddev
   //      (default 10 cm, which only RTK-fixed solutions reliably hit).
-  //   3. The most recent N PoseStamped/Odometry messages are mutually
-  //      consistent (translation drift < ins_max_pose_jitter, orientation
-  //      |q1·q2| > 0.999), guarding against IMU-only dead-reckoning.
+  //   3. The most recent N PoseStamped/Odometry messages are contiguous and
+  //      SMOOTH: position residual against a constant-velocity prediction
+  //      below ins_max_pose_jitter_trans, attitude residual against a
+  //      constant-angular-rate prediction below
+  //      ins_max_attitude_residual_deg. This rejects IMU-only
+  //      dead-reckoning without bounding speed or turn rate.
   // If the gate doesn't pass within ins_init_timeout_s, a bold RED
   // warning is printed periodically so the operator can decide whether
   // to wait, relax thresholds, or abort.
@@ -130,18 +134,29 @@ public:
   // actually got, so an operator (or CI) accepts a weakly-constrained map
   // deliberately rather than by accident.
   bool slam_initialized() const { return ins_init_applied.load(); }
-  // Number of GNSS position factors handed to the global graph.
+  // Number of GNSS poses the RTK bridge PUBLISHED. Diagnostic only — it says
+  // nothing about whether any extension consumed them, so it must NOT drive
+  // the run verdict (see gnss_factors_delivered()).
   int gnss_factors_published() const { return gnss_factors_published_.load(); }
+
+  // [P1 FIX 2026-07-27] Global constraints CONFIRMED into the optimizer's
+  // factor graph, summed over the loaded extension modules.
+  //
+  // The verdict previously used gnss_factors_published_, which
+  // try_publish_gnss_factor() increments on every successful publish to the
+  // ROS topic — regardless of whether libgnss_global.so was loaded, matched
+  // the topic, or accepted anything. A missing or failed GNSS extension
+  // therefore still produced "rtk_anchored" and satisfied
+  // require_rtk_anchor=true on a map with zero GNSS factors in the graph.
+  // This instead asks the modules what actually reached the graph.
+  uint64_t gnss_factors_delivered() const;
   // End-of-run map state:
   //   "uninitialized"    — RTK-fixed never validated; NO map was built.
   //   "rtk_origin_only"  — origin anchored at RTK-fixed, but RTK never
   //                        returned afterwards, so the trajectory past t0
   //                        is constrained by LiDAR-IMU alone.
   //   "rtk_anchored"     — origin anchored AND ongoing GNSS constraints.
-  const char* map_anchor_state() const {
-    if (!ins_init_applied.load()) return "uninitialized";
-    return gnss_factors_published_.load() > 0 ? "rtk_anchored" : "rtk_origin_only";
-  }
+  const char* map_anchor_state() const;
   // Operator policy: fail the run when the map came out local_only.
   bool require_rtk_anchor() const { return require_rtk_anchor_; }
   // One-line end-of-run verdict; also logged by save().
@@ -168,7 +183,7 @@ private:
   std::string expected_time_field;
   int expected_time_datatype = 0;
   bool expected_time_is_absolute = false;
-  bool float64_time_is_epoch_ns = false;  // [P2 FIX 2026-07-15] Luminar FLOAT64-epoch-ns opt-in
+  bool float64_time_is_epoch_ns = false;  // raw FLOAT64-as-epoch-ns opt-in; false on Robin W
   bool flip_points_y;
 
   // Extension modulles
@@ -256,10 +271,22 @@ private:
   // of genuine vehicle dynamics before the solution is called unsettled.
   // Raise it if mapping runs begin under harder acceleration.
   double ins_max_pose_jitter_trans_ = 0.05;      // metres (residual)
-  // Same idea for orientation: |q_pred · q| against a constant-angular-rate
-  // prediction. 0.999 ≈ 2.5° of residual, i.e. ≈250°/s² of angular
-  // acceleration at 10 Hz — a glitch bound, not a turn-rate bound.
-  double ins_min_quat_dot_ = 0.999;              // |q_pred·q|
+  // Same idea for orientation: the angle between the measured attitude and a
+  // constant-angular-rate prediction. Under constant angular acceleration α
+  // the residual is α·dt², so 2.5° at 10 Hz tolerates ≈250°/s² — a glitch
+  // bound, not a turn-rate bound. A steady turn passes at any rate.
+  //
+  // [P2 FIX 2026-07-27] Expressed in DEGREES. The predecessor key
+  // `ins_min_quat_dot` was a raw quaternion dot product, and since
+  // |q_a·q_b| = cos(θ/2) its documented angle was consistently half the
+  // residual actually admitted: 0.999 was annotated "2.5°" but allowed
+  // 5.125°, and the dual-antenna 0.9999 was annotated "0.8°" but allowed
+  // 1.621°. Carrying the unit in the name removes the trap; the comparison
+  // still runs on the dot product via the cached cosine below.
+  double ins_max_attitude_residual_deg_ = 2.5;   // degrees (residual)
+  // cos(0.5 * ins_max_attitude_residual_deg_), recomputed whenever the
+  // degree value changes. |q_pred·q| below this <=> residual above the bound.
+  double ins_min_quat_dot_ = 0.99976202;         // derived — do not set directly
   // Max gap (s) between consecutive accepted INS samples before the window
   // is discarded as non-contiguous. Samples enter the window only after the
   // RTK gates pass, so without this bound a flickering fix could assemble a

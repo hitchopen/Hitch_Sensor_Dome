@@ -26,7 +26,7 @@
 6. [初始位姿的 RTK-fixed 准入门控](#6-初始位姿的-rtk-fixed-准入门控)
 7. [RTK 门控的 GNSS 因子桥（init 之后）](#7-rtk-门控的-gnss-因子桥)
 8. [项目集成 —— URDF 生成器、启动助手、诊断脚本](#8-项目集成)
-9. [新增文档](#9-新增文档)
+9. [设计说明 —— 回环闭合、运动起步、TF 验证、合并记录](#9-设计说明)
 10. [未改动的部分](#10-未改动的部分)
 11. [按文件汇总的差异](#11-按文件汇总的差异)
 
@@ -50,16 +50,16 @@ topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond R
 
 ### 1.1 单天线 vs 双天线模式
 
-Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位置加装第二根天线即可启用无漂移 RTK 航向）。模式由 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 自动检测：副天线平移默认为哨兵值 `(0, 0, 0)`（单天线模式），任何非零平移（范数 ≥ 0.05 m）都会让 GLIM++ 在启动时切换到双天线模式。启用双天线的完整步骤参见项目 [根 README](../README.md#-双-gnss-天线--强烈推荐)；GLIM++ 在两种模式间的算法差异汇总如下。
+Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位置加装第二根天线即可启用无漂移 RTK 航向）。模式由 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 自动检测：副天线平移默认为哨兵值 `(0, 0, 0)`（单天线模式），任何非零平移（范数 ≥ 0.05 m）都会让 GLIM++ 在启动时切换到双天线模式。启用双天线的完整步骤参见项目 [根 README](../README_zh.md#-双-gnss-天线--强烈推荐)；GLIM++ 在两种模式间的算法差异汇总如下。
 
 | 维度 | 单天线 | 双天线 |
 |--------|----------------|--------------|
 | **航向来源** | IMU 陀螺仪积分（随 bias 漂移） | RTK-fixed 双天线基线（无漂移，约 0.1°–1°，取决于基线长度） |
-| **Init 门控 `ins_min_quat_dot`** | `0.999`（相邻样本约 2.5°） | 自动收紧到 `0.9999`（约 0.8°） |
+| **Init 门控 `ins_max_attitude_residual_deg`** | 姿态残差 `2.5°` | 自动收紧到 `0.8°` |
 | **Init 门控 `ins_min_pose_window_samples`** | `10` 条连续一致样本 | 自动缩短到 `5`（航向锁定更快） |
 | **Init 门控 `ins_init_timeout_s`** | `60 s` | 自动缩短到 `30 s` |
 | **Factor-bridge 朝向协方差** | 不填充（PoseStamped 的朝向信息不可用） | 由基线长度推导出的紧 yaw σ，松 pitch/roll —— 见 §7 |
-| **会话期航向漂移** | 随 IMU bias 累积；只能靠 LiDAR 扫描匹配抑制 | 在整段会话中由 RTK 航向约束（数据通路已就绪；见 `docs/moving_start_initialization.md` "Future work — session-long heading-constraint factor"一节） |
+| **会话期航向漂移** | 随 IMU bias 累积；只能靠 LiDAR 扫描匹配抑制 | 在整段会话中由 RTK 航向约束（数据通路已就绪，因子模块暂缓 —— 见 §9「会话期航向修正」） |
 | **长 / 多圈轨迹下的地图质量** | yaw 稳定性依赖 LiDAR 特征丰富度；只要 RTK 位置 fixed，z 锚点仍可靠 | 初始化时朝向精度更高，并为后续会话期航向修正预留了清晰数据路径 |
 | **硬件需求** | 一根 SP1（或同级天线） | 两根天线，固定偏置（推荐基线 1.0–1.5 m） |
 | **启动时操作员看到的日志** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
@@ -89,7 +89,7 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 | **IMU 噪声 / bias** | `config_sensors.json` | 放宽：`acc 0.05 → 0.2`、`gyro 0.02 → 0.05`、`bias 1e-5 → 1e-4`。降低 IMU 信任、提高 LiDAR 权重。 |
 | **加速度计标度** | `config_ros.json` | `acc_scale: 0.0 → 1.0`。Atlas Duo 原生输出 m/s²，无需自动检测。 |
 | **初始化** | `config_odometry_gpu.json` | 窗口 `1.0 → 3.0` s（后已被完全替换 —— 见 §5）。 |
-| **GNSS 先验** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]`（上游默认值相当于禁用 GNSS）。`min_baseline: 1.0 → 0.5`。 |
+| **GNSS 先验** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [100, 100, 25]`，并启用协方差感知的 `prior_inf_floor` / `prior_inf_cap` 与 Huber 宽度（上游默认值相当于禁用 GNSS）。`min_baseline: 1.0 → 10.0`（world↔UTM 对齐拟合门限；此前的 `0.5` 建立在一个**错误的**「提高因子密度」前提上）。 |
 | **运动畸变补偿** | `config_sensors.json` | `global_shutter_lidar: true → false`。重新启用畸变补偿（上游多 LiDAR 时间戳重基 bug 已被修复，无需再绕开）。 |
 | **每点时间戳** | `config_sensors.json` | Robin W 使用 `timestamp/FLOAT64` 绝对 Unix 秒；`autoconf_perpoint_times: false`、`perpoint_relative_time: false`、比例 `1.0`。 |
 | **下采样** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`、`k_correspondences: 10 → 20`。3 路传感器拼成的 360° 点云需更高密度；3× 上游值之所以可接受，是因为穹顶数据流程是**离线**针对录制 MCAP 包跑 GLIM —— 没有实时单帧时间预算。如果改为在线建图，建议降回 15-20K。 |
@@ -109,10 +109,14 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 | `submap_voxel_resolution_max` | `1.0` m | `2.0` m（拓宽 VGICP 收敛域） |
 | `max_implicit_loop_distance` | `100` m | `200` m（覆盖典型赛道一圈） |
 | `min_implicit_loop_overlap` | `0.2` | `0.1`（部分重叠也能创建因子） |
-| GNSS `prior_inf_scale[2]` (z) | `1e4` | `5e4`（z 比水平方向强 5×） |
-| GNSS `min_baseline` | `1.0` m | `0.5` m（GNSS 因子密度翻倍） |
+| GNSS `prior_inf_scale[2]` (z) | `1e4` | `25` —— 实际配置为 `prior_inf_scale = [100, 100, 25]`、`prior_inf_floor = [100, 100, 25]`、`prior_inf_cap = [2500, 2500, 1000]`。**垂直方向被刻意设置得比水平方向更*弱*，而不是更强。** |
+| GNSS `min_baseline` | `1.0` m | `10.0` m（world↔UTM 对齐拟合门限 —— **不是**因子密度旋钮，见下方勘误） |
 
-里程计初始化与 VGICP 收敛域之间的 chicken-and-egg 详见 [`docs/multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md)。前三项拓宽了收敛域，使在残余漂移下回环因子仍能触发；GNSS 两项则从源头阻止漂移累积。两层修复缺一不可。
+> **勘误（2026-07-27）。** 上表此前把 `min_baseline` 记为 `0.5` m 并注为「GNSS 因子密度翻倍」。该前提是错误的：`min_baseline` **只**参与一次性的 `T_world_utm` 对齐拟合门限，从不参与因子发射循环 —— 在模块中 grep 即可确认。每一个完成关联的 submap 都会得到一个因子，与 `min_baseline` 无关，因此调低它一个因子也不会多加；它真正的作用是允许 world↔UTM 对齐用一段更短、更嘈杂的基线去拟合，而在 `0.5` m 下这会产生数度的 yaw 误差并在整轮运行中被锁死（H1）。现已恢复为 `10.0` m，并配合 `fit_min_samples` 与样本外验证窗口。要调整 GNSS 相对 LiDAR 的权重，请使用 `prior_inf_scale` / `prior_inf_floor` / `prior_inf_cap`，**不要**动 `min_baseline`。
+>
+> 同一版本中 `prior_inf_scale[2]` 那一行的方向也写反了：它声称 z 被设置为比水平方向强 5×，而实际配置恰好相反 —— 垂直精度 `25` 对水平 `100`（σ ≈ 0.2 m 对 0.1 m），上限 `1000` 对 `2500`（σ ≈ 3.2 cm 对 2.0 cm）。这符合 RTK 的真实误差特性：垂直精度约为水平的一半，过度信任 z 会把地图高程从 LiDAR 解上拉偏。绝对量级从 `1e4` 降到 `100`，是因为协方差感知的 floor/cap 路径现在才是实际生效的加权机制，`prior_inf_scale` 仅作为「样本不携带可用协方差」时的兜底；若仍保持 `1e4`（1 cm），这类兜底样本反而会比自适应上限更硬。
+
+前三项拓宽了收敛域，使在残余漂移下回环因子仍能触发；GNSS 两项则从源头阻止漂移累积。两层修复缺一不可 —— 原因是 §9「多圈 z 漂移」中详述的 chicken-and-egg：回环因子只有在两圈之间 VGICP 收敛时才会产生，而 VGICP 只有在累积漂移已小于其收敛域时才会收敛；因此一旦越过某个阈值，本应纠正漂移的机制恰恰被漂移本身关掉了。
 
 ## 5. 初始化重写
 
@@ -135,7 +139,7 @@ GLIM++ 完全移除了"由加速度计估计重力"这条路径，并要求在�
 |------|--------|
 | [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) 与 [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | 支持兼容模式 `ins_pose_topic`（生产默认空）和 `ins_odom_topic`（生产默认 `/gps_p1/filtered_odom_rtk_fixed`，`nav_msgs/Odometry`）。第一条通过 §6 门控的消息会调用 `odometry_estimation->set_init_state(T, v)`。 |
 
-完整数据通路见 [`docs/moving_start_initialization.md`](docs/moving_start_initialization.md)。
+完整数据通路见 §9「运动起步初始化」：门控语义、成功与拒绝时操作员看到的输出、初始速度注入，以及 RTK 失锁期间的行为。
 
 **本改动要求 GLIM 启动时必须有可用 INS。** 对纯 LiDAR 配置而言，需要回退 §5 —— 之前的 LOOSE / NAIVE 路径已经被移除。Hitch Sensor Dome 始终配备 Atlas Duo，因此交易是无条件的：以"必须有可用 INS"换"运动起步不再失败"。
 
@@ -150,7 +154,7 @@ wrapper 在调用 `set_init_state` 之前先要求 adapter 的权威 Fixed-only 
 | 0. 解类型 | 消息来自 adapter 的 Fixed-only odometry | FusionEngine `kRtkFixed` |
 | 1. fix 状态 | `NavSatFix.status.status ≥ STATUS_GBAS_FIX`（独立 RTK 级交叉检查） | `ins_require_rtk_fixed = true` |
 | 2. 协方差 | 类型已知、对角线有限且为正、最大 σ ≤ 阈值 | `0.10 m` |
-| 3. 稳定性 | 最近 N 条 INS pose 互相一致（平移 jitter、`\|q1·q2\|`） | `N=10`、`0.05 m`、`0.999` |
+| 3. 平滑性 | 最近 N 条 INS 位姿必须*时间连续*，且每一条都符合由其前序样本外推的匀速 / 匀角速度模型。阈值约束的是**残差**而非原始的相邻样本差值，因此匀速行驶或稳定转向在任何速度下都能通过 —— 详见 §9 | `N=10`，残差 `0.05 m` / `2.5°`，最大间隔 `0.5 s` |
 
 只要任一阶段未通过，2 秒钟一次的 wall-timer 就会触发 `ins_init_timeout_tick()`，**每 10 秒打印一次粗体红色多行警告**，列明最近一次拒绝的原因和补救步骤。`ins_init_timeout_s = 60 s` 后警告升级为"TIMEOUT" —— 但 **GLIM 永远不会自动 abort**，由操作员决定。
 
@@ -164,7 +168,7 @@ ins_require_rtk_fixed             默认 true
 ins_max_position_stddev           默认 0.10
 ins_min_pose_window_samples       默认 10
 ins_max_pose_jitter_trans         默认 0.05
-ins_min_quat_dot                  默认 0.999
+ins_max_attitude_residual_deg     默认 2.5   （原 ins_min_quat_dot 0.999）
 ins_init_timeout_s                默认 60.0
 ```
 
@@ -219,12 +223,148 @@ fusion_engine_driver + adapter
 | [`launch/`](launch/) | `hitch_sensor_dome.launch.py` —— 从 `sensor_dome_tf.yaml` 发布静态 TF、用项目调好的配置启动 `glim_rosnode`、起 `foxglove_bridge` 做可视化、跑一次预飞静止性检查。 |
 | [`scripts/`](scripts/) | `check_init_stationarity.py` —— 预飞诊断脚本；读 `/imu/data` 前 3 秒，若 bag 不静止则打印粗体红色警告。在 fork 中已退化为信息提示（C++ INS-init 路径自身能处理运动起步），但仍可用于排查 Atlas Duo 锁定缓慢、CI gating 等。 |
 
-## 9. 新增文档
+## 9. 设计说明
 
-[`docs/`](docs/) 目录下：
+本节刻意做成自包含的：采用者操作、排障或复现本 fork 行为所需的全部内容都在
+本文件内，没有需要另行索取的配套文档，本节链接也不指向仓库以外的任何东西
+（已公开发表的上游参考资料除外）。
 
-- [`moving_start_initialization.md`](docs/moving_start_initialization.md) —— §5 + §6 + §7 的完整设计。覆盖数据通路、RTK 门控语义、警告/成功输出示例，以及无 RTK 场景如何运作。
-- [`multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md) —— 里程计初始化与 VGICP 收敛域之间 chicken-and-egg 的根因分析、三层修复、运行后四项验证（GNSS 因子计数、可视化器中的位姿图边、`T_world_utm.txt` 是否稳定、轨迹高度 vs GNSS 高度），以及五步升级方案（默认修复仍不足时使用）。
+### 多圈 z 漂移 —— §4 背后的 chicken-and-egg
+
+现象：第 1 圈建图正常，从第 2 圈起轨迹整体上翘，闭合回路的终点比起点高出几十
+厘米甚至数米。这不是扫描匹配的 bug，而是回环闭合的**未发生**。
+
+每帧微小的 z 误差会单调累积，因为没有任何东西约束它。车辆回到已建图区域时本应
+产生一个隐式回环因子把位姿图拉平，但该因子只有在第 1 圈与第 2 圈的 submap 之间
+VGICP 收敛时才存在 —— 而 VGICP 只有在累积偏移已经落在其体素收敛域内时才会收敛。
+越过这个阈值之后，本应纠正漂移的机制恰恰是被漂移关掉的那一个。仅仅拓宽收敛域也
+不够：漂移足够大时任何有限的收敛域都会失效，所以还必须从源头阻止漂移累积。这正
+是 §4 同时调整一个收敛域旋钮和一个 GNSS 旋钮的原因；只做其中一半，故障模式依然
+可达。
+
+**运行后如何验证。** 四项检查，建议按此顺序：
+
+1. **GNSS 因子确实在插入。** 读退出时机器可解析的 `gnss_global summary:` 行。
+   `factors_delivered` 应稳定增长 —— 每个完成关联的 submap 一个因子，与
+   `min_baseline` **无关**（后者只作用于一次性的 world↔UTM 拟合门限，从不参与
+   因子发射循环）。若计数偏低，说明 GNSS 被过滤掉了：检查 `gap_unanchored`
+   （RTK 失锁）、`yaw_gate_skips` 和 `submaps_dropped_no_bracket`，并确认驱动
+   上报的协方差没有悲观到让 RTK 门控拒绝每一个样本。
+2. **进入第 2 圈时回环因子触发。** 车辆重新进入已建图区域时，可视化器中应出现
+   连接时间上相距较远的 submap 之间的位姿图边。
+3. **`T_world_utm.txt` 只写一次且保持稳定。** 若运行结束仍未生成该文件，说明
+   GNSS 从未完成对齐 —— 请把 `min_baseline` 与首次 RTK 锁定前实际行驶的距离作
+   对比。
+4. **轨迹高程跟随 GNSS 高程。** 两者的差值随圈数持续拉大，就是漂移本身的直接
+   图像。
+
+**默认配置仍不够时如何升级。** 继续加大 `submap_voxel_resolution_max`，或提高
+`prior_inf_scale` / 收紧 `prior_inf_floor` + `prior_inf_cap`，让 GNSS 在与
+LiDAR 因子质量的竞争中占更大权重。**不要调低 `min_baseline`** —— 见 §4 的勘误：
+它一个因子都不会增加，只会劣化 world↔UTM 拟合。
+
+### 运动起步初始化 —— §5–§7 背后的数据通路
+
+上游 GLIM 用前 `initialization_window_size` 秒的加速度计均值估计世界坐标系朝向，
+这只有在该窗口内 IMU 全程静止时才成立。本 fork 用取自 Atlas Duo 的外部 INS 先验
+取而代之，因此录制可以从车辆已经在运动的状态开始。
+
+**门控语义。** SLAM 只在存在**经过校验且新鲜的 RTK-Fixed** 解时才启动。这是刻意
+的设计，不是图省事的默认值：在构建任何因子之前，地图原点必须具备全局参考，INS
+姿态必须通过校验。在此之前，初始化看门狗每 10 秒告警一次并附上当前的拒绝原因 ——
+离线回放与在线运行都会打印。
+
+**为什么门控检验的是平滑性而不是静止性。** 最初的稳定性检查把原始的相邻样本位移
+与 `ins_max_pose_jitter_trans`（0.05 m）比较。在 Atlas Duo 10 Hz 的位姿频率下，
+这等于一道 0.5 m/s 的硬上限 —— 它恰好禁止了该特性本应支持的运动起步，因为它无法
+区分 INS 噪声与车辆的真实平移。现在门控的两半都改为基于残差：位置用匀速残差，
+朝向用匀角速度残差，另加连续性要求。形如 `|q1·q2| > 0.999` 的朝向判据在旋转轴上
+有同样的缺陷 —— 它把 yaw 速率隐式地限制在约 25°/s —— 所以被替换而非保留。
+
+同一个阈值上还藏着第二个更隐蔽的缺陷，已于 2026-07-27 修复。对单位四元数有
+`|q_a·q_b| = cos(θ/2)`，因此用点积表示的界限，实际允许的角度**恰好是**读者据此
+推算出来的**两倍**。本 fork 中处处把 `0.999` 记作「2.5°」，而它实际允许 **5.125°**；
+双天线的 `0.9999` 被记作「0.8°」，实际允许 **1.621°**。现在该界限直接以角度配置
+（`ins_max_attitude_residual_deg`，默认 `2.5`，双天线模式自动收紧到 `0.8`），
+内部再转换成点积 —— 单位被写进了参数名里，这类错误无法再次发生。该门控因此比此
+日期之前的任何一次运行都真正严格了 2 倍；如果旧 bag 现在在姿态项上无法完成初始化，
+请有意识地调大这个角度值，而不要回退 —— 5.125° 从来就不是设计意图。
+
+**初始速度。** 直接采用 INS 速度，而不是对位姿做有限差分，这也是首选
+`nav_msgs/Odometry` 作为初始化源的原因。Point One 在平台机体系（前-左-上）中报告
+该速度，而 GLIM 期望的是世界系，因此 fork 施加 `v_world = T.linear() * v_body`。
+不做旋转直接透传，会让估计器沿错误的世界轴初始化，偏差正是车辆航向角 —— 在 90°
+yaw 时，20 m/s 的前向速度会被横向注入。
+
+**RTK 失锁期间。** 出厂 profile 从不接受 Float 作为 GNSS 因子。会话一旦从 Fixed
+完成初始化，RTK 丢失只会让 adapter 的 Fixed-only 话题安静下来，LiDAR–IMU SLAM
+在无锚定状态下继续；Fixed 恢复后因子随之恢复。放宽 NavSatFix 协方差阈值绕不过
+权威解算类型检查，也不是在无 RTK 条件下启动一次运行的受支持方式。
+
+**如何验证一次运动起步。** 确认该次运行是在非零速度下完成初始化的，且上报的初始
+速度大小与 INS 一致。相比静止起步，优化器收敛所需时间会略长，因为要从非零初始
+状态估计更多 IMU bias；`scripts/check_init_stationarity.py` 仍作为信息性的预飞
+诊断与 CI 门控保留，但已不再是前置条件。
+
+### 会话期航向修正 —— 数据通路已就绪，因子模块暂缓
+
+因子桥已经在每一条发布的位姿上填好了正确的朝向协方差，双天线模式下 yaw σ 很紧。
+上游 `gnss_global` 完全忽略协方差、只消费位置，所以这部分朝向信息目前止步于桥。
+有两种用法：改造 `gnss_global`，在 yaw σ 足够紧时添加带协方差的朝向因子（对上游
+模块侵入较大）；或新增一个独立扩展模块，订阅桥的话题、提取 yaw 与 yaw σ，向全局
+图贡献一个仅 yaw 的先验（与上游干净解耦，经 `extension_modules` 选择性启用）。
+两条路径所需的数据通路都已就绪；因子模块被刻意留到后续迭代。
+
+### TF 验证 —— 外参对照 3D 设计
+
+上游合并完成后，P1 与 Robin W 的外参已从 OpenSCAD 源头一路核验到 GLIM 配置：
+
+```
+3D files/sensor_dome.scad          （唯一几何来源）
+        │
+        ▼
+config/sensor_dome_tf.yaml         （唯一 TF 信息源）
+        │  generate_sensor_dome_urdf.py     │ launch：每条 YAML 条目一个
+        ▼                                   ▼ static_transform_publisher (tf2_ros)
+GLIM_plusplus/config/sensor_dome.urdf
+        │
+        ▼
+config_sensors.json（经 urdf_path 得到 T_lidar_imu、lidar_concat 辅助帧）
+config_gnss_global.json（杆臂）
+```
+
+全部通过：
+
+| Frame | YAML / URDF 值 | 设计推导 | STL 实测 |
+|---|---|---|---|
+| `lidar_front_link` | (0.080, 0, 0.1145)，yaw 0° | 安装环 r = 80 mm @ 0° | 4× M6 孔位与名义值相差 **0.05 mm** 以内 |
+| `lidar_rear_left_link` | (−0.040, 0.069282, 0.1145)，yaw 120° | 80·(cos 120°, sin 120°) = (−40, 69.282) | **0.05 mm** 以内 |
+| `lidar_rear_right_link` | (−0.040, −0.069282, 0.1145)，yaw 240° | 80·(cos 240°, sin 240°) | **0.05 mm** 以内 |
+
+z 偏置 0.1145 m 由安装面 6 mm（L1 板）+ 133 mm（立柱）= 139 mm 与 Atlas 导航中心
+6 + 18.5 = 24.5 mm 相减得到。实测一体件总高 151.0 mm，确认 139 mm 为实打印值。
+只用 yaw 旋转是成立的，因为 Seyond 驱动被固定为 `coordinate_mode:=3`（REP-103），
+Robin W 的原生坐标轴在驱动层就已重映射。
+
+IMU 侧：Atlas 装配图把导航中心定在距孔位基准 (68.7, 47.8) mm、安装面上方 18.5 mm
+处，而 SCAD 把该零件摆放成让导航中心正好落在设计原点。四个 M4 安装特征在
+220 × 100 mm 跨距上与 SCAD 位置相差 **0.1 mm** 以内。`enable_lever_arm` 为
+`false`、`urdf_gnss_frame` 为空，对于本身就在导航中心输出位姿的紧耦合 Atlas Duo
+而言是正确的。`sensor_dome.urdf` 与从 YAML 重新生成的结果逐字节一致，因此两者不
+可能各自漂移。
+
+两条长期成立的注意事项。其一，TF 把 `imu_link` 的坐标轴视为与车辆对齐；Atlas 的
+导航系与其机械朝向之间的对齐关系属于 Point One 的输出配置，无法从 3D 文件推导
+（假定正确，并已由此前的实车运行验证）。其二，`gnss_antenna_primary_link` 的
+z = 0.273 只是支架的名义高度，应按实际安装测量 —— 由于杆臂补偿已关闭，它对 GLIM
+而言仅具文档意义。
+
+### 上游合并记录
+
+英文版 §14 即合并记录，说明了从 `ucb-roar` 与 PR #15 移植了什么、刻意跳过了什么，
+以及每一项穹顶专有行为如何在冲突解决中保留下来。上游来源可直接访问：
+[`koide3/glim`](https://github.com/koide3/glim)（基础项目）与
+[`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus)（加固分支）。
 
 ## 10. 未改动的部分
 
@@ -264,8 +404,6 @@ fusion_engine_driver + adapter
 | `config/sensor_dome.urdf` | 新增（生成） | §8 |
 | `launch/hitch_sensor_dome.launch.py` | 新增 | §8 |
 | `scripts/check_init_stationarity.py` | 新增 | §8 |
-| `docs/moving_start_initialization.md` | 新增 | §9 |
-| `docs/multi_lap_loop_closure.md` | 新增 | §9 |
 | 其他所有上游文件 | 未改动 | §10 |
 
 ## 快速开始
@@ -312,7 +450,7 @@ GLIM 由以下人员开发：
 - **Iridescence** —— Kenji Koide。<https://github.com/koide3/iridescence>
 - **GTSAM** —— Frank Dellaert 与 Georgia Tech Borg Lab。<https://github.com/borglab/gtsam>
 
-`GLIM_plusplus/{config, launch, scripts, docs}/` 中的集成代码以及 §1 – §7 中所列改动属于 **Hitch Sensor Dome** 项目，由 Dr. Allen Y. Yang（Hitch Interactive · 加州大学伯克利分校）设计与维护。实现测试由 **Berkeley AI Racing Tech** 团队完成（见 [`../README.md`](../README.md) Credits）。
+`GLIM_plusplus/{config, launch, scripts}/` 中的集成代码以及 §1 – §7 中所列改动属于 **Hitch Sensor Dome** 项目，由 Dr. Allen Y. Yang（Hitch Interactive · 加州大学伯克利分校）设计与维护。实现测试由 **Berkeley AI Racing Tech** 团队完成（见 [`../README.md`](../README.md) Credits）。
 
 ## License
 

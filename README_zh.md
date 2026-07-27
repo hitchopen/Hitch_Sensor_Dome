@@ -116,7 +116,6 @@ recording/           运行期数据采集 + Foxglove 仪表盘
 GLIM_plusplus/                LiDAR-Inertial 建图 (koide3/glim 的 fork)
   config/                 sensor_dome.urdf + URDF 生成器
   launch/                 hitch_sensor_dome.launch.py
-  docs/                   多圈回环调试指南
   glim/                   上游 GLIM 核心 (附项目调参)
   glim_ext/               上游扩展模块 (GNSS 先验已重新启用)
   glim_ros2/              上游 ROS 2 封装 (未改动)
@@ -195,7 +194,7 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 > - **预留 RTK 收敛时间。** 启动 GLIM++ 之前，把车停在天空开阔的位置等 RTK 锁定。室外典型收敛时间为 30–120 秒；条件较差时更久。启动前务必在 Atlas Duo 的 web UI 中确认。
 > - **NTRIP 校正必须畅通。** Atlas Duo 经蜂窝路由器接通 NTRIP caster 的链路（见 [`PTP_sync/README.md`](PTP_sync/README.md) §3.1）必须工作；否则无法达到 RTK-fixed。
 > - **会话进行中遇到隧道 / 城市峡谷不影响。** 后续每条消息的 RTK 门控只在失锁时段静默暂停因子发布，重新锁定后自动恢复，**不会重启会话** —— RTK 硬性要求只针对*初始位姿*。
-> - **完全没有 RTK** 的场景（既没有基站也没有 NTRIP），可通过 `ins_require_rtk_fixed:=false ins_max_position_stddev:=0.5` 放宽门控，允许 RTK-float / SBAS 初始化。地图依然可用，但世界坐标系锚点的精度从厘米级退化到米级。详见 [`GLIM_plusplus/docs/moving_start_initialization.md`](GLIM_plusplus/docs/moving_start_initialization.md) "Operating without RTK"一节。
+> - **完全没有 RTK** 的场景（既没有基站也没有 NTRIP）属于**仅供诊断**的配置，不是受支持的建图模式。做法是在 `config_ros.json` 中指向连续 INS 源，并设置 `"ins_require_rtk_fixed": false` 与 `"ins_max_position_stddev": 0.5` —— 注意这些是配置键，不是启动参数。地图依然可用，但世界坐标系锚点的精度从厘米级退化到米级，运行结束时报告为 `rtk_origin_only` 而非 `rtk_anchored`。生产 profile 始终保持 Fixed-only。另需注意：单纯放宽 NavSatFix 协方差阈值**打不开**这道门 —— 门控读的是 Atlas 的解算类型（solution type），所以无论 Float 解上报的协方差多好看，都会被拒绝。
 
 > ### ⚙ GLIM++ GNSS 天线杆臂补偿 —— 默认关闭（仅适用于 Atlas Duo）
 >

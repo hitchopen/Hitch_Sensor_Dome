@@ -56,7 +56,7 @@ uname -a
 # 应显示：... SMP PREEMPT_RT ...
 ```
 
-**NVIDIA GPU 注意事项（仅 RT 内核）：** NVIDIA 内核模块（`nvidia.ko`）在 PREEMPT_RT 内核上无法加载 —— RT 内核下没有 CUDA、cuDNN、TensorRT。请使用 Intel 集显作为显示输出。完整双内核工作流见 [附录 C](#c-nvidia-gpu-and-rt-kernel-compatibility)。
+**NVIDIA GPU 注意事项（仅 RT 内核）：** NVIDIA 内核模块（`nvidia.ko`）在 PREEMPT_RT 内核上无法加载 —— RT 内核下没有 CUDA、cuDNN、TensorRT。请使用 Intel 集显作为显示输出。完整双内核工作流见 [附录 C](#c-nvidia-gpu-与-rt-内核兼容性)。
 
 ### 1.2 运行安装脚本
 
@@ -281,7 +281,7 @@ chmod +x provision_robin_w_multiunit.sh
 3. 通过 `innovusion_lidar_util get_static_info` 读出 LiDAR 的序列号。
 4. 调用 `set_network` 把单元从 `172.168.1.10` 移到 `192.168.1.10` / `.11` / `.12`，重启，等待约 25 秒。
 5. 上传位置专用的 `PCS_ENV`（`RobinW_FW2835_Multiunit/RW_FW2835_robin_w_<位置>_unicast.env`），再次重启。
-6. 把这个单元的序列号写入或更新到 [`RobinW_FW2835_Multiunit/serial_inventory.yaml`](RobinW_FW2835_Multiunit/serial_inventory.yaml)，保留 SN ↔ 位置的对应关系以便维护与备件管理。
+6. 把这个单元的序列号写入或更新到 `RobinW_FW2835_Multiunit/serial_inventory.yaml`，保留 SN ↔ 位置的对应关系以便维护与备件管理。该文件由本脚本在配置过程中**自动生成** —— 它不在仓库里，全新 clone 在你配置第一台单元之前不会有这个文件。
 
 脚本是幂等的 —— 对已经配置好的 LiDAR 再次运行会识别状态匹配并打印 `[SKIP]`。脚本还会拒绝覆盖：若 inventory 中记录的某个位置的序列号与当前接入的单元不同，脚本会停止并提示你确认 —— 这能在错误传播之前抓出「插错单元」的失误。如果某台 Robin W 需要更换（RMA、故障），删除 `serial_inventory.yaml` 中该位置的整段记录，然后用相应的 `--position` 重新运行脚本即可。
 

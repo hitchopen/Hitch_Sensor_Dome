@@ -3,6 +3,7 @@
 #include <limits>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <numeric>
 #include <fstream>
@@ -275,6 +276,8 @@ public:
     using std::placeholders::_3;
     GlobalMappingCallbacks::on_insert_submap.add(std::bind(&GNSSGlobal::on_insert_submap, this, _1));
     GlobalMappingCallbacks::on_smoother_update.add(std::bind(&GNSSGlobal::on_smoother_update, this, _1, _2, _3));
+    GlobalMappingCallbacks::on_smoother_update_result.add(
+      std::bind(&GNSSGlobal::on_smoother_update_result, this, _1, _2));
     GlobalMappingCallbacks::on_update_submaps.add(std::bind(&GNSSGlobal::on_update_submaps, this, _1));
   }
   ~GNSSGlobal() {
@@ -296,6 +299,18 @@ public:
     // line + T_world_utm.txt instead of trusting a clean exit code: a run can
     // be locally consistent yet completely unanchored (zero factors) and
     // previously still reported success.
+    // Anything still pending at exit never completed an update (the final
+    // flush threw, or the batch never reached one). There is no ISAM2 handle
+    // here, so resolve conservatively as lost rather than dropping it from the
+    // accounting entirely.
+    if (pending_delivery_count_ > 0) {
+      factors_lost_in_update_ += pending_delivery_count_;
+      logger->error(
+        "{} GNSS prior factor(s) were still awaiting optimizer confirmation at exit — "
+        "the final update did not complete; counting them as UNDELIVERED",
+        pending_delivery_count_);
+      pending_delivery_count_ = 0;
+    }
     const uint64_t pf = position_factor_count.load();
     const uint64_t of = orientation_factor_count.load();
     const uint64_t gf = gravity_factor_count.load();
@@ -311,7 +326,8 @@ public:
     // coverage ratio instead of looking fully anchored.
     logger->info(
       "gnss_global summary: transformation_initialized={} fit_rms_m={:.3f} position_factors={} "
-      "orientation_factors={} gravity_factors={} factors_delivered={} factors_undelivered={} yaw_gate_skips={} "
+      "orientation_factors={} gravity_factors={} factors_delivered={} factors_undelivered={} "
+      "factors_lost_in_update={} yaw_gate_skips={} "
       "gap_unanchored={} submaps_seen={} submaps_dropped_pre_gnss={} submaps_dropped_no_bracket={} "
       "submaps_unanchored_pre_fit={} "
       "submap_anchor_coverage={:.3f} nonmonotonic_drops={} bracket_count={} bracket_max_s={:.3f} "
@@ -326,6 +342,7 @@ public:
       gf,
       delivered,
       undelivered,
+      factors_lost_in_update_.load(),
       yaw_gate_skip_count.load(),
       gap_unanchored_count.load(),
       seen,
@@ -347,6 +364,13 @@ public:
       fit_duration_s_.load(),
       fit_validation_rms_m_.load(),
       fit_rejected_count_.load());
+    if (factors_lost_in_update_.load() > 0) {
+      logger->error(
+        "gnss_global: {} GNSS prior factor(s) were DISCARDED by a failed optimizer update "
+        "(exception / indeterminant linear system) — those anchors are absent from the "
+        "serialized map even though they were emitted",
+        factors_lost_in_update_.load());
+    }
     if (undelivered > 0) {
       logger->warn("gnss_global: {} GNSS prior factor(s) were EMITTED but never DELIVERED to the "
                    "graph (save() flushed before on_smoother_update drained them) — the serialized "
@@ -375,6 +399,15 @@ public:
   }
 
   virtual bool ok() const override { return healthy_.load(); }
+
+  // [P1 FIX 2026-07-27] Authoritative anchoring evidence for the run verdict.
+  // This is H3's CONFIRMED-delivery count (factors observed to have grown the
+  // optimizer's graph), NOT the number emitted or published. GlimROS uses it
+  // for map_anchor_state()/require_rtk_anchor so a missing, failed, or
+  // silently-dropping GNSS extension cannot yield "rtk_anchored".
+  virtual std::optional<std::uint64_t> delivered_global_constraints() const override {
+    return factors_delivered_count.load();
+  }
 
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
     if (gnss_msg_type == "nav_msgs/msg/Odometry") {
@@ -449,6 +482,12 @@ public:
   }
 
   void on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
+    // Settle the PREVIOUS batch first. If the last update threw, the
+    // pose-graph backend skipped on_smoother_update_result entirely, so this
+    // is where that batch is correctly recorded as lost — the graph did not
+    // grow. MUST run before the new batch overwrites graph_size_at_update_.
+    resolve_pending_delivery(isam2);
+
     std::vector<gtsam::NonlinearFactor::shared_ptr> factors;
     std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>> delivered_anchors;
     {
@@ -467,7 +506,17 @@ public:
       // the graph while output_factors still holds undelivered factors, so the
       // emitted counts overstate what actually reached the graph. at_exit reports
       // factors_undelivered = emitted - delivered so prep_bag can gate on it.
-      factors_delivered_count += factors.size();
+      //
+      // [H3 FIX 2026-07-27] Handing factors to new_factors is NOT delivery.
+      // This callback runs BEFORE GlobalMapping::update_isam2(), which swallows
+      // exceptions and returns an empty result, and whose
+      // IndeterminantLinearSystem path re-runs from the PRE-update graph — in
+      // both cases the batch is discarded. Counting here therefore reported
+      // factors_undelivered=0 for factors that never reached graph.bin, i.e.
+      // the one metric operators are told to gate acceptance on could lie.
+      // Delivery is now confirmed in on_smoother_update_result() below.
+      pending_delivery_count_ += factors.size();
+      graph_size_at_update_ = isam2.getFactorsUnsafe().size();
     }
     if (!delivered_anchors.empty()) {
       std::lock_guard<std::mutex> lock(delivered_anchor_mtx_);
@@ -480,6 +529,63 @@ public:
         delivered_anchor_positions_[anchor.submap_id] = anchor.position;
       }
     }
+  }
+
+  // [H3 FIX 2026-07-27] Confirm delivery AFTER the optimizer update.
+  //
+  // GlobalMapping calls this immediately after update_isam2() returns, on both
+  // the success and the caught-exception paths, so arrival alone proves
+  // nothing. Growth of the optimizer's factor graph does: a swallowed
+  // exception leaves the graph untouched, and the IndeterminantLinearSystem
+  // recovery rebuilds it from the pre-update factors.
+  //
+  // Deliberately conservative. If iSAM2 reuses freed factor slots
+  // (findUnusedFactorSlots) the graph may not grow even on a successful
+  // update, in which case this UNDER-counts delivery and therefore
+  // OVER-reports factors_undelivered. That direction is safe: it warns about a
+  // healthy run rather than staying silent about a damaged one, which is
+  // exactly the failure this metric exists to prevent.
+  // [P1 FIX 2026-07-27] Resolving delivery ONLY from on_smoother_update_result
+  // was not sound. GlobalMappingPoseGraph::update_optimizer() invokes that
+  // callback INSIDE its try block, so when isam2->update() throws the callback
+  // never runs. The pending count then survived the failed update and the NEXT
+  // successful update — which does grow the graph — credited the DISCARDED
+  // batch as delivered. That backend is not hypothetical: it is the one
+  // scripts/generate_glim_mapping_config.py selects
+  // (so_name: libglobal_mapping_pose_graph.so). The GPU backend calls the
+  // result callback after its try/catch, so only the pose-graph path was
+  // exposed — but the accounting must not depend on which backend is loaded.
+  //
+  // Resolution is now driven by graph growth and evaluated everywhere the
+  // outcome becomes knowable, not only on a callback that may never arrive:
+  //   * start of on_smoother_update() — settles the PREVIOUS batch before a
+  //     new one is staged; this is the path that catches a thrown update;
+  //   * on_smoother_update_result()   — the normal, prompt path;
+  //   * at_exit()                     — still pending means no update ever
+  //     completed, so it is reported lost.
+  // Idempotent: pending == 0 is a no-op, so multiple call sites are safe.
+  void resolve_pending_delivery(const gtsam_points::ISAM2Ext& isam2) {
+    const uint64_t pending = pending_delivery_count_;
+    if (pending == 0) {
+      return;
+    }
+    pending_delivery_count_ = 0;
+    const size_t graph_size_now = isam2.getFactorsUnsafe().size();
+    if (graph_size_now > graph_size_at_update_) {
+      factors_delivered_count += pending;
+    } else {
+      factors_lost_in_update_ += pending;
+      logger->error(
+        "{} GNSS prior factor(s) were handed to the optimizer but the factor graph did "
+        "not grow ({} -> {}) — the update was rejected (exception / indeterminant "
+        "system) and the batch was DISCARDED. These are counted as UNDELIVERED.",
+        pending, graph_size_at_update_, graph_size_now);
+    }
+  }
+
+  void on_smoother_update_result(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result) {
+    (void)result;
+    resolve_pending_delivery(isam2);
   }
 
   void on_update_submaps(const std::vector<SubMap::Ptr>& updated_submaps) {
@@ -1285,7 +1391,14 @@ private:
   std::atomic<uint64_t> position_factor_count{0};     // GNSS position priors emitted
   std::atomic<uint64_t> orientation_factor_count{0};  // heading priors emitted
   std::atomic<uint64_t> gravity_factor_count{0};      // roll/pitch priors emitted
-  std::atomic<uint64_t> factors_delivered_count{0};   // priors actually inserted into the graph
+  std::atomic<uint64_t> factors_delivered_count{0};   // priors CONFIRMED inserted into the graph
+  // [H3 FIX 2026-07-27] Batch handed to the optimizer but not yet confirmed,
+  // and the graph size when it was handed over. Written in on_smoother_update
+  // and read in on_smoother_update_result; both run on the mapping thread,
+  // strictly in that order, so no lock is required.
+  uint64_t pending_delivery_count_ = 0;
+  size_t graph_size_at_update_ = 0;
+  std::atomic<uint64_t> factors_lost_in_update_{0};  // batches discarded by a failed update
   std::atomic<uint64_t> gap_unanchored_count{0};      // submaps skipped: bracket > max_interp_gap
   std::atomic<uint64_t> nonmonotonic_drop_count{0};   // GNSS samples dropped: stamp regression
   std::atomic<double> bracket_max_s{0.0};             // widest accepted GNSS bracket

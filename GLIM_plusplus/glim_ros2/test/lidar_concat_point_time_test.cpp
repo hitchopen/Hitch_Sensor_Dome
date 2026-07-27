@@ -33,10 +33,10 @@ sensor_msgs::msg::PointCloud2::SharedPtr cloud(
 TEST(LidarConcatPointTime, DecodesAbsoluteRangeOnceWhenBuffered) {
   const auto buffered = glim_ros::buffer_aux_cloud(
     cloud(1'000'000'000ULL, 1'049'000'000ULL, 1.0));
-  ASSERT_TRUE(buffered.luminar_range.valid);
-  EXPECT_EQ(buffered.luminar_range.min_ns, 1'000'000'000ULL);
-  EXPECT_EQ(buffered.luminar_range.max_ns, 1'049'000'000ULL);
-  EXPECT_EQ(buffered.luminar_range.count, 2U);
+  ASSERT_TRUE(buffered.point_time_range.valid);
+  EXPECT_EQ(buffered.point_time_range.min_ns, 1'000'000'000ULL);
+  EXPECT_EQ(buffered.point_time_range.max_ns, 1'049'000'000ULL);
+  EXPECT_EQ(buffered.point_time_range.count, 2U);
 }
 
 TEST(LidarConcatPointTime, SplitBagSeekAlignsFromFirstDeliveredLidarRecord) {
@@ -82,8 +82,8 @@ TEST(LidarConcatPointTime, Float64EpochNsContractPreservesRawAuxBytes) {
   std::memcpy(msg->data.data(), &first, sizeof(first));
   std::memcpy(msg->data.data() + 8, &last, sizeof(last));
 
-  EXPECT_FALSE(glim_ros::luminar_timestamp_range(*msg).valid);
-  const auto range = glim_ros::luminar_timestamp_range(*msg, true);
+  EXPECT_FALSE(glim_ros::decode_point_time_range(*msg).valid);
+  const auto range = glim_ros::decode_point_time_range(*msg, true);
   ASSERT_TRUE(range.valid);
   EXPECT_EQ(range.min_ns, first);
   EXPECT_EQ(range.max_ns, last);
@@ -193,7 +193,7 @@ TEST(LidarConcatPointTime, RobinWContractIsFloat64AbsoluteTime) {
   EXPECT_EQ(msg->fields.front().datatype, sensor_msgs::msg::PointField::FLOAT64);
   EXPECT_EQ(msg->fields.front().count, 1U);
 
-  const auto range = glim_ros::luminar_timestamp_range(*msg, false);
+  const auto range = glim_ros::decode_point_time_range(*msg, false);
   ASSERT_TRUE(range.valid);
   EXPECT_EQ(range.count, 2U);
   EXPECT_EQ(range.min_ns, static_cast<uint64_t>(t0 * 1e9));
@@ -252,7 +252,7 @@ TEST(LidarConcatPointTime, HesaiFloat64AbsoluteSecondsDecodeToRange) {
   // Hesai FLOAT64 absolute Unix seconds need no raw-epoch-ns contract flag.
   const double t0 = 1'700'000'000.000;
   const auto msg = float64_time_cloud({0.0, t0, t0 + 0.049}, t0);
-  const auto range = glim_ros::luminar_timestamp_range(*msg, false);
+  const auto range = glim_ros::decode_point_time_range(*msg, false);
   ASSERT_TRUE(range.valid);
   EXPECT_EQ(range.count, 2U);
   EXPECT_EQ(range.min_ns, static_cast<uint64_t>(t0 * 1e9));
@@ -263,7 +263,7 @@ TEST(LidarConcatPointTime, RelativeFloat64SecondsRejectedFailClosed) {
   // Scan-RELATIVE FLOAT64 seconds must NOT be promoted to an absolute range:
   // the whole decode fails closed so the generic header fallback is used.
   const auto msg = float64_time_cloud({0.0, 0.010, 0.049}, 1.0);
-  EXPECT_FALSE(glim_ros::luminar_timestamp_range(*msg, false).valid);
+  EXPECT_FALSE(glim_ros::decode_point_time_range(*msg, false).valid);
 }
 
 TEST(LidarConcatPointTime, HesaiAbsoluteSecondsNotRebasedButCorrected) {
@@ -309,7 +309,7 @@ TEST(LidarConcatPointTime, Float64MixedMagnitudeCloudFailsTowardNoShift) {
   // The range decoder meanwhile fails such a cloud closed (invalid range).
   const double t0 = 1'700'000'000.0;
   auto msg = float64_time_cloud({0.010, t0}, t0);
-  EXPECT_FALSE(glim_ros::luminar_timestamp_range(*msg, false).valid);
+  EXPECT_FALSE(glim_ros::decode_point_time_range(*msg, false).valid);
   auto bytes = msg->data;
   glim_ros::shift_cloud_timestamps(
     bytes, 8, 0, sensor_msgs::msg::PointField::FLOAT64, 1,
@@ -330,11 +330,11 @@ TEST(LidarConcatPointTime, HesaiPointTimesDriveSweepSelection) {
     float64_time_cloud({t0 - 0.100, t0 - 0.051}, t0 - 0.008), false));
   candidates.push_back(glim_ros::buffer_aux_cloud(
     float64_time_cloud({t0, t0 + 0.049}, t0 + 0.092), false));
-  const auto primary_range = glim_ros::luminar_timestamp_range(
+  const auto primary_range = glim_ros::decode_point_time_range(
     *float64_time_cloud({t0, t0 + 0.049}, t0), false);
   ASSERT_TRUE(primary_range.valid);
 
-  const auto match = glim_ros::find_closest_luminar_sweep(
+  const auto match = glim_ros::find_closest_sweep(
     candidates, primary_range, 0.0, t0, 0.0);
   ASSERT_TRUE(match.has_value());
   EXPECT_EQ(match->msg, candidates[1].msg);
@@ -344,7 +344,7 @@ TEST(LidarConcatPointTime, HesaiPointTimesDriveSweepSelection) {
 TEST(LidarConcatPointTime, LivoxFloat64NumericNanosecondsUseOneENineScale) {
   const double t0_ns = 1'700'000'000'000'000'000.0;
   auto msg = float64_time_cloud({t0_ns, t0_ns + 50'000'000.0}, 1'700'000'000.0);
-  const auto range = glim_ros::luminar_timestamp_range(*msg, false);
+  const auto range = glim_ros::decode_point_time_range(*msg, false);
   ASSERT_TRUE(range.valid);
   EXPECT_EQ(range.count, 2U);
   EXPECT_EQ(range.min_ns, static_cast<uint64_t>(t0_ns));
@@ -379,10 +379,10 @@ TEST(LidarConcatPointTime, PointTimesOverrideMisleadingHeaderProximity) {
     cloud(900'000'000ULL, 949'000'000ULL, 0.992)));
   candidates.push_back(glim_ros::buffer_aux_cloud(
     cloud(1'000'000'000ULL, 1'049'000'000ULL, 1.092)));
-  const glim_ros::LuminarTimestampRangeNs primary{
+  const glim_ros::PointTimeRangeNs primary{
     true, 1'000'000'000ULL, 1'049'000'000ULL, 2};
 
-  const auto match = glim_ros::find_closest_luminar_sweep(
+  const auto match = glim_ros::find_closest_sweep(
     candidates, primary, 0.0, 1.0, 0.0);
   ASSERT_TRUE(match.has_value());
   EXPECT_EQ(match->msg, candidates[1].msg);
@@ -391,7 +391,7 @@ TEST(LidarConcatPointTime, PointTimesOverrideMisleadingHeaderProximity) {
 }
 
 TEST(LidarConcatPointTime, PointClockCorrectionIsSeparateFromHeaderPhase) {
-  const glim_ros::LuminarTimestampRangeNs uncorrected{
+  const glim_ros::PointTimeRangeNs uncorrected{
     true, 1'010'000'000ULL, 1'059'000'000ULL, 2};
   const auto corrected = glim_ros::shifted_range(uncorrected, -0.010);
   EXPECT_EQ(corrected.min_ns, 1'000'000'000ULL);

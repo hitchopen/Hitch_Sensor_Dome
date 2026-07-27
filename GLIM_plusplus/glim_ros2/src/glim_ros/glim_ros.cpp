@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <cmath>
+#include <limits>   // [P2 FIX 2026-07-27] quiet_NaN() in the deprecated-key conversion
 #include <cstdio>
 #include <algorithm>
 #include <thread>
@@ -305,7 +306,45 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ins_max_position_stddev_     = config_ros.param<double>("glim_ros", "ins_max_position_stddev",     0.10);
   ins_min_pose_window_samples_ = config_ros.param<int>(   "glim_ros", "ins_min_pose_window_samples", 10);
   ins_max_pose_jitter_trans_   = config_ros.param<double>("glim_ros", "ins_max_pose_jitter_trans",   0.05);
-  ins_min_quat_dot_            = config_ros.param<double>("glim_ros", "ins_min_quat_dot",            0.999);
+  // [P2 FIX 2026-07-27] Attitude bound is configured in DEGREES. The legacy
+  // `ins_min_quat_dot` key is honoured for one release. PRESENCE, not value,
+  // selects the source (same discipline as lidar_concat's sweep threshold):
+  // reading with an out-of-band default would let a deliberately invalid entry
+  // masquerade as an absent one and skip validation.
+  {
+    const bool has_deg = config_ros.has_param("glim_ros", "ins_max_attitude_residual_deg");
+    const bool has_dot = config_ros.has_param("glim_ros", "ins_min_quat_dot");
+    if (has_deg) {
+      ins_max_attitude_residual_deg_ =
+        config_ros.param<double>("glim_ros", "ins_max_attitude_residual_deg", 2.5);
+      if (has_dot) {
+        spdlog::warn(
+          "glim_ros: both 'ins_max_attitude_residual_deg' and the deprecated "
+          "'ins_min_quat_dot' are present — using the degree form ({:.3f}°) and "
+          "IGNORING the dot form. Please delete 'ins_min_quat_dot'.",
+          ins_max_attitude_residual_deg_);
+      }
+    } else if (has_dot) {
+      const double dot = config_ros.param<double>("glim_ros", "ins_min_quat_dot", 0.999);
+      // Only a dot in [0, 1] maps to a real angle; anything else falls through
+      // to the range check below as an out-of-range degree value rather than
+      // producing NaN from std::acos.
+      ins_max_attitude_residual_deg_ =
+        (std::isfinite(dot) && dot >= 0.0 && dot <= 1.0)
+          ? 2.0 * std::acos(dot) * 180.0 / M_PI
+          : std::numeric_limits<double>::quiet_NaN();
+      spdlog::warn(
+        "glim_ros: 'ins_min_quat_dot' is deprecated — it is a quaternion dot "
+        "product, and because |q_a·q_b| = cos(θ/2) its documented angle was "
+        "half the residual actually admitted. Converted {:.6f} -> "
+        "ins_max_attitude_residual_deg = {:.3f}°. NOTE: the old default 0.999 "
+        "was annotated \"2.5°\" but admits 5.125°; set the degree key "
+        "explicitly to get the value you intend.",
+        dot, ins_max_attitude_residual_deg_);
+    } else {
+      ins_max_attitude_residual_deg_ = 2.5;
+    }
+  }
   ins_max_pose_gap_s_          = config_ros.param<double>("glim_ros", "ins_max_pose_gap_s",          0.5);
   fix_max_age_s_               = config_ros.param<double>("glim_ros", "fix_max_age_s",               0.5);
   fix_future_tolerance_s_      = config_ros.param<double>("glim_ros", "fix_future_tolerance_s",      0.05);
@@ -313,11 +352,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   if (!std::isfinite(ins_max_position_stddev_) || ins_max_position_stddev_ <= 0.0 ||
       ins_min_pose_window_samples_ < 3 ||
       !std::isfinite(ins_max_pose_jitter_trans_) || ins_max_pose_jitter_trans_ <= 0.0 ||
-      !std::isfinite(ins_min_quat_dot_) || ins_min_quat_dot_ < 0.0 || ins_min_quat_dot_ > 1.0 ||
+      !std::isfinite(ins_max_attitude_residual_deg_) ||
+      ins_max_attitude_residual_deg_ <= 0.0 || ins_max_attitude_residual_deg_ >= 180.0 ||
       !std::isfinite(ins_max_pose_gap_s_) || ins_max_pose_gap_s_ <= 0.0) {
     throw std::runtime_error(
       "glim_ros: invalid INS gate thresholds (stddev/jitter/gap must be finite and > 0, "
-      "window >= 3, quat dot in [0, 1])");
+      "window >= 3, ins_max_attitude_residual_deg in (0, 180))");
   }
   if (!std::isfinite(fix_max_age_s_) || fix_max_age_s_ <= 0.0 ||
       !std::isfinite(fix_future_tolerance_s_) || fix_future_tolerance_s_ < 0.0) {
@@ -343,16 +383,19 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     // Tighter stability + shorter timeout — RTK-fixed dual-antenna
     // heading converges within a few /pose samples, so we don't need
     // the conservative single-antenna defaults.
-    ins_min_quat_dot_ = std::max(ins_min_quat_dot_, 0.9999);     // ≈ 0.8° vs 2.5°
+    // 0.8° vs the 2.5° single-antenna bound. This is the TRUE residual angle;
+    // the predecessor wrote 0.9999 here and called it 0.8°, which actually
+    // admitted 1.621°.
+    ins_max_attitude_residual_deg_ = std::min(ins_max_attitude_residual_deg_, 0.8);
     ins_min_pose_window_samples_ = std::min(ins_min_pose_window_samples_, 5);
     ins_init_timeout_s_ = std::min(ins_init_timeout_s_, 30.0);
     spdlog::info(
       "Hitch fork: DUAL-antenna mode — baseline={:.3f} m, expected "
       "heading σ={:.3f} rad ({:.2f}°). Init gates auto-tightened: "
-      "min_quat_dot={:.4f}, window={} samples, timeout={:.0f} s.",
+      "max_attitude_residual={:.2f}°, window={} samples, timeout={:.0f} s.",
       dual_antenna_baseline_m_, dual_antenna_heading_sigma_rad_,
       dual_antenna_heading_sigma_rad_ * 180.0 / 3.14159265358979,
-      ins_min_quat_dot_, ins_min_pose_window_samples_, ins_init_timeout_s_);
+      ins_max_attitude_residual_deg_, ins_min_pose_window_samples_, ins_init_timeout_s_);
   } else {
     spdlog::info(
       "Hitch fork: SINGLE-antenna mode — heading derived from IMU "
@@ -360,12 +403,19 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       "config/sensor_dome_tf.yaml to enable dual-antenna heading.");
   }
 
+  // Derive the comparison constant ONCE, after every adjustment to the degree
+  // bound (including the dual-antenna tightening above). |q_a·q_b| = cos(θ/2),
+  // so a residual angle θ maps to the dot-product floor cos(θ/2). The hot path
+  // then compares dot products directly — no trig per sample.
+  ins_min_quat_dot_ = std::cos(0.5 * ins_max_attitude_residual_deg_ * M_PI / 180.0);
+
   spdlog::info(
     "Hitch fork: RTK gate — require_rtk_fixed={}, max_pos_stddev={:.2f} m, "
-    "window={} samples, max_jitter={:.3f} m, min_quat_dot={:.4f}, timeout={:.0f} s",
+    "window={} samples, max_jitter={:.3f} m, max_attitude_residual={:.2f}° "
+    "(|q_pred·q| >= {:.6f}), timeout={:.0f} s",
     ins_require_rtk_fixed_, ins_max_position_stddev_,
     ins_min_pose_window_samples_, ins_max_pose_jitter_trans_,
-    ins_min_quat_dot_, ins_init_timeout_s_);
+    ins_max_attitude_residual_deg_, ins_min_quat_dot_, ins_init_timeout_s_);
 
   // ---- GNSS factor bridge (post-init, RTK-gated republisher) ----
   // Each accepted /pose / /odom is evaluated against the most recent
@@ -569,7 +619,7 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 //   (3) STABILITY   — the last ins_min_pose_window_samples PoseStamped /
 //       Odometry messages are mutually consistent: pairwise translation
 //       drift below ins_max_pose_jitter_trans, pairwise quaternion
-//       |q1·q2| above ins_min_quat_dot. This rejects IMU-only
+//       residual below ins_max_attitude_residual_deg. This rejects IMU-only
 //       dead-reckoning that hasn't aligned to GNSS yet.
 //
 // Until the gate passes, ins_init_timeout_tick() prints a bold RED
@@ -895,9 +945,10 @@ bool GlimROS::ins_window_push_and_check(
     if (qdot < ins_min_quat_dot_) {
       char buf[192];
       std::snprintf(buf, sizeof(buf),
-                    "INS orientation residual |q_pred.q|=%.5f < %.5f vs "
+                    "INS attitude residual %.3f deg > %.3f deg vs "
                     "constant-rate prediction — solution not settled",
-                    qdot, ins_min_quat_dot_);
+                    2.0 * std::acos(std::min(1.0, qdot)) * 180.0 / M_PI,
+                    ins_max_attitude_residual_deg_);
       ins_last_reject_reason_ = buf;
       ins_last_hard_reject_ = buf;
       ++ins_hard_reject_count_;
@@ -1060,9 +1111,29 @@ void GlimROS::ins_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
   T.translation() << msg->pose.pose.position.x,
                      msg->pose.pose.position.y,
                      msg->pose.pose.position.z;
-  Eigen::Vector3d v(msg->twist.twist.linear.x,
-                    msg->twist.twist.linear.y,
-                    msg->twist.twist.linear.z);
+  // [P1 FIX 2026-07-27] FRAME CONVERSION — twist is a BODY-frame velocity.
+  //
+  // nav_msgs/Odometry defines twist in `child_frame_id`, and the adapter sets
+  // child_frame_id = body_frame_id (adapter_node.cpp:478) while filling
+  // twist.linear from FusionEngine `velflu` — Point One's forward-left-up
+  // PLATFORM BODY velocity (adapter_node.cpp:549). The adapter is therefore
+  // correct per the ROS contract, and GICP++ reads the same field as
+  // `v_lin_body` (localization.cc:4170), so the conversion belongs HERE.
+  //
+  // set_init_state() expects v_world_imu ("IMU velocity in the world frame",
+  // odometry_estimation_base.hpp:63) and it seeds the V(0) prior. Passing the
+  // body vector unrotated aligned the initial velocity with the wrong world
+  // axis: at 90 deg yaw a 20 m/s forward motion was seeded as 20 m/s along
+  // world +X instead of +Y — a ~28 m/s vector error against a sigma = 1 m/s
+  // prior, on the very interval that anchors the global graph.
+  //
+  // No axis permutation is needed, only the rotation: velflu is
+  // forward-left-up and the dome body frame (imu_link) is REP-103
+  // X-fwd/Y-left/Z-up, so the axes already coincide.
+  const Eigen::Vector3d v_body(msg->twist.twist.linear.x,
+                               msg->twist.twist.linear.y,
+                               msg->twist.twist.linear.z);
+  const Eigen::Vector3d v = T.linear() * v_body;
 
   // (3) Stability gate. Odometry already carries P1's own velocity, which is
   // authoritative (tightly-coupled INS), so no estimate is requested here.
@@ -1075,10 +1146,11 @@ void GlimROS::ins_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     ins_init_applied.store(true);
     spdlog::info(
       "{}Hitch fork: INS init pose+velocity ACCEPTED — fix={}, pos σ={:.3f} m, "
-      "translation=[{:.3f}, {:.3f}, {:.3f}], v=[{:.3f}, {:.3f}, {:.3f}]{}",
+      "translation=[{:.3f}, {:.3f}, {:.3f}], v_world=[{:.3f}, {:.3f}, {:.3f}] "
+      "|v|={:.2f} m/s (rotated from body-frame twist){}",
       CYAN, fix_quality, pos_stddev,
       T.translation().x(), T.translation().y(), T.translation().z(),
-      v.x(), v.y(), v.z(), RESET);
+      v.x(), v.y(), v.z(), v.norm(), RESET);
     // Subscriptions stay alive post-init for the GNSS factor bridge.
     if (ins_init_timeout_timer) ins_init_timeout_timer->cancel();
   }
@@ -1624,18 +1696,48 @@ void GlimROS::wait(bool auto_quit) {
   }
 }
 
+uint64_t GlimROS::gnss_factors_delivered() const {
+  // Sum over modules that report confirmed delivery. A module returning
+  // nullopt does not contribute global constraints; if NO module reports,
+  // the total is 0 and the map cannot be called anchored — which is the
+  // point: a missing or failed GNSS extension must not pass as anchored.
+  uint64_t total = 0;
+  for (const auto& module : extension_modules) {
+    if (!module) continue;
+    const auto delivered = module->delivered_global_constraints();
+    if (delivered) {
+      total += *delivered;
+    }
+  }
+  return total;
+}
+
+const char* GlimROS::map_anchor_state() const {
+  if (!ins_init_applied.load()) return "uninitialized";
+  return gnss_factors_delivered() > 0 ? "rtk_anchored" : "rtk_origin_only";
+}
+
 void GlimROS::log_map_status() const {
   // End-of-run verdict. LiDAR-IMU SLAM is the primary estimator; GNSS is an
   // optional global constraint, so "no GNSS factors" is a REPORTED STATE,
   // not automatically a failure. Only require_rtk_anchor makes it one.
   const char* state = map_anchor_state();
-  const int factors = gnss_factors_published_.load();
+  const uint64_t delivered = gnss_factors_delivered();
+  const int published = gnss_factors_published_.load();
   const int rejected = gnss_factors_rejected_.load();
   spdlog::info(
-    "Hitch fork: map status: state={} slam_initialized={} gnss_factors={} "
-    "gnss_suppressed={} require_rtk_anchor={}",
-    state, slam_initialized() ? "true" : "false", factors, rejected,
+    "Hitch fork: map status: state={} slam_initialized={} "
+    "gnss_factors_delivered={} gnss_bridge_published={} gnss_suppressed={} "
+    "require_rtk_anchor={}",
+    state, slam_initialized() ? "true" : "false", delivered, published, rejected,
     require_rtk_anchor_ ? "true" : "false");
+  if (published > 0 && delivered == 0) {
+    spdlog::error(
+      "{}  The RTK bridge published {} GNSS pose(s) but NO extension confirmed a single "
+      "factor into the graph — is libgnss_global.so loaded, and does its gnss_topic "
+      "match gnss_factor_topic? The map is NOT globally anchored.{}",
+      RED, published, RESET);
+  }
 
   if (!slam_initialized()) {
     spdlog::error(
@@ -1643,7 +1745,7 @@ void GlimROS::log_map_status() const {
       "solution was seen, so no frame was ever ingested.{}", RED, RESET);
     return;
   }
-  if (factors == 0) {
+  if (delivered == 0) {
     spdlog::warn(
       "  Map origin is RTK-anchored, but RTK never returned afterwards: the "
       "trajectory past initialization is constrained by LiDAR-IMU only. This "

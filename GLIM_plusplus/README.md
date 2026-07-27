@@ -15,7 +15,7 @@ This document is a **complete change log** between GLIM++ and the upstream `koid
 7. [RTK-gated GNSS factor bridge (post-init)](#7-rtk-gated-gnss-factor-bridge)
 8. [Optional GNSS yaw prior — dual-antenna only](#8-optional-gnss-yaw-prior)
 9. [Project integration — URDF generator, launch helper, diagnostics](#9-project-integration)
-10. [Documentation added](#10-documentation-added)
+10. [Design notes — loop closure, moving start, TF verification, merge record](#10-design-notes)
 11. [What was NOT changed](#11-what-was-not-changed)
 12. [File-by-file diff summary](#12-file-by-file-diff-summary)
 13. [2026-07 P1–P5 improvements — merge evidence, yaw-quality gate, GNSS backfill](#13-2026-07-p1p5-improvements)
@@ -46,11 +46,11 @@ The Hitch Sensor Dome supports either one or two GNSS antennas (a second antenna
 | Aspect | Single-antenna | Dual-antenna |
 |--------|----------------|--------------|
 | **Heading source** | IMU gyroscope integration (drifts with bias over time) | RTK-fixed dual-antenna baseline (drift-free, ≈ 0.1°–1° depending on baseline) |
-| **Init gate `ins_min_quat_dot`** | `0.999` (≈ 2.5° between consecutive samples) | auto-tightened to `0.9999` (≈ 0.8°) |
+| **Init gate `ins_max_attitude_residual_deg`** | `2.5°` attitude residual | auto-tightened to `0.8°` |
 | **Init gate `ins_min_pose_window_samples`** | `10` consecutive consistent samples | auto-shortened to `5` (orientation locks faster) |
 | **Init gate `ins_init_timeout_s`** | `60 s` | auto-shortened to `30 s` |
 | **Factor-bridge orientation covariance** | not populated (no usable orientation info from single antenna's PoseStamped) | tight yaw σ derived from baseline length, loose pitch/roll — see §7 |
-| **Session-long heading drift** | accumulates with IMU bias; mitigated only by LiDAR scan matching | bounded by RTK heading available throughout the session (data path in place; see "future work" note in `docs/moving_start_initialization.md` §"Future work — session-long heading-constraint factor") |
+| **Session-long heading drift** | accumulates with IMU bias; mitigated only by LiDAR scan matching | bounded by RTK heading available throughout the session (data path in place, factor module deferred — see §10 "Session-long heading correction") |
 | **Map quality on long / multi-lap trajectories** | depends on LiDAR feature richness for yaw stability; ground-truth z-anchor still good if RTK position is fixed | better orientation accuracy at init, with a clean data path for further session-long heading correction |
 | **Hardware needed** | one SP1 (or compatible) | two antennas at fixed offset (1.0–1.5 m baseline recommended) |
 | **Operator UX at launch** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
@@ -80,7 +80,7 @@ Twenty-four parameter changes across the seven JSON configs, each annotated inli
 | **IMU noise / bias** | `config_sensors.json` | Loosened: `acc 0.05 → 0.2`, `gyro 0.02 → 0.05`, `bias 1e-5 → 1e-4`. Less IMU trust, more LiDAR trust. |
 | **Accelerometer scale** | `config_ros.json` | `acc_scale: 0.0 → 1.0`. Atlas Duo emits m/s² natively, no auto-detect needed. |
 | **Initialization** | `config_odometry_gpu.json` | Window `1.0 → 3.0` s for cleaner gravity (later replaced entirely — see §5). |
-| **GNSS prior** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [1e4, 1e4, 5e4]` (was silently disabled upstream). `min_baseline: 1.0 → 0.5`. |
+| **GNSS prior** | `config_gnss_global.json` | `prior_inf_scale: [0,0,0] → [100, 100, 25]` with covariance-aware `prior_inf_floor`/`prior_inf_cap` and a Huber width (was silently disabled upstream). `min_baseline: 1.0 → 10.0` (world↔UTM fit gate; the earlier `0.5` was set on a false factor-density premise). |
 | **Deskewing** | `config_sensors.json` | `global_shutter_lidar: true → false`. Re-enables motion deskewing (the upstream multi-LiDAR timestamp rebasing bug it was working around has since been fixed). |
 | **Per-point time** | `config_sensors.json` | `timestamp/FLOAT64`, numeric Unix seconds, with `autoconf_perpoint_times: false`, `perpoint_relative_time: false`, and scale `1.0`. The schema and absolute axis are validated before deskew. |
 | **Downsampling** | `config_preprocess.json` | `random_downsample_target: 10000 → 30000`, `k_correspondences: 10 → 20`. Higher density required for the 360° stitched cloud from 3 sensors; the 3× upstream factor is safe because the dome pipeline runs GLIM **offline** against recorded MCAP bags, so there is no real-time per-scan budget. Lower to 15-20K if switching to live mapping. |
@@ -100,10 +100,14 @@ A targeted three-layer fix in `glim/config/config_global_mapping_gpu.json` and `
 | `submap_voxel_resolution_max` | `1.0` m | `2.0` m (wider VGICP convergence basin) |
 | `max_implicit_loop_distance` | `100` m | `200` m (covers a typical race-track lap) |
 | `min_implicit_loop_overlap` | `0.2` | `0.1` (partial overlap still creates factors) |
-| GNSS `prior_inf_scale[2]` (z) | `1e4` | `5e4` (z 5× stronger than horizontal) |
-| GNSS `min_baseline` | `1.0` m | `0.5` m (twice the GNSS factor density) |
+| GNSS `prior_inf_scale[2]` (z) | `1e4` | `25` — with `prior_inf_scale = [100, 100, 25]`, `prior_inf_floor = [100, 100, 25]`, `prior_inf_cap = [2500, 2500, 1000]`. **Vertical is deliberately *weaker* than horizontal, not stronger.** |
+| GNSS `min_baseline` | `1.0` m | `10.0` m (world↔UTM fit gate — **not** a factor-density knob; see below) |
 
-The chicken-and-egg between odometry initialization and VGICP convergence basin is described in [`docs/multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md). The first three knobs widen the convergence basin so closure factors fire even with residual drift; the GNSS knobs prevent the drift from accumulating in the first place. Both are required.
+> **Correction (2026-07-27).** `min_baseline` was previously listed here as `0.5` m "twice the GNSS factor density". That premise was false: `min_baseline` gates only the one-shot `T_world_utm` alignment fit and never the factor-emission loop, so lowering it adds no factors — it merely lets the world↔UTM alignment be fitted from a shorter, noisier baseline, which latched several degrees of yaw error for entire runs. Restored to `10.0` m alongside `fit_min_samples` and out-of-sample fit validation. Weight GNSS against LiDAR with `prior_inf_scale` / `prior_inf_floor` / `prior_inf_cap` instead.
+>
+> The `prior_inf_scale[2]` row above was wrong in the same revision, and in the opposite direction: it claimed z was made *5× stronger* than horizontal. The shipped config does the reverse — precision `25` vertical against `100` horizontal (σ ≈ 0.2 m vs 0.1 m), and cap `1000` against `2500` (σ ≈ 3.2 cm vs 2.0 cm). That matches how RTK actually behaves: vertical accuracy is roughly half of horizontal, so over-trusting z pulls the map's height against the LiDAR solution. The absolute magnitudes also dropped from `1e4` to `100` because the covariance-aware floor/cap path is now the active weighting mechanism; `prior_inf_scale` is only the fallback for samples carrying no usable covariance, and at `1e4` (1 cm) such a sample would have been *stiffer* than the capped adaptive maximum.
+
+The first three knobs widen the convergence basin so closure factors fire even with residual drift; the GNSS knobs prevent the drift from accumulating in the first place. Both are required, because of a chicken-and-egg described in full in §10 "Multi-lap z-drift": a loop-closure factor can only be created if VGICP converges between the two laps, but VGICP only converges if the accumulated drift is already smaller than its basin — so past a threshold the mechanism that would correct the drift is exactly the one the drift has disabled.
 
 ## 5. Initialization rewrite
 
@@ -126,7 +130,7 @@ GLIM++ removes the gravity-from-accelerometer pathway entirely and requires an e
 |------|--------|
 | [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) and [`.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) | New subscriptions to `ins_pose_topic` and `ins_odom_topic` (production default `/gps_p1/filtered_odom_rtk_fixed`, `nav_msgs/Odometry`). On the first valid message that passes the gate (§6), the orientation is forwarded to `odometry_estimation->set_init_state(T, v)` and the optimizer's gravity reference is fixed for the session. |
 
-The pathway is documented in detail in [`docs/moving_start_initialization.md`](docs/moving_start_initialization.md).
+§10 "Moving-start initialization" carries the full pathway: gate semantics, what the operator sees on success and on refusal, initial-velocity seeding, and how the run behaves through an RTK dropout.
 
 **This change requires an INS to start GLIM.** Pure-LiDAR setups would need to revert §5 — the previous LOOSE / NAIVE pathways are gone. For Hitch Sensor Dome the Atlas Duo is always present, so the trade is unconditional: a working INS in exchange for a moving-start failure mode that no longer exists.
 
@@ -142,7 +146,7 @@ guards before calling `set_init_state`:
 | 0. Solution class | Input arrives on adapter's Fixed-only odometry topic | FusionEngine `kRtkFixed` |
 | 1. Fix status | `NavSatFix.status.status ≥ STATUS_GBAS_FIX` (RTK-class cross-check) | `ins_require_rtk_fixed = true` |
 | 2. Covariance | Known type; finite, non-negative diagonal; max σ ≤ threshold | `0.10 m` |
-| 3. Stability | Last N consecutive INS poses are mutually consistent (translation jitter, `\|q1·q2\|`) | `N=10`, `0.05 m`, `0.999` |
+| 3. Smoothness | Last N consecutive INS poses are *contiguous* and each fits a constant-velocity / constant-angular-rate extrapolation of its predecessors. The thresholds bound the **residual**, not the raw inter-sample delta, so a steady drive or a steady turn passes at any speed — see §10 | `N=10`, residual `0.05 m` / `2.5°`, max gap `0.5 s` |
 
 While any stage is failing, a 2-second wall timer ticks `ins_init_timeout_tick()` and prints a **bold-RED multi-line warning every 10 s** naming the most recent rejection reason and listing remediation steps. After `ins_init_timeout_s = 60 s` the warning escalates to "TIMEOUT" — but **GLIM never auto-aborts**. The operator decides.
 
@@ -156,7 +160,7 @@ ins_require_rtk_fixed             default true
 ins_max_position_stddev           default 0.10
 ins_min_pose_window_samples       default 10
 ins_max_pose_jitter_trans         default 0.05
-ins_min_quat_dot                  default 0.999
+ins_max_attitude_residual_deg     default 2.5   (was ins_min_quat_dot 0.999)
 ins_init_timeout_s                default 60.0
 ```
 
@@ -240,14 +244,187 @@ Three new top-level folders inside `GLIM_plusplus/` that hold integration-only c
 | [`launch/`](launch/) | `hitch_sensor_dome.launch.py` — publishes static TFs from `sensor_dome_tf.yaml`, starts `glim_rosnode` against the project's tuned configs, spawns `foxglove_bridge` for visualization, runs the pre-flight stationarity check. |
 | [`scripts/`](scripts/) | `check_init_stationarity.py` — pre-flight diagnostic; reads first 3 s of `/imu/data` and prints a bold-RED warning if the bag is non-stationary. Now informational only (the C++ INS-init pathway handles moving starts), but useful for diagnosing slow Atlas Duo lock and for CI gating. |
 
-## 10. Documentation added
+## 10. Design notes
 
-Inside [`docs/`](docs/):
+This section is deliberately self-contained. Everything an adopter needs in
+order to operate, debug, or re-derive the fork's behavior is in this file —
+there is no companion document to chase, and no link here points at anything
+outside the repository except published upstream references.
 
-- [`moving_start_initialization.md`](docs/moving_start_initialization.md) — full design of §5 + §6 + §7. Covers the data flow, the RTK gate semantics, sample warning output, sample success output, and how to operate without RTK.
-- [`upstream_merge_2026-07-27.md`](docs/upstream_merge_2026-07-27.md) — the §14 merge record: what was ported from upstream `ucb-roar` + PR #15, what was deliberately skipped, and how each dome-specific behavior was preserved through the conflict resolutions.
-- [`tf_verification_2026-07-27.md`](docs/tf_verification_2026-07-27.md) — end-to-end verification of the P1 and Robin W extrinsics against the 3D design files (SCAD parameters, STL measurements, sensor datasheets), including the yaml → URDF → GLIM-config chain.
-- [`multi_lap_loop_closure.md`](docs/multi_lap_loop_closure.md) — root-cause analysis of the chicken-and-egg between odometry initialization and VGICP convergence basin, the three-layer fix, post-run verification checks (GNSS factor count, pose-graph edges, `T_world_utm.txt` stability, trajectory altitude vs GNSS altitude), and a five-step escalation if the default fix isn't sufficient.
+### Multi-lap z-drift — the chicken-and-egg behind §4
+
+The failure mode: lap 1 maps cleanly, and from lap 2 onward the trajectory
+tilts upward, so a closed circuit ends tens of centimetres to several metres
+above where it started. It is not a scan-matching bug. It is a loop-closure
+*non-event*.
+
+Small per-scan z-errors accumulate monotonically because nothing bounds them.
+Returning to a previously-mapped location should create an implicit
+loop-closure factor and pull the graph flat, but that factor only exists if
+VGICP converges between the lap-1 and lap-2 submaps — and VGICP only converges
+if the accumulated offset is already inside its voxel convergence basin. Past
+that threshold the very mechanism that would correct the drift is the one the
+drift has switched off. Widening the basin alone is not enough either: at some
+drift magnitude any finite basin loses, so the drift also has to be prevented
+from accumulating. That is why §4 changes both a basin knob and a GNSS knob;
+either alone leaves the failure reachable.
+
+**Verifying it after a run.** Four checks, in the order worth doing them:
+
+1. **GNSS factors are being inserted.** Read the machine-parseable
+   `gnss_global summary:` line at exit. `factors_delivered` should grow
+   steadily — one factor per associated submap, *independent* of
+   `min_baseline`, which gates only the one-shot world↔UTM fit and never the
+   emission loop. If the count stays low, GNSS is being filtered: check
+   `gap_unanchored` (RTK dropouts), `yaw_gate_skips`, and
+   `submaps_dropped_no_bracket`, and confirm the driver's reported covariance
+   is not so pessimistic that the RTK gate rejects every sample.
+2. **Loop-closure factors fire when lap 2 begins.** Pose-graph edges between
+   temporally distant submaps should appear in the viewer as the vehicle
+   re-enters mapped ground.
+3. **`T_world_utm.txt` is written once and stays stable.** If the run finishes
+   without it, GNSS was never aligned — compare `min_baseline` against the
+   distance actually travelled before the first RTK lock.
+4. **Trajectory altitude tracks GNSS altitude.** A widening gap between the two
+   over successive laps is the drift, directly plotted.
+
+**Escalation if the shipped defaults are not enough.** Widen
+`submap_voxel_resolution_max` further, or raise `prior_inf_scale` /
+tighten `prior_inf_floor` + `prior_inf_cap` so GNSS carries more weight against
+the LiDAR factor mass. **Do not lower `min_baseline`** — see the correction in
+§4; it adds no factors and degrades the world↔UTM fit.
+
+### Moving-start initialization — the pathway behind §5–§7
+
+Upstream GLIM estimates the world-frame orientation from the accelerometer mean
+over the first `initialization_window_size` seconds, which is only valid if the
+IMU is stationary throughout that window. This fork replaces that with an
+external INS prior taken from the Atlas Duo, so a recording may begin with the
+vehicle already moving.
+
+**Gate semantics.** SLAM starts only when a validated, fresh RTK-**Fixed**
+solution exists. That is a deliberate choice, not a convenience default: the
+map origin has to be globally referenced and the INS attitude validated before
+any factor is built. Until then the init watchdog warns every 10 s with the
+current reject reason, in replay as well as live.
+
+**Why the gate tests smoothness rather than stationarity.** The original
+stability check compared raw inter-sample displacement against
+`ins_max_pose_jitter_trans` (0.05 m). At the Atlas Duo's 10 Hz pose rate that is
+a hard ceiling of 0.5 m/s — it forbids exactly the moving start the feature
+exists to support, because it cannot distinguish INS noise from real vehicle
+translation. Both halves of the gate are now residual-based: a
+constant-velocity residual on position and a constant-angular-rate residual on
+orientation, plus a contiguity requirement. An orientation test of the form
+`|q1·q2| > 0.999` has the same defect in the rotational axis — it silently caps
+yaw rate at roughly 25°/s — so it was replaced rather than kept.
+
+A second, quieter defect lived in that same threshold and is fixed as of
+2026-07-27. For unit quaternions `|q_a·q_b| = cos(θ/2)`, so a dot-product bound
+always admits **twice** the angle a reader would compute from it. `0.999` was
+documented as "2.5°" throughout this fork but actually admitted **5.125°**, and
+the dual-antenna `0.9999` was documented as "0.8°" but admitted **1.621°**. The
+bound is now configured in degrees (`ins_max_attitude_residual_deg`, default
+`2.5`, auto-tightened to `0.8` in dual-antenna mode) and converted to a dot
+product internally, so the unit is carried in the name and this class of error
+cannot recur. The gate is genuinely 2× tighter than in any run recorded before
+that date; if an old bag now fails to initialize on attitude, raise the degree
+value deliberately rather than reverting, because 5.125° was never an intended
+bound.
+
+**Initial velocity.** The INS velocity is used directly rather than
+finite-differenced from pose, which is why `nav_msgs/Odometry` is the preferred
+initialization source. Point One reports this velocity in the platform body
+frame (forward-left-up); GLIM expects it in the world frame, so the fork
+applies `v_world = T.linear() * v_body`. Passing it through unrotated
+initializes the estimator along the wrong world axis by the vehicle's heading —
+at 90° yaw, a 20 m/s forward velocity is injected sideways.
+
+**Through an RTK dropout.** The shipped profile never accepts Float as a GNSS
+factor. Once a session has initialized from Fixed, losing RTK simply makes the
+adapter's Fixed-only topic go quiet and LiDAR–IMU SLAM continues unanchored;
+factors resume when Fixed returns. Loosening the NavSatFix covariance threshold
+cannot bypass the authoritative solution-type check, and is not a supported way
+to start a run without RTK.
+
+**Verifying a moving start.** Confirm the run initialized at non-zero speed and
+that the reported initial velocity magnitude matches the INS. Expect the
+optimizer to take somewhat longer to settle than from a standing start, since
+there is more IMU bias to estimate from a non-zero initial state;
+`scripts/check_init_stationarity.py` remains available as an informational
+pre-flight diagnostic and CI gate, but is no longer a precondition.
+
+### Session-long heading correction — data path in place, factor deferred
+
+The factor bridge already stamps the correct orientation covariance on every
+published pose, and in dual-antenna mode the yaw σ is tight. Upstream
+`gnss_global` ignores covariance entirely and consumes position only, so that
+orientation information currently stops at the bridge. Two ways to use it:
+patch `gnss_global` to add an orientation-with-covariance factor when yaw σ is
+tight (invasive in an upstream module), or add a separate extension module that
+subscribes to the bridge topic, extracts yaw and yaw σ, and contributes a
+yaw-only prior to the global graph (cleanly separated, opt-in via
+`extension_modules`). The data path for either is already in place; the factor
+module is deliberately left to a future iteration.
+
+### TF verification — extrinsics against the 3D design
+
+The P1 and Robin W extrinsics were re-verified end to end after the upstream
+merges, from the OpenSCAD source through to the GLIM configs:
+
+```
+3D files/sensor_dome.scad          (single geometric source)
+        │
+        ▼
+config/sensor_dome_tf.yaml         (single TF source of truth)
+        │  generate_sensor_dome_urdf.py     │ launch: one static_transform_publisher
+        ▼                                   ▼ per YAML entry (tf2_ros)
+GLIM_plusplus/config/sensor_dome.urdf
+        │
+        ▼
+config_sensors.json (T_lidar_imu via urdf_path, lidar_concat aux frames)
+config_gnss_global.json (lever arm)
+```
+
+All checks pass:
+
+| Frame | YAML / URDF value | Design derivation | STL measurement |
+|---|---|---|---|
+| `lidar_front_link` | (0.080, 0, 0.1145), yaw 0° | ring r = 80 mm @ 0° | 4× M6 holes within **0.05 mm** of nominal |
+| `lidar_rear_left_link` | (−0.040, 0.069282, 0.1145), yaw 120° | 80·(cos 120°, sin 120°) = (−40, 69.282) | within **0.05 mm** |
+| `lidar_rear_right_link` | (−0.040, −0.069282, 0.1145), yaw 240° | 80·(cos 240°, sin 240°) | within **0.05 mm** |
+
+The z offset of 0.1145 m follows from the mount surface at 6 mm (L1 plate) +
+133 mm (pillar) = 139 mm against the Atlas Center of Navigation at 6 + 18.5 =
+24.5 mm. Measured unibody height of 151.0 mm confirms 139 mm as the as-printed
+value. Yaw-only rotations are valid because the Seyond driver is pinned to
+`coordinate_mode:=3` (REP-103), which remaps the native Robin W axes at the
+driver.
+
+For the IMU: the Atlas assembly drawing places the Center of Navigation at
+(68.7, 47.8) mm from the hole-pattern datum and 18.5 mm above the mounting
+surface, and the SCAD positions the part so the CoN lands on the design origin.
+The four M4 mount features measure within 0.1 mm of their SCAD positions over a
+220 × 100 mm span. `enable_lever_arm` is `false` and `urdf_gnss_frame` empty,
+which is correct for a tightly-coupled Atlas Duo that already outputs pose at
+the CoN. `sensor_dome.urdf` is byte-identical to a fresh regeneration from the
+YAML, so no second copy can drift.
+
+Two standing caveats. The TF treats `imu_link` axes as vehicle-aligned; the
+Atlas nav-frame alignment to its mechanical orientation is a Point One output
+configuration and is not derivable from the 3D files (assumed correct, and
+validated by prior on-vehicle runs). And `gnss_antenna_primary_link` z = 0.273
+is a nominal stand height that should be measured per installation — it is
+documentation-only for GLIM, since the lever arm is disabled.
+
+### Upstream merge record
+
+The §14 summary below is the merge record. It states what was ported from
+`ucb-roar` and PR #15, what was deliberately skipped, and how each dome-specific
+behavior survived conflict resolution. Upstream sources are linked directly:
+[`koide3/glim`](https://github.com/koide3/glim) for the base project and
+[`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus) for the
+hardening branch.
 
 ## 11. What was NOT changed
 
@@ -287,8 +464,6 @@ Important — so adopters know what stayed identical to upstream and can rely on
 | `config/sensor_dome.urdf` | new (generated) | §8 |
 | `launch/hitch_sensor_dome.launch.py` | new | §8 |
 | `scripts/check_init_stationarity.py` | new | §8 |
-| `docs/moving_start_initialization.md` | new | §9 |
-| `docs/multi_lap_loop_closure.md` | new | §9 |
 | All other upstream files | unchanged | §10 |
 
 
@@ -365,7 +540,9 @@ still an OPEN PR at merge time). Every dome adaptation in §1–§13 is
 preserved: P1 GNSS stays the GNSS source with its own bridge contract
 (`/gnss/pose_rtk_only`, `PoseWithCovarianceStamped`), Robin W stays the
 LiDAR, and the Naive/INS-driven initialization is unchanged. Full merge
-record: [`docs/upstream_merge_2026-07-27.md`](docs/upstream_merge_2026-07-27.md).
+record: §10 "Upstream merge record" and the per-area detail below. Upstream
+sources: [`koide3/glim`](https://github.com/koide3/glim) and
+[`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus).
 
 > The shipped production path now also starts from
 > `/gps_p1/filtered_odom_rtk_fixed`. The local bridge retains its
@@ -375,7 +552,7 @@ record: [`docs/upstream_merge_2026-07-27.md`](docs/upstream_merge_2026-07-27.md)
 **Per-point time and multi-LiDAR merge — the headline change.** Aux sweep
 selection no longer trusts header time. Where an *absolute* per-point time
 axis is decodable, an aux sweep is accepted only when its point-time
-endpoints match the primary's within `luminar_time_threshold` (10 ms);
+endpoints match the primary's within `sweep_time_threshold` (10 ms);
 header time survives only as a tie-break and as a scheduling hint
 (`aux_match_time_offsets`). Residual clock corrections are a separate,
 explicitly-measured knob (`aux_point_time_offsets`) applied to point times,
@@ -387,7 +564,7 @@ by `future_sweep_wait_timeout`. Where no absolute axis exists, the reader
 instead holds each primary until every aux header passes it (PR #15), which
 fixes the "always merge the *previous* side sweep" bias of naive
 header-nearest matching. New `lidar_concat` keys in `config_sensors.json`:
-`luminar_time_threshold`, `future_sweep_wait_timeout`,
+`sweep_time_threshold`, `future_sweep_wait_timeout`,
 `two_pass_point_time_join`, `aux_match_time_offsets`,
 `aux_point_time_offsets` (all zero on the PTP-locked dome).
 
@@ -481,8 +658,8 @@ platform's Robin W topics/frames; everything overridable via CLI), and
 `scripts/export_glim_dump_to_pcd.py` exports a dump to PCD.
 
 **TF verification**: the P1 and Robin W extrinsics were re-verified against
-the 3D design after the merges — see
-[`docs/tf_verification_2026-07-27.md`](docs/tf_verification_2026-07-27.md).
+the 3D design after the merges, from the OpenSCAD source through the URDF to
+the GLIM configs. Results and caveats are tabulated in §10 "TF verification".
 
 ## Quick start
 
@@ -549,7 +726,7 @@ GLIM is the work of:
 - **Iridescence** — Kenji Koide. <https://github.com/koide3/iridescence>
 - **GTSAM** — Frank Dellaert and the Georgia Tech Borg Lab. <https://github.com/borglab/gtsam>
 
-The integration work in `GLIM_plusplus/{config, launch, scripts, docs}/` and the modifications detailed in §1 – §7 are part of the **Hitch Sensor Dome** project, designed and maintained by Dr. Allen Y. Yang (Hitch Interactive · University of California, Berkeley). Implementation testing by the **Berkeley AI Racing Tech** team (see [`../README.md`](../README.md) Credits).
+The integration work in `GLIM_plusplus/{config, launch, scripts}/` and the modifications detailed in §1 – §7 are part of the **Hitch Sensor Dome** project, designed and maintained by Dr. Allen Y. Yang (Hitch Interactive · University of California, Berkeley). Implementation testing by the **Berkeley AI Racing Tech** team (see [`../README.md`](../README.md) Credits).
 
 ## License
 

@@ -211,7 +211,7 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "aux_frames": aux_frames,
             "buffer_size": args.concat_buffer_size,
             "time_threshold": args.header_time_threshold,
-            "luminar_time_threshold": args.point_time_threshold,
+            "sweep_time_threshold": args.point_time_threshold,
             "future_sweep_wait_timeout": args.future_sweep_wait_timeout,
             # Always attempt the deterministic planner. Robin W/Hesai absolute
             # seconds, Livox numeric epoch ns, and raw epoch-ns carriers use it.

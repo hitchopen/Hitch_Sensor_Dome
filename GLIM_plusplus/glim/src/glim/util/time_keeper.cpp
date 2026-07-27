@@ -93,7 +93,7 @@ bool TimeKeeper::process(const glim::RawPoints::Ptr& points) {
   // after replace_points_stamp has (for absolute-time clouds) overwritten the
   // frame stamp with the raw min point time. Applying it earlier — as the ROS
   // layer used to, before process() — let that overwrite silently discard it
-  // for Luminar/absolute clouds. Uniform application covers every stamp source
+  // for absolute-time clouds. Uniform application covers every stamp source
   // (pseudo-times, relative, absolute).
   points->stamp += point_time_offset;
 

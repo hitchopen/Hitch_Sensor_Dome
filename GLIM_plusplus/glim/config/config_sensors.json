@@ -68,8 +68,8 @@
     //
     // flip_points_y=false because the seyond driver is configured with
     // coordinate_mode:=3 (REP-103, X=fwd / Y=left / Z=up) — see
-    // recording/sensor_config.yaml. The Luminar Iris workflow needed the
-    // flip because Luminar emits SAE Y-right; Robin W in mode 3 already
+    // recording/sensor_config.yaml. The upstream Iris workflow needed the
+    // flip because that sensor emits SAE Y-right; Robin W in mode 3 already
     // matches ROS conventions.
     "global_shutter_lidar": false,
     // Robin W ROS contract: numeric IEEE-754 FLOAT64 Unix seconds. This flag
@@ -99,7 +99,7 @@
       1.0
     ],
     // PointCloud2 field names — Robin W emits standard ROS field names.
-    // Luminar uses "reflectance"/"line_index"; Seyond uses the defaults.
+    // (The upstream Iris driver used "reflectance"/"line_index".)
     "intensity_field": "intensity",
     "ring_field": "ring",
     // Fail closed if a modified driver bypasses the pinned build in
@@ -208,7 +208,7 @@
     // Production therefore requires every aux below. Until this measured gate
     // admits both rears, scans are skipped and the run aborts after the failure
     // budget instead of silently producing a 120-degree front-only map.
-    "luminar_time_threshold": 0.01,
+    "sweep_time_threshold": 0.01,
     // Offline readers (glim_rosbag): bag-time bound on holding a queued
     // primary for a future aux sweep. Past this, the primary is released for a
     // merge attempt. Strict mode below skips an incomplete scan and eventually
@@ -220,11 +220,15 @@
     "future_sweep_wait_timeout": 0.15,
     // Offline readers: index absolute point-time ranges in a first bag pass
     // and plan every merge deterministically (min endpoint-range delta within
-    // luminar_time_threshold; header only as tie-break). Unmatched primaries
-    // carry a recorded miss reason into the strict skip/abort path. Engages on
-    // Hesai/Livox and explicit epoch-ns carriers can use this planner. Robin
-    // W is scan-relative, so it deliberately falls back to the streaming
-    // future-header watermark.
+    // sweep_time_threshold; header only as tie-break). Unmatched primaries
+    // carry a recorded miss reason into the strict skip/abort path.
+    // ENGAGES ON ROBIN W: this file pins the absolute contract above
+    // (expected_time_is_absolute: true, expected_time_datatype: 8,
+    // perpoint_relative_time: false), i.e. FLOAT64 absolute Unix seconds,
+    // which the planner decodes. It also engages for Hesai/Livox and explicit
+    // epoch-ns carriers. Only a genuinely scan-RELATIVE stream (e.g. a driver
+    // patched per PTP_sync/seyond_robin_w_legacy_relative_time.patch) fails
+    // the decode and falls back to the streaming future-header watermark.
     "two_pass_point_time_join": true,
     // Header-only acquisition-phase offsets, used only by the generic
     // fallback and point-time tie-break. They never modify per-point
