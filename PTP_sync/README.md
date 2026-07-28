@@ -1,22 +1,27 @@
-# Sensor Recording System: Point One Nav Atlas Duo + Seyond Robin W LiDAR + RouteCAM Cameras
+# Sensor Recording System: Point One Nav Atlas Duo + Seyond Robin W LiDARs
 
-Installation and configuration guide for a high-performance GNSS / IMU / LiDAR / camera data recording system running on Ubuntu 22.04 with ROS 2 Humble or Ubuntu 24.04 with ROS 2 Jazzy, optionally on a PREEMPT_RT real-time kernel.
+Installation and configuration guide for a high-performance GNSS / IMU / LiDAR
+recording system running on Ubuntu 22.04 with ROS 2 Humble or Ubuntu 24.04 with
+ROS 2 Jazzy, optionally on a PREEMPT_RT real-time kernel. RouteCAM setup is an
+optional extension and is not required by the recorder, GICP++, or GLIM++.
 
 **Target Hardware:**
 - Ubuntu 22.04 or 24.04 LTS workstation (tested on Lenovo ThinkPad P1 Gen 6, Intel i9-13900H)
 - Point One Nav Atlas Duo (GNSS / INS, Ethernet-only)
 - Up to 3× Seyond Robin W directional LiDARs
-- 4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision cameras (PoE, IEEE 1588 PTP, 2MP global shutter)
+- Optional: 0–4× e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision cameras
 
-**Setup flow.** Five numbered scripts in this folder, run in order. Each script handles one logical step, has its own self-test at the end, and tells you the next script to run when it finishes.
+**Setup flow.** Run scripts 1–4 for the supported camera-free P1 + LiDAR
+pipeline. Run script 5 only when RouteCAMs are physically installed. Each
+script handles one logical step and has its own self-test.
 
 | # | Script | What it does |
 |---|--------|--------------|
 | 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt prerequisites, RT scheduling permissions, kernel tuning, ROS 2 Humble/Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | Host NIC static IP, hardware-timestamping detection, RUTM50 reachability |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd (NMEA over TCP), chrony, ptp4l grandmaster, phc2sys, fusion_engine_driver (TCP) |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd (NMEA over TCP), chrony, ptp4l grandmaster, phc2sys, Point One host tools |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave enable + Seyond ROS 2 driver |
-| 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave enable + Aravis (Tier 2 only) |
+| 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | **Optional:** RouteCAM PTP slave enable + Aravis (Tier 2 only) |
 
 A one-time per-LiDAR provisioning step lives in [`provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) — see Section 4.
 
@@ -77,7 +82,7 @@ What it installs:
 - **apt prerequisites:** `build-essential`, `cmake`, `git`, `linuxptp`, `chrony`, `gpsd`, `pps-tools`, `tcpdump`, `ethtool`, `libyaml-cpp-dev`, Python tooling.
 - **RT scheduling group + limits:** creates the `realtime` group, adds your user, writes `/etc/security/limits.d/99-realtime.conf` granting `rtprio 99` and `memlock unlimited` to that group. Whether or not you're on the RT kernel, these limits are required for the PTP daemons to run at real-time priority.
 - **Kernel `sysctl` tuning:** large UDP buffers (`net.core.rmem_max=32 MiB`) and `vm.swappiness=10` for the high-bandwidth LiDAR / camera streams.
-- **ROS 2 Humble/Jazzy:** desktop + dev tools + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/default storage plugins. Sources `/opt/ros/$ROS_DISTRO/setup.bash` from `~/.bashrc`.
+- **ROS 2 Humble/Jazzy:** `ros-base` + dev tools + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/default storage plugins. The default setup does not install camera packages; the optional script 5 provisions those separately. Sources `/opt/ros/$ROS_DISTRO/setup.bash` from `~/.bashrc`.
 - **`tcpdump` cap:** `cap_net_raw+ep` so the recorder can sniff sensor UDP without `sudo`.
 
 The script's self-test at the end verifies the RT kernel banner, group membership, the `sysctl` value, and the ROS 2 install.
@@ -198,7 +203,7 @@ Same across Tier 1 and Tier 2. Every static device sits below `.100`, so the RUT
 | .30 | Atlas Duo INS Ethernet (static, NTRIP RTK only) | ✓ | ✓ |
 | .100 – .249 | RUTM50 DHCP pool — factory default, untouched | ✓ | ✓ |
 
-> **Why `.5` and `.30` are pinned to specific addresses.** Static-lease the PC at .5 and the Atlas Duo at .30 via the RUTM50's Network → LAN → Static Leases page (bind to MAC). This way both devices stay at known IPs across reboots without any device-side static config — the RUTM50 always hands them the same address. See the project root README's network section for the full Static Leases procedure.
+> **Why `.5` and `.30` are pinned to specific addresses.** Static-lease the PC at .5 and the Atlas Duo at .30 via the RUTM50's Network → LAN → Static Leases page (bind to MAC). This way both devices stay at known IPs across reboots without any device-side static config — the RUTM50 always hands them the same address. Procedure: RUTM50 web UI → Network → LAN → Static Leases → Add, then bind each device's MAC to the address you want it to keep. Reboot both devices and confirm they come back on the same IPs before running any of the scripts here — every step below assumes those addresses are stable.
 
 **Atlas Duo Ethernet (time + data + NTRIP).** The Atlas Duo's Ethernet port is the only interface it exposes for time and data — its hardware does not have a BNC PPS output or a USB serial data output. The same cable that carries FusionEngine (TCP 30201) and NMEA (TCP 30200) to the host also pulls RTK NTRIP corrections (RTCM3) from your caster (Trimble VRS Now, your local base, etc.). Configure via the Atlas web UI: static IP `192.168.1.30` (or DHCP + reservation), gateway `192.168.1.1`, DNS `192.168.1.1`, and NTRIP client pointed at your caster. The time-sync chain (gpsd → chrony → ptp4l) all rides on this same Ethernet path — see §3 for the host-side configuration.
 
@@ -293,7 +298,10 @@ After all three positions show up in `serial_inventory.yaml`, the network is ful
 
 ## Section 3: PTP Sync from INS to PC
 
-The Point One Nav Atlas Duo serves NMEA over TCP to discipline the host's `CLOCK_REALTIME`, while FusionEngine over TCP carries pose / IMU / GPSFix / odometry to the ROS 2 driver. The host then acts as the PTP grandmaster on the sensor LAN — Sections 4 and 5 set up the sensor *slaves* that synchronize to it.
+The Point One Nav Atlas Duo serves NMEA over TCP to discipline the host's
+`CLOCK_REALTIME`. Its FusionEngine stream is consumed separately by the
+deployment's native-message ROS driver. The host then acts as the PTP
+grandmaster on the sensor LAN; Sections 4 and 5 configure the sensor slaves.
 
 ```
 ┌─────────────────────────┐
@@ -315,7 +323,7 @@ The Point One Nav Atlas Duo serves NMEA over TCP to discipline the host's `CLOCK
 │  chrony ← SHM → CLOCK_REALTIME (~10–100 ms to GPS)│
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → PTP announce on Ethernet       │
-│  fusion_engine_driver: TCP 30201 → /pose /imu /…   │
+│  native Atlas driver: TCP 30201 → native ROS data   │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -344,8 +352,14 @@ What it configures:
 - **`ptp4l` grandmaster:** announces on the sensor NIC. Because the host clock is no longer disciplined to <100 ns GPS, the script defaults `clockClass` to **13** (application-specific, locked-to-internal-reference) instead of 6 (locked to primary GPS reference). Cross-sensor PTP sync remains tight; the change is just an honest advertisement to PTP slaves about the absolute-time pedigree.
 - **`phc2sys`:** copies `CLOCK_REALTIME` into the NIC PHC (only relevant for hardware timestamping).
 - **systemd:** enables and starts `gpsd`, `chrony`, and `ptp4l-grandmaster`; `phc2sys-grandmaster` is enabled only when the NIC supports hardware timestamping. The chain is live without a reboot.
-- **fusion_engine_driver:** clones and `colcon build`s the Point One Nav ROS 2 driver into `~/ros2_ws/`. Applies the GCC 14 `<cstdint>` patch. Driver invocation uses `connection_type:=tcp` with the Atlas Duo IP (no longer `connection_type:=tty`).
 - **Point One host tools:** `p1-host-tools/` cloned to `$HOME`, `pip install fusion-engine-client[all]`.
+
+The script deliberately does **not** install Point One's public
+`ros2-fusion-engine-driver`. At the pinned upstream revision it publishes
+host-arrival-stamped `geometry_msgs/msg/PoseStamped`; Hitch's adapter requires
+the deployment-provided `fusion_engine_msgs/msg/Pose` stream with device time,
+solution type, and covariance. Start that native-message driver separately
+before the adapter and recorder.
 
 ### 3.2 Manual verification
 
@@ -373,10 +387,9 @@ chronyc sources -v
 chronyc tracking
 # "Reference ID" should show NMEA, not an NTP server IP
 
-# PTP grandmaster
-sudo journalctl -u ptp4l-grandmaster -f
-# Look for: "assuming the grand master role"
-# master offset values should be < 1000 ns (hardware) or < 50 µs (software)
+# Setup-time PTP grandmaster diagnostic
+sudo "$(command -v pmc)" -u -b 0 "GET PORT_DATA_SET"
+# At least one local portState must be MASTER.
 
 # PHC sync (hardware timestamping only)
 sudo journalctl -u phc2sys-grandmaster -f
@@ -392,7 +405,12 @@ sudo systemctl status phc2sys-grandmaster
 
 ## Section 4: PTP Sync from PC to LiDARs
 
-Configures the 3× Seyond Robin W LiDARs as PTP slaves of the grandmaster from Section 3, and installs the Seyond ROS 2 driver. Assumes the **one-time network provisioning** in [§2.7](#27-one-time-per-lidar-network-provisioning) has already moved each Robin W from its factory IP `172.168.1.10` to its dome IP `192.168.1.10` / `.11` / `.12`. If `4_setup_lidar_ptp.sh` cannot ping the LiDARs at those addresses, run §2.7 first.
+Configures one to three Seyond Robin W LiDARs as PTP slaves of the grandmaster
+from Section 3 and installs the Seyond ROS 2 driver. Use `--ips` to name the
+units fitted to this rig. GICP supports the front primary alone or with optional
+rear units; GLIM requires all three. Assumes the **one-time network
+provisioning** in [§2.7](#27-one-time-per-lidar-network-provisioning) has moved
+each fitted Robin W from its factory IP to its assigned dome IP.
 
 ### 4.1 Run the LiDAR PTP-sync script
 
@@ -424,7 +442,10 @@ Expected post-sync accuracy:
 
 ## Section 5: PTP Sync from PC to Cameras
 
-> **Tier 2 only.** The cameras require PoE and benefit from the Planet WGS-6325-8UP2X boundary clock — see Section 2.2. If you're running a Tier 1 LiDAR-only build, skip this entire section.
+> **Optional, Tier 2 only.** If no cameras are installed, stop after Section 4:
+> the recorder, GICP++, and GLIM++ are fully supported without this section.
+> Installed cameras require PoE and benefit from the Planet
+> WGS-6325-8UP2X boundary clock; see Section 2.2.
 
 ### 5.1 Run the camera PTP-sync script
 
@@ -455,29 +476,52 @@ Expected post-sync accuracy through the Planet WGS-6325-8UP2X boundary clock:
 
 The supported recorder is
 [`../recording/sensor_recorder.py`](../recording/sensor_recorder.py). It
-launches the configured ROS 2 sensor drivers, verifies chrony/PTP and the RTK
-gate, records an MCAP rosbag, and starts the Foxglove bridge. It runs
-unprivileged; only the optional `pmc` management query uses `sudo -n`.
+launches the configured ROS 2 LiDAR/camera drivers, verifies chrony plus the
+actual sensor timestamps and Atlas adapter gate, records an MCAP rosbag, and
+starts the Foxglove bridge. It runs unprivileged and does not call `pmc`. Its
+hard runtime gate subscribes directly to every selected LiDAR/camera ROS topic
+before bag creation and measures each `header.stamp` against host
+`CLOCK_REALTIME`, including age stability and drift. The setup scripts still
+use interactive `sudo pmc` only as an installation diagnostic.
 
-For a production GLIM++ bag, start the Atlas adapter separately with exactly
-one deployment datum. The recorder does not launch it:
+Responsibility is intentionally one-way: **this `PTP_sync/` directory
+configures and disciplines all clocks; the recorder only verifies the resulting
+state.** A failed recording preflight never enables PTP, adjusts a clock, or
+restarts a synchronization service. Correct the fault here, then rerun the
+recorder.
+
+For a production GLIM++ bag, start the deployment's native-message Atlas driver
+first. It must publish `fusion_engine_msgs/msg/Pose` on
+`/atlas/pose_filtered` and `sensor_msgs/msg/Imu` on
+`/atlas/imu_calibrated`; the generic `fusion_engine_ros_driver` does not retain
+the native solution-class/covariance contract required by the adapter. Then
+start the adapter with exactly one deployment datum. The recorder launches
+neither Atlas component:
 
 ```bash
-# Terminal 1: normalized Atlas streams and authoritative Fixed-only odometry.
+# Terminal 1: launch the deployment's Atlas native-message ROS driver, then:
+ros2 topic type /atlas/pose_filtered
+ros2 topic type /atlas/imu_calibrated
+
+# Terminal 2: normalized Atlas streams and authoritative Fixed-only odometry.
 ros2 launch adapter adapter.launch.py \
+  use_sim_time:=false \
   use_p1_imu_pcap:=false \
+  pose_input_topic:=/atlas/pose_filtered \
+  imu_input_topic:=/atlas/imu_calibrated \
   local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
 
-# Terminal 2: detect sensors, verify sync/RTK, and record.
+# Terminal 3: enforce the production GLIM profile and record.
 cd /path/to/Hitch_Sensor_Dome
-python3 recording/sensor_recorder.py
+python3 recording/sensor_recorder.py --profile glim
 ```
 
 The output is `recording/data/session_<timestamp>/rosbag2/*.mcap` plus logs and
-`session_metadata.json`. The bag includes the three Robin W clouds, camera
-streams, `/imu/data`, `/gps_p1/fix`,
+`session_metadata.json`. A GLIM-profile bag includes the three Robin W clouds,
+`/gps_p1/imu`, `/gps_p1/fix`,
 `/gps_p1/filtered_odom_rtk_fixed`, TF, and diagnostics when their publishers
-are available. See [`../recording/README.md`](../recording/README.md) and
+are available. Camera streams are included only when cameras are detected and
+selected. See [`../recording/README.md`](../recording/README.md) and
 [`../recording/sensor_config.yaml`](../recording/sensor_config.yaml) for the
 complete runtime and configuration reference.
 
@@ -548,7 +592,10 @@ To select the kernel at boot, choose **Advanced options for Ubuntu** in the GRUB
 
 ### D. Troubleshooting
 
-**PTP not syncing (large master offset):** Verify the interface name in the `ptp4l` config matches your actual interface. Confirm PTP is enabled on each Robin W. Check cable connections.
+**PTP not syncing:** Verify the interface name in the `ptp4l` config, then run
+`sudo "$(command -v pmc)" -u -b 0 "GET PORT_DATA_SET"` and require a local
+`MASTER` state.
+Confirm PTP is enabled on each Robin W and check the cable path.
 
 **chronyc shows NTP as primary (not NMEA):** gpsd may not be reaching the Atlas Duo over TCP. Verify `ping 192.168.1.30` works, and that the Atlas Duo is set to "Start Navigating" in its web UI (without the navigation engine running, no NMEA is emitted). Run `sudo systemctl status gpsd` and `gpsmon`. To raw-test the NMEA stream independently of gpsd: `nc -w 5 192.168.1.30 30200 | head`.
 

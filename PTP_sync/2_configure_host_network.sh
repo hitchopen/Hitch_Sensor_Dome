@@ -18,7 +18,7 @@
 #   ./2_configure_host_network.sh    ← you are here
 #   ./3_setup_ins_to_pc_sync.sh
 #   ./4_setup_lidar_ptp.sh
-#   ./5_setup_camera_ptp.sh
+#   ./5_setup_camera_ptp.sh          (optional; cameras only)
 #
 # What it does:
 #   1. Reads ETH_IFACE + HOST_IP from network_config.yaml

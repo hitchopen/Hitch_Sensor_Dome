@@ -15,8 +15,8 @@
 #       reachability ping of the RUTM50 router.
 #
 #   3_setup_ins_to_pc_sync.sh     (was §5–§9 + §11 of this)
-#       gpsd, chrony with PPS+NMEA, ptp4l grandmaster, phc2sys,
-#       fusion_engine_driver + Point One host tools.
+#       gpsd, chrony with NMEA, ptp4l grandmaster, phc2sys,
+#       Point One host tools (native Atlas ROS driver is deployment-provided).
 #
 # Run them in order:
 #

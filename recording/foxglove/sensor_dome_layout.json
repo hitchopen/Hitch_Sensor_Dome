@@ -53,7 +53,7 @@
           "pointSize": 2,
           "pointShape": "circle"
         },
-        "/imu/data": { "visible": true },
+        "/gps_p1/imu": { "visible": true },
         "/pose": { "visible": true }
       },
       "publish": { "type": "point", "poseTopic": "/move_base_simple/goal" },
@@ -115,10 +115,10 @@
     },
     "Plot!imu": {
       "paths": [
-        { "value": "/imu/data.linear_acceleration.x", "enabled": true, "label": "ax" },
-        { "value": "/imu/data.linear_acceleration.y", "enabled": true, "label": "ay" },
-        { "value": "/imu/data.linear_acceleration.z", "enabled": true, "label": "az" },
-        { "value": "/imu/data.angular_velocity.z",   "enabled": true, "label": "yaw rate" }
+        { "value": "/gps_p1/imu.linear_acceleration.x", "enabled": true, "label": "ax" },
+        { "value": "/gps_p1/imu.linear_acceleration.y", "enabled": true, "label": "ay" },
+        { "value": "/gps_p1/imu.linear_acceleration.z", "enabled": true, "label": "az" },
+        { "value": "/gps_p1/imu.angular_velocity.z",   "enabled": true, "label": "yaw rate" }
       ],
       "showXAxisLabels": true,
       "showYAxisLabels": true,

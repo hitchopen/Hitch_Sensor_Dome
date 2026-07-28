@@ -402,7 +402,9 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "extension_modules": ["libgnss_global.so"],
             "imu_topic": args.imu_topic,
             "points_topic": args.points_topic,
-            "image_topic": "/image",
+            # The production mapping profile is LiDAR + Atlas only. An empty
+            # topic makes camera-free operation explicit in live and bag paths.
+            "image_topic": "",
             "ins_pose_topic": "",
             "ins_odom_topic": args.ins_odom_topic,
             "ins_fix_topic": args.ins_fix_topic,

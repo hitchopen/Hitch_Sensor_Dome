@@ -17,7 +17,58 @@
 - 3× Seyond Robin W LiDAR —— 单台 120° 水平视场，按 120° 间隔排布，实现 360° 环视
 - 1× Point One Nav Atlas Duo INS —— 居中安装，导航中心 (CoN) 与几何原点重合
 - 1× **Point One SP1** 多频段 (L1/L2/L5) GNSS 天线 —— 安装在 ArduSimple 测量支架上，置于 CoN 正上方
-- 4× e-con RouteCAM_P_CU25_CXLC_IP67 摄像头 —— 前向立体对 (110 mm 基线) + 后向对称对
+- 可选 0–4× e-con RouteCAM_P_CU25_CXLC_IP67 摄像头 —— 前向立体对 (110 mm 基线) + 后向对称对；不参与 GLIM/GICP
+
+默认 GLIM++ 编译会在编译阶段排除摄像头数据入口，并且不查找或链接
+OpenCV、`cv_bridge`、`image_transport`。摄像头仅是可选记录载荷；启用上游兼容
+的图像入口需要显式安装依赖并开启编译开关，详见
+[`GLIM_plusplus/README_zh.md`](GLIM_plusplus/README_zh.md#编译依赖)。
+
+### 启用可选摄像头
+
+摄像头录制与 GLIM 图像入口是两个独立的可选功能：
+
+1. 配置 RouteCAM 硬件、PTP、Aravis 驱动和 ROS 摄像头软件包。脚本 5 不属于
+   默认 P1 + LiDAR 部署流程：
+
+   ```bash
+   cd PTP_sync
+   ./5_setup_camera_ptp.sh --eth <传感器网卡>
+   cd ..
+   ```
+
+2. 如需录制摄像头，请在
+   [`recording/sensor_config.yaml`](recording/sensor_config.yaml) 中填写真实 IP、
+   frame 和 topic，然后运行普通录制器。录制器会检测所有可达摄像头并让操作员
+   选择；仅录制图像不需要重新编译 GLIM：
+
+   ```bash
+   python3 recording/sensor_recorder.py --profile glim
+   ```
+
+3. 如需编译与上游兼容的 GLIM 图像入口，必须同时启用核心与 ROS bridge 两层。
+   从无摄像头版本切换时需要清理 CMake cache：
+
+   ```bash
+   sudo apt install -y libopencv-dev
+   colcon build --packages-select glim glim_ext glim_ros --symlink-install \
+     --cmake-clean-cache \
+     --cmake-args -DCMAKE_BUILD_TYPE=Release \
+                  -DBUILD_WITH_OPENCV=ON \
+                  -DBUILD_WITH_CV_BRIDGE=ON
+   source install/setup.bash
+   ```
+
+4. 在
+   [`GLIM_plusplus/glim/config/config_ros.json`](GLIM_plusplus/glim/config/config_ros.json)
+   中把 `glim_ros.image_topic` 设置为一个已发布的
+   `sensor_msgs/msg/Image` topic，例如 `/cam_front_left/image_raw`，并启用应用
+   所需的图像消费扩展。如果使用生成的单次运行 profile，应修改该 profile
+   实际使用的 `config_ros.json`。仓库默认建图模块不消费图像，因此只开启
+   bridge 不会改变地图估计。
+
+GLIM 继承的接口目前只接受一个已配置图像 topic；录制器可以同时采集四台摄像头。
+GICP++ 在任何编译配置下都不接收摄像头数据，始终只使用 LiDAR。
 
 > **GNSS 天线说明。** Atlas Duo 的 GNSS 端口为有源 LNA 提供 **3.3 V DC 偏置** (见 [Point One Atlas User Guide](https://pointonenav.com/wp-content/uploads/2024/06/Atlas-User-Guide.pdf))。[Point One SP1](https://store.pointonenav.com/products/sp1-high-precision-gnss-antenna) 出厂即与该电源匹配，是推荐默认选择。BOM 中所用 ArduSimple "Magnetic Stand for Survey GNSS Antenna" 采用 **5/8"-11 UNC** 螺纹（测量杆的标准接口），各候选天线与该支架的螺纹匹配情况如下表所示。
 >
@@ -98,7 +149,7 @@ config/              项目级配置 (单一信息源)
 PTP_sync/                    一次性的主机 + 传感器时间同步搭建
   1_install_packages.sh      apt 依赖、RT 权限、ROS 2 Humble/Jazzy
   2_configure_host_network.sh 主机 NIC 静态 IP、硬件时间戳检测
-  3_setup_ins_to_pc_sync.sh   gpsd + chrony + ptp4l GM + phc2sys + p1 驱动
+  3_setup_ins_to_pc_sync.sh   gpsd + chrony + ptp4l GM + phc2sys + Point One 主机工具
   4_setup_lidar_ptp.sh       Robin W PTP slave + Seyond ROS 2 驱动
   5_setup_camera_ptp.sh      RouteCAM PTP slave + Aravis（仅 Tier 2）
   provision_robin_w_multiunit.sh 每台 LiDAR 一次性 IP 重分配 + UDP 端口
@@ -160,13 +211,13 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
 
 完成穹顶组装与传感器接线之后，由两个目录把硬件转化为可用数据集：
 
-1. **一次性搭建** —— 运行 [`PTP_sync/`](PTP_sync/) 中的脚本，把主机配置成 GPS 校准的 PTP 主时钟，并在每台 LiDAR 与每台摄像头上启用 IEEE 1588 PTP。完成后所有传感器共享亚微秒级的 GPS 时间基准。
+1. **一次性搭建** —— 运行 [`PTP_sync/`](PTP_sync/) 中的脚本，把主机配置成 GPS 校准的 PTP 主时钟，并在每台 LiDAR 与每台摄像头上启用 IEEE 1588 PTP。PTP 保证传感器之间的相对同步；主机绝对时间精度受 Atlas NMEA over TCP 限制，通常为 10–100 ms。
 
-2. **逐次采集** —— 同时运行 [`adapter/`](adapter/) 与 [`recording/sensor_recorder.py`](recording/sensor_recorder.py)。录制器自动检测已连接的传感器、验证时钟同步链路和 adapter 的 Fixed-only 里程计，并把 GNSS / IMU / LiDAR / 摄像头数据流录制成 Foxglove 原生的 MCAP rosbag。录制器不会代替你启动 adapter。
+2. **逐次采集** —— 先启动部署使用的 Atlas 原生消息驱动与 [`adapter/`](adapter/)，再运行 [`recording/sensor_recorder.py`](recording/sensor_recorder.py)。录制器要求实时 `/gps_p1/imu`，并在同一段 ROS 预检窗口内独立比较每台 LiDAR/相机的 `header.stamp` 与主机 `CLOCK_REALTIME`；生产 GLIM 建图还会硬性验证三台 LiDAR、Fixed-only 里程计和已完成调试的双天线航向。所有时钟配置与同步只由 `PTP_sync/` 负责；录制器只验证结果，不会改变时钟状态，也不会代替你启动 Atlas 驱动或 adapter。
 
 ```bash
-# 在 PTP_sync/ 已经跑过一次之后：
-python3 recording/sensor_recorder.py
+# 在 PTP_sync/ 已经跑过一次，Atlas 原生消息驱动和 adapter 已启动之后：
+python3 recording/sensor_recorder.py --profile glim
 # 然后在 Foxglove 中：Open Connection → ws://localhost:8765
 #                     Layouts → Import → recording/foxglove/sensor_dome_layout.json
 ```
@@ -177,7 +228,7 @@ python3 recording/sensor_recorder.py
 
 针对 SLAM 与 3D 建图，本项目搭载 **GLIM++**，一个对 **GLIM** 做了深度修改的 fork —— 上游 *Graph-based LiDAR-Inertial Mapping* 由 AIST 的 Kenji Koide 等人开发，仓库地址 <https://github.com/koide3/glim>。本 fork 位于 [`GLIM_plusplus/`](GLIM_plusplus/)（双加号意在提示这并非原版 GLIM）。在高层视角下，GLIM++ 与上游的差异分为八个类别：
 
-1. **传感器适配** —— topic、frame、字段名开箱即为 Hitch Sensor Dome（3× Robin W + Atlas Duo + 4× RouteCAM）配置：`/imu/data`、`/robin_w_*/points`，frame 采用 `config/sensor_dome_tf.yaml` 中的 `imu_link`/`lidar_front_link`。
+1. **传感器适配** —— topic、frame、字段名开箱即为 Hitch Sensor Dome 的 P1/Atlas + 3× Robin W 建图配置；RouteCAM 为可选录制载荷，不参与 GLIM 或 GICP。主要话题为 `/gps_p1/imu`、`/robin_w_*/points`，frame 采用 `config/sensor_dome_tf.yaml` 中的 `imu_link`/`lidar_front_link`。
 2. **车辆无关主体坐标系** —— GLIM++ 的地图锚定在 `imu_link`（Atlas Duo 导航中心），可跨车辆平台复用。下游定位节点把位姿报告在 `base_link`（ROS 标准车体坐标系）下，由 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中的 `imu_link → base_link` 静态变换桥接 —— 默认 identity，按车辆需要重写（后轴、底盘几何中心等），无需重新建图。
 3. **户外 / 车辆尺度调参** —— 24 项参数变更（放宽 IMU 噪声、增大 voxel、加长初始化窗口、提高 sub-mapping 密度），针对高速公路 / 赛道 / 车辆机动场景。
 4. **多圈回环修复** —— 拓宽 VGICP 收敛域、放宽隐式回环阈值、使用协方差感知 GNSS 先验并加固 world/UTM 拟合，防止经典的"第二圈轨迹翘向天空"现象。
@@ -233,7 +284,7 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 >
 > 1. **Atlas 固件前置条件（文档约定）。** Atlas Duo 内部的 `gnss_lever_arm_secondary` 与双天线航向模式必须在 Atlas Web UI 中按物理安装方式正确配置。这一项无法由本仓库的代码自动验证 —— 只能在 Atlas 调试期间手动确认。具体参数对应关系见上文的 GNSS 杆臂补偿说明。
 > 2. **启动期一致性检查（自动）。** `hitch_sensor_dome.launch.py` 同时读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 和 [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json)，若物理双天线意图与 `enable_orientation_prior` 不一致则告警。该助手只做诊断，不会改写 JSON，也不会启动 GLIM 建图进程。
-> 3. **运行期 yaw σ 合理性检查（自动）。** GLIM++ 启动后，C++ wrapper 会读取每条 `/odom` 消息中 Atlas 自己上报的 yaw σ（pose 协方差中的对应项），与我们根据双天线基线长度估计出的预期 σ 做对比。前约 20 条样本采集完毕后，若 Atlas 持续上报远宽于预期的 σ，打印粗体黄色一次性警告，说明 Atlas 固件很可能**没有**真正进入双天线航向模式（即便本仓库的配置说它在）。该检查要求 `ins_odom_topic` 已经接入（Odometry 携带协方差，PoseStamped 不携带）。检查通过时会输出一行 info 级别的确认日志，确认双天线航向已生效。
+> 3. **运行期 yaw σ 质量检查（自动）。** GLIM++ 启动后，C++ wrapper 会读取每条 `/odom` 消息中 Atlas 上报的 yaw σ（pose 协方差中的对应项），与根据双天线基线估计的预期 σ 做对比。该数值只能检查当前航向质量，不能证明航向来源：单天线 INS 也可能给出有限的 yaw 协方差。因此生产录制还要求先直接观察 Atlas `HeadingOutput`/`RawHeadingOutput` 的 `solution_type=RTKFixed`，再把 `recording/sensor_config.yaml` 中的 `requirements.dual_antenna_commissioned` 设为 `true`。运行期检查不能替代这一步调试证明。
 
 ```bash
 # (一次性) 从 sensor_dome_tf.yaml 生成 sensor_dome.urdf
@@ -263,7 +314,7 @@ LiDAR 拓扑与调参模式独立。`lidar_mode:=front_only` 是所有 profile
 
 相对上游 VECTR DLIO 的项目改进：
 
-1. **针对 Robin W + Atlas Duo** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶（低延迟实时 IMU `/imu/data`、adapter 的 RTK-fixed-only `/gps_p1/filtered_odom_rtk_fixed`、`/robin_w_*/points`；frame 来自 `config/sensor_dome_tf.yaml` 的 `base_link`/`imu_link`/`lidar_front_link`）。
+1. **针对 Robin W + Atlas Duo** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶（adapter 规范化 IMU `/gps_p1/imu`、RTK-fixed-only `/gps_p1/filtered_odom_rtk_fixed`、`/robin_w_*/points`；frame 来自 `config/sensor_dome_tf.yaml` 的 `base_link`/`imu_link`/`lidar_front_link`）。
 2. **固定解门控与失效回退** —— 生产路径直接使用 adapter 按 FusionEngine `solution_type == RTK_FIXED` 发布的固定解里程计。协方差必须为有限、正值且不超过阈值；RTK float、过期/未知质量或无解时不允许初始化或恢复跳变，而是继续使用 LiDAR + IMU。`nav_sat_gated_odom` 仅用于旧 bag 的 REP-145 兼容路径，因为 `STATUS_GBAS_FIX` 本身无法可靠区分 float 与 fixed。
 3. **调参模式与 LiDAR 模式独立** —— `mode:=race|safe|custom` 选择参数 profile，`lidar_mode:=front_only|three_lidar|auto` 选择传感器。启动默认前置一台；两个互斥 systemd 单元分别显式固定 race/front 与 safe/three-lidar。
 4. **GLIM++ ENU 地图桥接** —— 规范导出器 `GLIM_plusplus/scripts/export_glim_dump_to_pcd.py` 精确读取 compact 点格式，依次应用 `T_world_origin` 与 `inverse(T_world_utm)`，输出 surveyed local-ENU PCD 及 `<map>.manifest.yaml`。GICP++ 默认要求 manifest，并在处理点云前把其 datum 与 adapter 的 transient-local `/gps_p1/local_enu_origin` 比对；旧脚本仅保留为该导出器的兼容包装。

@@ -30,7 +30,7 @@ def generate_launch_description():
 
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/robin_w_front/points')
-    imu_topic = LaunchConfiguration('imu_topic', default='/imu/data')
+    imu_topic = LaunchConfiguration('imu_topic', default='/gps_p1/imu')
     # The adapter publishes this topic only for genuine SolutionType::RtkFixed.
     # Float/no-fix periods therefore fall back to LiDAR+IMU localization.
     gt_odom_topic = LaunchConfiguration(
@@ -51,8 +51,8 @@ def generate_launch_description():
         description='Primary Robin W point cloud topic (the front sensor by default).')
     declare_imu_topic_arg = DeclareLaunchArgument(
         'imu_topic', default_value=imu_topic,
-        description='Atlas Duo IMU topic. /imu/data is the low-latency live '
-                    'default; /gps_p1/imu is supported for normalized replay.')
+        description='Atlas Duo IMU topic. /gps_p1/imu is the adapter-normalized '
+                    'default; /imu/data remains accepted for legacy bags.')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(
         'gt_odom_topic', default_value=gt_odom_topic,
         description='Adapter RTK-fixed-only INS odometry. Used for initial '

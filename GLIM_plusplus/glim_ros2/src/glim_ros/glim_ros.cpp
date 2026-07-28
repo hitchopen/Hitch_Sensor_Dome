@@ -22,8 +22,10 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
-#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#ifdef BUILD_WITH_CV_BRIDGE
+#include <sensor_msgs/msg/image.hpp>
+#endif
 
 #include <gtsam_points/optimizers/linearization_hook.hpp>
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
@@ -482,7 +484,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   if (this->online_mapping_enabled_) {
     const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
     const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
-    const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
     // Subscribers
     rclcpp::SensorDataQoS default_imu_qos;
@@ -497,8 +498,15 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
 
 #ifdef BUILD_WITH_CV_BRIDGE
-    qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
-    image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
+    const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
+    if (!image_topic.empty()) {
+      qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
+      image_sub = image_transport::create_subscription(
+        this, image_topic, std::bind(&GlimROS::image_callback, this, _1),
+        "raw", qos.get_rmw_qos_profile());
+    } else {
+      spdlog::info("camera input disabled (glim_ros.image_topic is empty)");
+    }
 #endif
 
     // Hitch Sensor Dome fork: live subscriptions for the INS init gate +

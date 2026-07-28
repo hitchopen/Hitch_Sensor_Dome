@@ -13,7 +13,7 @@ option(BUILD_WITH_CUDA "Build with GPU support" ON)
 option(BUILD_WITH_CUDA_MULTIARCH "Build with GPU cross-platform support" OFF)
 option(BUILD_WITH_VIEWER "Build with visualizer" ON)
 option(BUILD_WITH_MARCH_NATIVE "Build with -march=native" OFF)
-option(BUILD_WITH_OPENCV "Build with OpenCV to support camera images" ON)
+option(BUILD_WITH_OPENCV "Build with OpenCV to support camera images" OFF)
 
 if(BUILD_WITH_MARCH_NATIVE)
   add_definitions(-march=native)
@@ -38,8 +38,10 @@ endif()
 if(BUILD_WITH_OPENCV)
   set(GLIM_USE_OPENCV 1)
   find_package(OpenCV REQUIRED COMPONENTS core)
+  message(STATUS "GLIM camera image support: ENABLED (OpenCV)")
 else()
   set(GLIM_USE_OPENCV 0)
+  message(STATUS "GLIM camera image support: DISABLED (default)")
 endif()
 
 ###########
@@ -105,7 +107,6 @@ target_include_directories(glim PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/json/include>
   $<INSTALL_INTERFACE:include/glim>
   ${LIBXML2_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(glim
   Boost::boost
@@ -117,9 +118,10 @@ target_link_libraries(glim
   spdlog::spdlog
   $<TARGET_NAME_IF_EXISTS:Iridescence::Iridescence>
   ${LIBXML2_LIBRARIES}
-  ${OpenCV_LIBRARIES}
 )
 if(BUILD_WITH_OPENCV)
+  target_include_directories(glim PUBLIC ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(glim ${OpenCV_LIBRARIES})
   target_compile_definitions(glim PUBLIC GLIM_USE_OPENCV)
 endif()
 list(APPEND glim_LIBRARIES glim)
@@ -273,7 +275,7 @@ if(DEFINED ENV{ROS_VERSION})
     # port originally installed a nonexistent av24.urdf and OPTIONAL masked
     # the failure).
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../config/sensor_dome.urdf DESTINATION share/glim/config)
-    ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${LIBXML2_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+    ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${LIBXML2_INCLUDE_DIRS})
     ament_export_libraries(${glim_LIBRARIES} ${GTSAM_LIBRARIES} fmt spdlog::spdlog ${LIBXML2_LIBRARIES})
     ament_export_targets(glim-targets HAS_LIBRARY_TARGET)
     ament_package(CONFIG_EXTRAS "cmake/glim-config.cmake.in")

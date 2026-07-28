@@ -1,6 +1,6 @@
 # GLIM++ — A heavily modified fork of GLIM for Hitch Sensor Dome
 
-> **This is not stock GLIM.** The folder name `GLIM_plusplus/` is intentional: this version diverges from upstream [`koide3/glim`](https://github.com/koide3/glim) in ways that change algorithmic behavior — not just configuration. If you came here looking for the original GLIM, that lives at <https://github.com/koide3/glim> and we strongly recommend starting there if you do not have the [Hitch Sensor Dome](../README.md) hardware. All algorithmic and implementation credit for GLIM belongs to **Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno (AIST)**. See [Credits](#credits), [License](#license), and [Citation](#citation).
+> **This is not stock GLIM.** The folder name `GLIM_plusplus/` is intentional: this version diverges from upstream [`koide3/glim`](https://github.com/koide3/glim) in ways that change algorithmic behavior — not just configuration. If you came here looking for the original GLIM, that lives at <https://github.com/koide3/glim> and we strongly recommend starting there if you do not have the Hitch Sensor Dome hardware. All algorithmic and implementation credit for GLIM belongs to **Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno (AIST)**. See [Credits](#credits), [License](#license), and [Citation](#citation).
 
 This document is a **complete change log** between GLIM++ and the upstream `koide3/glim`. It is organized so an adopter can decide, mechanism by mechanism, which changes apply to their use case and which would need to be reverted.
 
@@ -23,21 +23,34 @@ This document is a **complete change log** between GLIM++ and the upstream `koid
 
 ## 1. Sensor adaptation for Hitch Sensor Dome
 
-Topic, frame, and field names throughout the configs target the Hitch Sensor Dome reference setup (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM).
+Topic, frame, and field names throughout the configs target the Hitch Sensor
+Dome mapping setup: 3× Seyond Robin W plus the Point One Atlas Duo. RouteCAMs
+are optional payload sensors and are not required or consumed by the shipped
+mapping modules.
 
 | Surface | Hitch Sensor Dome setting |
 |---------|---------------------------|
-| IMU topic | `/imu/data` (fusion_engine_driver, Atlas Duo) |
+| IMU topic | `/gps_p1/imu` (adapter-normalized Atlas stream) |
 | Primary lidar | `/robin_w_front/points` |
 | Aux lidars | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
 | GNSS | `/gps_p1/fix` (synchronized adapter NavSatFix gate) + `/gps_p1/filtered_odom_rtk_fixed` (adapter Fixed-only odometry) |
-| Camera | `/cam_front_left/image_raw` |
+| Camera | excluded from the default build; optional modules may opt in |
 | `intensity_field` | `intensity` (Robin W default) |
 | `ring_field` | `ring` (Robin W default) |
 | `flip_points_y` | `false` (Robin W in `coordinate_mode:=3` already emits REP-103 axes) |
 | LiDAR–IMU extrinsic source | URDF generated from [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) — see §8 |
 
 Files touched: `glim/config/config_sensors.json`, `glim/config/config_ros.json`.
+
+The camera-free contract is enforced at build time. `BUILD_WITH_OPENCV` and
+`BUILD_WITH_CV_BRIDGE` both default to `OFF`; the default package manifests do
+not request OpenCV, `cv_bridge`, or `image_transport`, and the resulting ROS
+binaries compile out live image subscriptions and offline image
+deserialization. The empty `image_topic` remains for configuration
+compatibility, but it is not the mechanism that disables camera intake. The
+required sensor inputs are P1/Atlas `/gps_p1/imu` plus all three Robin W clouds;
+the production profile additionally enforces its documented RTK-fixed and
+heading-quality gates.
 
 ### 1.1 Single-antenna vs dual-antenna mode
 
@@ -189,7 +202,7 @@ The upstream module also (per its own header comment) "ignores GNSS observation 
 The fork adds an in-process bridge:
 
 ```
-fusion_engine_driver + adapter
+native Atlas driver + adapter
    ├── /gps_p1/filtered_odom_rtk_fixed (Odometry, solution_type == kRtkFixed)
    └── /gps_p1/fix                    (NavSatFix, freshness/covariance cross-check)
                   │
@@ -244,12 +257,15 @@ GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_glob
 
 **Dual-antenna gating end-to-end.** The factor is only safe after a secondary
 antenna is installed and the Atlas is configured for dual-antenna heading.
-Intent is checked at three points: Atlas firmware commissioning, the launch
-helper's TF/config mismatch warning, and the runtime yaw-sigma sanity check
-inside `try_publish_gnss_factor`. Only the third check can detect firmware that
-does not actually emit dual-antenna heading.
+Intent is checked at three points: direct Atlas HeadingOutput commissioning,
+the launch helper's TF/config mismatch warning, and the runtime yaw-sigma
+quality check inside `try_publish_gnss_factor`. The last check cannot identify
+the heading source: a single-antenna INS may also report finite yaw covariance.
+Production recording therefore requires the explicit
+`requirements.dual_antenna_commissioned` attestation after directly observing
+an RTK-fixed Atlas heading output.
 
-**Why no lever-arm compensation here.** A related branch of work in the broader GLIM ecosystem pairs the orientation prior with antenna-to-IMU lever-arm compensation (`urdf_gnss_frame`-style). GLIM++ intentionally **does not** apply that compensation, because the Atlas Duo is a tightly-coupled GNSS+INS that already resolves antenna observations to the IMU origin in firmware and publishes `/pose` there. Adding a second lever-arm correction would double-compensate. The prerequisite is that the Atlas firmware's `gnss_lever_arm_primary` / `gnss_lever_arm_secondary` are programmed to match the dome's `sensor_dome_tf.yaml`; see the root README's "GLIM++ GNSS antenna lever-arm compensation" callout. If a future deployment swaps the Atlas Duo for a non-tightly-coupled GNSS, lever-arm compensation must be re-introduced inside the `try_publish_gnss_factor` bridge before publishing to `libgnss_global.so`.
+**Why no lever-arm compensation here.** A related branch of work in the broader GLIM ecosystem pairs the orientation prior with antenna-to-IMU lever-arm compensation (`urdf_gnss_frame`-style). GLIM++ intentionally **does not** apply that compensation, because the Atlas Duo is a tightly-coupled GNSS+INS that already resolves antenna observations to the IMU origin in firmware and publishes `/pose` there. Adding a second lever-arm correction would double-compensate. The prerequisite is that the Atlas Duo's own firmware configuration (web UI → device configuration) carries `gnss_lever_arm_primary` and, in dual-antenna installations, `gnss_lever_arm_secondary`, expressed in the device IMU frame in metres, and that those values agree with the antenna entries in [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml). Nothing validates that agreement at runtime: if the firmware lever arm and the TF disagree, the resulting bias is silent and looks like a plausible map. If a future deployment swaps the Atlas Duo for a non-tightly-coupled GNSS, lever-arm compensation must be re-introduced inside the `try_publish_gnss_factor` bridge before publishing to `libgnss_global.so`.
 
 **Behavior on RTK loss.** Same as §7: the wrapper bridge drops samples that fail the RTK gate, so the orientation prior never sees them and never fires during outages. There is no fallback to IMU-derived yaw — when RTK heading isn't available, yaw stays under LiDAR scan-matching control, which is correct (substituting drifting INS yaw for missing GNSS yaw would defeat the purpose of the factor).
 
@@ -263,7 +279,7 @@ Three new top-level folders inside `GLIM_plusplus/` that hold integration-only c
 |--------|----------|
 | [`config/`](config/) | `generate_sensor_dome_urdf.py` converts [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) into `sensor_dome.urdf`, which GLIM consumes via the `urdf_path` field in `config_sensors.json` for both `T_lidar_imu` and multi-LiDAR `lidar_concat`. Single source of truth across recording, visualization, and mapping. Re-run when the TF YAML changes. |
 | [`launch/`](launch/) | `hitch_sensor_dome.launch.py` publishes static TFs, checks dual-antenna/config consistency, optionally runs the stationarity diagnostic, and starts Foxglove support. It deliberately does **not** start `glim_rosnode`; production mapping is offline. |
-| [`scripts/`](scripts/) | `check_init_stationarity.py` — pre-flight diagnostic; reads first 3 s of `/imu/data` and prints a bold-RED warning if the bag is non-stationary. Now informational only (the C++ INS-init pathway handles moving starts), but useful for diagnosing slow Atlas Duo lock and for CI gating. |
+| [`scripts/`](scripts/) | `check_init_stationarity.py` — pre-flight diagnostic; reads first 3 s of `/gps_p1/imu` and prints a bold-RED warning if the bag is non-stationary. Now informational only (the C++ INS-init pathway handles moving starts), but useful for diagnosing slow Atlas Duo lock and for CI gating. |
 
 ## 10. Design notes
 
@@ -604,9 +620,9 @@ header-nearest matching. New `lidar_concat` keys in `config_sensors.json`:
 > points. `float64_time_is_epoch_ns` remains false; that flag is only for a
 > legacy raw-uint64 encoding mislabeled FLOAT64.
 >
-> See the root README's
-> [LiDAR per-point timestamp standard](../README.md#lidar-per-point-timestamp-standard)
-> for the complete five-vendor contract and the live-topic validation command.
+> The repository's canonical five-vendor contract and live-topic validation
+> command are in the root README's
+> [timestamp standard](../README.md#canonical-per-point-timestamp-standard).
 
 **LiDAR quality gate.** GLIM++ measures the first usable raw cloud from each
 configured LiDAR before preprocessing and validates each primary/auxiliary
@@ -698,6 +714,94 @@ platform's Robin W topics/frames; everything overridable via CLI), and
 the 3D design after the merges, from the OpenSCAD source through the URDF to
 the GLIM configs. Results and caveats are tabulated in §10 "TF verification".
 
+### 14.1 LiDAR per-point timestamp standard
+
+The root README's
+[timestamp standard](../README.md#canonical-per-point-timestamp-standard) is
+canonical for the repository. This section retains the GLIM-specific ingestion
+details and source references used to validate that contract.
+
+The repository targets ROS 2 Humble on Ubuntu 22.04 and ROS 2 Jazzy on Ubuntu
+24.04. Humble compatibility is mandatory for the official Seyond deployment
+path, so the LiDAR contract and its consumers use only APIs common to both
+distributions.
+
+The following `sensor_msgs/PointCloud2` layouts are the **canonical ingestion
+contract for this repository**. Field name, ROS datatype, unit, and origin are
+all part of the contract; datatype alone is not enough to infer the time axis.
+
+| Vendor / profile | Field | ROS datatype | Stored unit | Time origin |
+|---|---|---:|---|---|
+| Ouster | `t` | `UINT32` | nanoseconds | start of sweep |
+| Velodyne | `time` | `FLOAT32` | seconds | start of sweep |
+| Hesai | `timestamp` | `FLOAT64` | seconds | Unix epoch (absolute) |
+| Livox | `timestamp` | `FLOAT64` | numeric nanoseconds, multiplied by `1e-9` to obtain seconds | Unix epoch (absolute) |
+| Seyond Robin W (ROS 2, `coordinate_mode:=3`) | `timestamp` | `FLOAT64` | seconds | Unix epoch (absolute) |
+
+#### Seyond raw payload vs ROS 2
+
+The two layers must not be conflated:
+
+- **Raw packet layer:** each point carries `ts_10us`, a compact offset from its
+  packet/frame time origin in 10 microsecond ticks. Robin W frames are 100 ms,
+  so a frame contains at most about 10,000 timestamp quanta. This raw offset is
+  not an absolute epoch value.
+- **Hydrated SDK/PCL/ROS 2 layer:** the driver publishes `double timestamp`, as
+  confirmed by Seyond support. PCL converts it to the `sensor_msgs/PointCloud2` field
+  `timestamp/FLOAT64/count=1`, in absolute Unix seconds.
+
+The reviewed driver computes:
+
+```text
+T_packet_start = packet.common.ts_start_us * 1e-6
+delta_t_point  = point.ts_10us * 1e-5
+T_point        = T_packet_start + delta_t_point
+```
+
+This is source-verified at pinned Seyond commit
+[`18c5c936`](https://github.com/Seyond-Inc/seyond_ros_driver/tree/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf):
+[`driver_lidar.cc`](https://github.com/Seyond-Inc/seyond_ros_driver/blob/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf/src/seyond_lidar_ros/src/driver/driver_lidar.cc#L558-L604)
+performs the reconstruction and
+[`point_types.h`](https://github.com/Seyond-Inc/seyond_ros_driver/blob/18c5c9362d41cd0766ee1b430f4b431bb14b1ccf/src/seyond_lidar_ros/src/driver/point_types.h#L35-L52)
+registers `timestamp` as `double`.
+
+Equivalently, when the packet offset within the frame is included in
+`delta_t_point_from_frame`,
+`T_point = T_frame_start + delta_t_point_from_frame`. The cloud
+`header.stamp` is `frame_start_ts_us * 1000` nanoseconds. PTP supplies the
+shared Unix timebase; `coordinate_mode:=3` changes point axes to REP-103 and
+does not change timestamp representation. Never cast an absolute Unix
+timestamp to `FLOAT32`, because that destroys sub-second deskew precision.
+
+GLIM uses `perpoint_relative_time=false`, scale `1.0`, and normalizes the
+absolute values to offsets from the first point for deskew. GICP++ uses its
+explicit `seyond` path and deskews directly on the same absolute values.
+The official driver filters invalid returns before publication and hydrates
+every published point timestamp; therefore a zero timestamp is not a valid
+ROS-layer sentinel. GLIM++ and GICP++ reject a Robin W cloud containing one.
+During three-LiDAR concatenation, absolute point timestamps are **not**
+shifted by `aux_header_stamp - primary_header_stamp`; they already identify
+capture time on the shared PTP axis. `float64_time_is_epoch_ns` remains
+`false` because Robin W publishes numeric IEEE-754 seconds, not raw uint64
+nanosecond bits.
+
+[`PTP_sync/4_setup_lidar_ptp.sh`](../PTP_sync/4_setup_lidar_ptp.sh) pins the
+reviewed Seyond commit, removes the repository's obsolete relative-time
+override from existing installations, and verifies the source formula and
+PCL registration before building. GLIM also rejects a Robin W cloud unless
+the field schema and absolute axis match this contract.
+Verify a driver or bag before mapping:
+
+```bash
+ros2 topic echo --once --field fields /robin_w_front/points
+# PointField datatype 8 is FLOAT64; expect: name=timestamp, datatype=8, count=1.
+```
+
+The generic GLIM converter retains support for Hesai absolute seconds, Livox
+numeric epoch nanoseconds, relative-time LiDARs, and explicit
+raw-epoch-nanosecond carriers, but those compatibility paths do not redefine
+the Robin W contract above.
+
 ## Quick start
 
 Edit [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) once for your installation, then:
@@ -706,7 +810,7 @@ Edit [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) once for y
 cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 cd ../..
 
-# Build (CMake / colcon — gtsam, gtsam_points, Iridescence as upstream)
+# Default build: camera intake and camera libraries are excluded.
 colcon build --packages-select glim glim_ext glim_ros \
              --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
@@ -745,7 +849,13 @@ The ROS 2 package names (`glim`, `glim_ext`, `glim_ros`) are unchanged — only 
 
 ## Build dependencies
 
-Identical to upstream GLIM. See the upstream documentation for the canonical list.
+The default build is LiDAR/IMU/GNSS-only. OpenCV, `cv_bridge`, and
+`image_transport` are deliberately absent from the package manifests and are
+not build dependencies.
+
+After upgrading an existing workspace that previously cached the old `ON`
+defaults, run the first rebuild with `colcon build --cmake-clean-cache ...`.
+Fresh build directories use the camera-free defaults automatically.
 
 ```bash
 sudo apt install -y libeigen3-dev libboost-all-dev libfmt-dev libomp-dev \
@@ -753,6 +863,23 @@ sudo apt install -y libeigen3-dev libboost-all-dev libfmt-dev libomp-dev \
                     ros-${ROS_DISTRO}-pcl-ros ros-${ROS_DISTRO}-foxglove-bridge
 # Then GTSAM, gtsam_points, Iridescence — see upstream README.
 ```
+
+Camera intake is retained only as an upstream-compatible opt-in. Provision its
+dependencies manually and enable both layers; enabling the ROS bridge while the
+core is camera-free is a configuration error:
+
+```bash
+sudo apt install -y libopencv-dev ros-${ROS_DISTRO}-cv-bridge \
+                    ros-${ROS_DISTRO}-image-transport
+colcon build --packages-select glim glim_ext glim_ros --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release \
+               -DBUILD_WITH_OPENCV=ON \
+               -DBUILD_WITH_CV_BRIDGE=ON
+```
+
+`ENABLE_ORBSLAM` and `ENABLE_DBOW` in `glim_ext` are separate OpenCV-dependent
+features and also remain `OFF` by default. Enabling either requires a core
+`glim` built with `BUILD_WITH_OPENCV=ON`.
 
 ## Credits
 
@@ -763,7 +890,7 @@ GLIM is the work of:
 - **Iridescence** — Kenji Koide. <https://github.com/koide3/iridescence>
 - **GTSAM** — Frank Dellaert and the Georgia Tech Borg Lab. <https://github.com/borglab/gtsam>
 
-The integration work in `GLIM_plusplus/{config, launch, scripts}/` and the modifications detailed in §1 – §7 are part of the **Hitch Sensor Dome** project, designed and maintained by Dr. Allen Y. Yang (Hitch Interactive · University of California, Berkeley). Implementation testing by the **Berkeley AI Racing Tech** team (see [`../README.md`](../README.md) Credits).
+The integration work in `GLIM_plusplus/{config, launch, scripts}/` and the modifications detailed in §1 – §7 are part of the **Hitch Sensor Dome** project, designed and maintained by Dr. Allen Y. Yang (Hitch Interactive · University of California, Berkeley). Implementation testing and field validation by the **Berkeley AI Racing Tech** team: from UC Berkeley (alphabetical by last name) — Bryan Chang, Logan Kinajil-Moran, Moises Lopez Mendoza, Gary Passon, Tanishaa Viral Shah, Joshua Sun, Di Tian, Jovan Yap; from UC San Diego — Kevin Shin.
 
 ## License
 

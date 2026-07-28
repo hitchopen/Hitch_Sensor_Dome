@@ -17,25 +17,24 @@ network:
 # Point One Nav Atlas Duo (GNSS / INS)
 # Ethernet-only transport — the Atlas Duo hardware does not
 # expose a BNC PPS pin or a USB serial NMEA stream. FusionEngine
-# rides TCP 30201 to the host's fusion_engine_driver; NMEA
+# rides TCP 30201 to the deployment's native-message driver; NMEA
 # rides TCP 30200 to gpsd (see PTP_sync/3_setup_ins_to_pc_sync.sh).
 # -------------------------------------------------------------
 point_one_nav:
   enabled: true
-  connection_type: "tcp"     # passed to fusion_engine_driver
   tcp_ip: "192.168.1.30"     # Atlas Duo IP on RUTM50 LAN 4
   tcp_port: 30201            # FusionEngine TCP port
-  frame_id: "imu_link"
-  # ROS topics recorded for the GNSS/INS path. The first three are published
-  # by fusion_engine_driver. adapter_fix and rtk_fixed_odom are synchronized
-  # outputs from the Atlas adapter and form GLIM++'s production gate/source.
-  # Start the adapter during capture when producing mapping bags.
+  # ROS topics recorded for the GNSS/INS path. The deployment's native-message
+  # Atlas driver and adapter are external prerequisites: they must be running
+  # before this recorder starts. The recorder verifies live adapter IMU and GNSS
+  # output before it creates a bag.
   topics:
-    imu: "/imu/data"           # sensor_msgs/Imu       @ 200 Hz
-    gps_fix: "/gps/fix"        # sensor_msgs/NavSatFix @ 10 Hz
-    pose: "/pose"              # geometry_msgs/PoseStamped @ 10 Hz
+    native_imu: "/atlas/imu_calibrated" # sensor_msgs/Imu
+    native_pose: "/atlas/pose_filtered" # fusion_engine_msgs/Pose
     adapter_fix: "/gps_p1/fix" # sensor_msgs/NavSatFix; adapter solution class/covariance
     rtk_fixed_odom: "/gps_p1/filtered_odom_rtk_fixed"  # nav_msgs/Odometry; kRtkFixed only
+    adapter_imu: "/gps_p1/imu" # sensor_msgs/Imu; normalized Atlas stream
+    local_enu_origin: "/gps_p1/local_enu_origin" # transient-local datum contract
 
 # -------------------------------------------------------------
 # Seyond Robin W LiDARs (3× directional)
@@ -69,7 +68,10 @@ lidars:
     topic: "/robin_w_rear_right/points"
 
 # -------------------------------------------------------------
-# RouteCAM cameras (4× GigE Vision, IEEE 1588 PTP)
+# Optional RouteCAM cameras (0–4× GigE Vision, IEEE 1588 PTP).
+# Leave this list in place when cameras are temporarily absent: detection
+# disables missing units and no profile requires them. It may also be [] on a
+# permanently camera-free rig.
 # -------------------------------------------------------------
 cameras:
   - name: "cam_front_left"
@@ -98,23 +100,39 @@ cameras:
 # (See PTP_sync/README.md §3 for expected accuracy at each stage.)
 # -------------------------------------------------------------
 sync:
-  # Behavior when checks exceed tolerance: "prompt" warns and asks y/N.
-  # Other modes available in the script: "hard" (refuse) and "log" (continue).
-  mode: "prompt"
+  # Behavior when checks exceed tolerance. "hard" refuses to record.
+  # "prompt" (warn + y/N) and "log" (continue) also exist, but are IGNORED
+  # while requirements.clock_sync is true — synchronized clocks are a
+  # precondition for both pipelines, not an operator judgement call.
+  mode: "hard"
 
   # chrony — host clock vs. GPS NMEA discipline over Ethernet TCP.
   # Atlas Duo has no PPS pin, so accuracy is NMEA-bound (~10–100 ms).
   chrony_offset_ns: 100000000 # 100 ms — appropriate ceiling for NMEA-only sync
   chrony_max_age_s: 30        # last update must be within 30 s
 
-  # ptp4l — NIC PHC vs. host clock (master offset).
-  # Use the larger HW number even for software TS to avoid noisy prompts.
-  ptp_master_offset_ns_hw: 1000   # < 1 µs (hardware timestamping)
-  ptp_master_offset_ns_sw: 50000  # < 50 µs (software timestamping)
+  # Direct evidence from the ROS streams that will enter the bag. The recorder
+  # launches every selected driver before preflight, then compares each
+  # msg.header.stamp against host CLOCK_REALTIME at callback receipt. This age
+  # includes sensor framing, transport, and driver latency, so it is not the
+  # sub-50 us PTP servo offset. Gross epoch errors, nonmonotonic stamps, excess
+  # latency variation, and drift are rejected independently for every sensor.
+  sensor_timestamp:
+    capture_window_s: 5.0
+    min_samples: 10
+    max_future_ms: 5.0
+    max_drift_ms: 5.0
+    lidar:
+      # Robin W header.stamp is frame start, so a completed cloud naturally
+      # arrives roughly one sweep later (50-100 ms at 20/10 FPS).
+      max_age_ms: 250.0
+      max_jitter_ms: 30.0
+    camera:
+      max_age_ms: 150.0
+      max_jitter_ms: 30.0
 
-  # PTP slaves — Robin W LiDARs and RouteCAM cameras.
-  lidar_offset_ns: 1000        # 1 µs (Robin W typically 300–800 ns)
-  camera_offset_ns: 10000      # 10 µs (GigE Vision typically 1–10 µs)
+  # Per-sensor overrides may be added beside topic/frame_id:
+  # timestamp_max_age_ms, timestamp_max_jitter_ms, timestamp_max_drift_ms.
 
 # -------------------------------------------------------------
 # RTK-fix pre-flight check (matches GLIM++'s init gate)
@@ -125,20 +143,24 @@ sync:
 # capture_window_s. NavSatFix supplies the synchronized covariance check;
 # only arrival on the adapter topic proves FusionEngine kRtkFixed.
 rtk:
-  # Behavior when the gate fails:
-  #   "prompt" — bold-RED warning + y/N prompt (default)
-  #   "hard"   — refuse to start
-  #   "log"    — record anyway, note in metadata
-  mode: "prompt"
+  # Behavior when the gate fails: "hard" refuses to start; "prompt" asks for
+  # confirmation; "log" continues and records the result in metadata.
+  # The selected requirements profile overrides this mode and the legacy
+  # require_rtk_fixed value below. A strict profile cannot be downgraded.
+  mode: "hard"
 
   # NavSatFix topic to inspect — same as GLIM++'s ins_fix_topic.
   gnss_topic: "/gps_p1/fix"
 
   # Authoritative stream emitted by adapter only for solution_type=kRtkFixed.
   fixed_odom_topic: "/gps_p1/filtered_odom_rtk_fixed"
+  # Live normalized IMU evidence, required by every profile.
+  imu_topic: "/gps_p1/imu"
 
-  # If true, require both the Fixed-only stream and NavSatFix status >=
-  # STATUS_GBAS_FIX. Set false only for an explicit degraded recording.
+  # Legacy/default value; the selected requirements profile overwrites it.
+  # true requires both the Fixed-only stream and NavSatFix status >=
+  # STATUS_GBAS_FIX. false skips both Fixed proofs even when rtk.mode is hard;
+  # that mode can then gate only finite position and covariance quality.
   require_rtk_fixed: true
 
   # Maximum allowed σ on the NavSatFix position covariance (m). Default
@@ -149,7 +171,71 @@ rtk:
   # Subscribe for this many seconds before deciding. Long enough to catch
   # a transient float-quality sample mid-window; short enough that a
   # locked rig isn't held up.
-  capture_window_s: 3.0
+  capture_window_s: 5.0
+
+# -------------------------------------------------------------
+# Non-negotiable session requirements
+#
+# The recorder refuses to start unless every enabled requirement below is
+# satisfied. These are NOT operator judgement calls: a session missing any of
+# them looks identical to a good one on disk and only fails later, at map-build
+# or localization time, when the data is no longer recapturable.
+# -------------------------------------------------------------
+requirements:
+  # Point One Atlas Duo must be present and enabled. Its IMU feeds both
+  # pipelines, so a bag without it is useless to either. Whether it must also
+  # be RTK-FIXED is profile-dependent — see profiles below.
+  gnss_imu: true
+  # Read-only chrony and per-sensor timestamp verification must PASS, not
+  # merely be reported. PTP_sync/ owns all clock configuration and discipline;
+  # the recorder only observes the resulting state. Forces sync.mode = hard.
+  clock_sync: true
+  # Dual-antenna heading. Checked three ways when a profile requires it: the
+  # secondary entry in config/sensor_dome_tf.yaml must be off its (0,0,0)
+  # sentinel, commissioning must be explicitly attested below after observing
+  # an RTK-fixed Atlas heading output, and Fixed-only odometry must carry a
+  # finite, tight yaw sigma. The covariance checks live quality, not source.
+  #
+  # Like require_rtk_fixed, this is profile-dependent. GLIM++ needs drift-free
+  # heading or the map accumulates the yaw error the second antenna exists to
+  # prevent. GICP++ localizes against an already-built map from LiDAR + IMU and
+  # does not, so a single-antenna rig can still collect useful GICP data.
+  dual_antenna: true
+  # Set true only after commissioning has directly observed Atlas
+  # HeadingOutput/RawHeadingOutput with solution_type=RTKFixed and a baseline
+  # matching sensor_dome_tf.yaml. Pose yaw covariance is checked at runtime for
+  # quality, but cannot identify whether heading came from one or two antennas.
+  dual_antenna_commissioned: false
+  max_heading_stddev_rad: 0.05    # ~2.9 deg; a 1.0 m baseline gives ~0.01 rad
+  tf_config_path: "../config/sensor_dome_tf.yaml"
+  min_antenna_baseline_m: 0.05    # matches GLIM++'s dual-antenna sentinel test
+
+  # Which LiDARs a session must carry, by intended consumer. Recording with
+  # the front plus zero, one, or two rear units is a legitimate GICP++
+  # data-collection run; the front unit remains mandatory because it is the
+  # primary GICP stream. GLIM++ builds its offline map from all three.
+  # Cameras are optional payloads and are never profile requirements.
+  # Default is the lighter GICP profile: a bare `sensor_recorder.py` requires
+  # the front Robin W, synchronized clocks, and live adapter IMU. Capturing a
+  # GLIM++ map is a deliberate `--profile glim`, which then enforces three
+  # LiDARs, RTK-fixed, and dual-antenna heading.
+  profile: "gicp"
+  profiles:
+    # GLIM++ builds the offline map: it needs all three units, and it cannot
+    # even initialize without a validated RTK-fixed solution (the map origin
+    # must be globally referenced from the first factor).
+    glim:
+      lidars: ["robin_w_front", "robin_w_rear_left", "robin_w_rear_right"]
+      require_rtk_fixed: true
+      require_dual_antenna: true
+    # GICP++ localizes against an already-built map using LiDAR + IMU, so a
+    # session captured without an RTK fix is still useful. The Atlas Duo is
+    # still mandatory — that is where the IMU comes from — but its GNSS
+    # solution quality is not gating here.
+    gicp:
+      lidars: ["robin_w_front"]
+      require_rtk_fixed: false
+      require_dual_antenna: false
 
 # -------------------------------------------------------------
 # Recording options
@@ -164,8 +250,9 @@ recording:
 
   # rosbag2 storage plugin. mcap is Foxglove-native and recommended.
   storage: "mcap"
-  compression_mode: "file"        # "none", "file", or "message"
-  compression_format: "zstd"      # "zstd" (mcap) — fast, lossless
+  # Production recording is intentionally uncompressed to avoid compression
+  # CPU load, write-path latency, and additional jitter during capture.
+  compression_mode: "none" # the recorder rejects every other value
 
   # Auto-include /tf and /tf_static so all frames stitch in Foxglove.
   include_tf: true
@@ -174,6 +261,8 @@ recording:
   # which the Foxglove layout binds to a Diagnostics panel.
   rate_topic: "/sensor_dome/rates"
   rate_window_s: 2.0
+  # Critical children must remain alive through this startup window.
+  startup_grace_s: 2.0
 
 # -------------------------------------------------------------
 # Foxglove live visualization
@@ -188,17 +277,6 @@ foxglove:
 # Override per-installation. {arg} placeholders are substituted.
 # -------------------------------------------------------------
 drivers:
-  point_one_nav:
-    # Ethernet-only transport — Atlas Duo hardware has no USB serial output.
-    cmd: ["ros2", "run", "fusion_engine_driver", "fusion_engine_ros_driver",
-          "--ros-args",
-          "-p", "connection_type:={connection_type}",
-          "-p", "tcp_ip:={tcp_ip}",
-          "-p", "tcp_port:={tcp_port}",
-          "-p", "frame_id:={frame_id}",
-          "-r", "imu:={topics.imu}",
-          "-r", "fix:={topics.gps_fix}",
-          "-r", "pose:={topics.pose}"]
   seyond_lidar:
     # One driver instance per LiDAR. frame_id MUST match the
     # child_frame_id in config/sensor_dome_tf.yaml so Foxglove
@@ -219,13 +297,15 @@ drivers:
           "frame_topic:={topic}",
           "coordinate_mode:=3"]
   routecam:
-    # camera_aravis2 driver — one node per camera.
+    # camera_aravis2 driver — one node per camera. PTP_sync/
+    # 5_setup_camera_ptp.sh has already enabled and configured PTP on each
+    # device. Do not pass PtpEnable/GevIEEE1588 here: recording verifies clock
+    # state but must never mutate it.
     cmd: ["ros2", "run", "camera_aravis2", "camera_driver_gv",
           "--ros-args",
           "-r", "__ns:=/{name}",
           "-p", "guid:={ip}",
           "-p", "frame_id:={frame_id}",
-          "-p", "PtpEnable:=true",
           "-r", "image_raw:={topic}",
           "-r", "camera_info:={info_topic}"]
   static_tf:

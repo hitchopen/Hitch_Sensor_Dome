@@ -9,7 +9,7 @@
 #      GLIM uses these (via sensor_dome.urdf) to align the rear-left and
 #      rear-right Robin W clouds into the front-lidar primary frame.
 #
-#   2. (optional, opt-in) Pre-flight stationarity check on /imu/data —
+#   2. (optional, opt-in) Pre-flight stationarity check on /gps_p1/imu —
 #      bold RED CLI warning if the bag/stream starts with the vehicle
 #      in motion. Pure diagnostic; the actual fix is in the C++ side
 #      (see #4 below). Set skip_stationarity_check:=true to suppress.
@@ -18,7 +18,7 @@
 #      in glim/config/config_ros.json makes glim_rosnode refuse to run).
 #      Record the session (recording/), then build the map with:
 #        ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<out>
-#      glim_rosbag feeds /imu/data, /robin_w_*/points,
+#      glim_rosbag feeds /gps_p1/imu, /robin_w_*/points,
 #      /gps_p1/filtered_odom_rtk_fixed, and /gps_p1/fix from the bag into the
 #      same callbacks the live path would use, so INS init and the
 #      RTK-gated GNSS factor bridge behave identically.
@@ -109,7 +109,7 @@ def _build_static_tfs(context, *args, **kwargs):
 
 def _maybe_pre_flight(context, *args, **kwargs):
     """Run the pre-flight stationarity check synchronously before GLIM
-    starts. Prints a bold RED warning if the first 3 s of /imu/data is
+    starts. Prints a bold RED warning if the first 3 s of /gps_p1/imu is
     non-stationary — informational only in this fork (the C++ INS-init
     pathway handles moving starts correctly), but useful for debugging
     Atlas Duo lock issues.

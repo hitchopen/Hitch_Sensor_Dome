@@ -11,7 +11,7 @@
 #   ./2_configure_host_network.sh
 #   ./3_setup_ins_to_pc_sync.sh
 #   ./4_setup_lidar_ptp.sh           ← you are here
-#   ./5_setup_camera_ptp.sh
+#   ./5_setup_camera_ptp.sh          (optional; cameras only)
 #
 # One-time per-LiDAR provisioning (IP renumber + per-unit UDP
 # port) is handled by a separate script:
@@ -137,6 +137,10 @@ else
     fi
 fi
 
+PMC_PATH="$(command -v pmc || true)"
+[ -n "$PMC_PATH" ] || fail "pmc not found; rerun ./1_install_packages.sh."
+PMC_PATH="$(readlink -f "$PMC_PATH")"
+
 # ─── 2. Check LiDAR network connectivity ────────────────────
 info "Pinging Robin W LiDARs..."
 REACHABLE=()
@@ -258,8 +262,8 @@ fi
 
 # Check PTP slave status
 info "Checking PTP slave status (LiDARs should appear as slaves)..."
-sudo pmc -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || \
-    warn "Could not query PTP peers — run: sudo pmc -u -b 1 'GET PORT_DATA_SET'"
+sudo "$PMC_PATH" -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || \
+    warn "Could not query PTP peers with pmc."
 
 # =============================================================
 # 6. Self-Test: Verify Robin W PTP Sync Quality
@@ -322,11 +326,26 @@ verify_lidar_sync() {
 
     # ── Test 4: PTP slave detection ──
     info "Test 4/6: PTP slave devices on network"
-    PTP_PORTS=$(sudo pmc -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || true)
+    PTP_PORTS=$(sudo "$PMC_PATH" -u -b 1 'GET PORT_DATA_SET' 2>/dev/null || true)
     if [ -n "$PTP_PORTS" ]; then
-        SLAVE_COUNT=$(echo "$PTP_PORTS" | grep -c "SLAVE" || true)
+        # The response header begins with sourcePortIdentity. Strip only its
+        # port-number suffix so a multi-port clock counts as one PTP peer.
+        SLAVE_IDENTITIES=$(printf '%s\n' "$PTP_PORTS" | awk '
+            /RESPONSE MANAGEMENT PORT_DATA_SET/ {
+                identity = $1
+                sub(/-[0-9]+$/, "", identity)
+                next
+            }
+            /portState[[:space:]]+SLAVE/ && identity != "" {
+                peers[identity] = 1
+            }
+            END {
+                for (identity in peers) print identity
+            }')
+        SLAVE_COUNT=$(printf '%s\n' "$SLAVE_IDENTITIES" |
+            awk 'NF {count++} END {print count + 0}')
         if [ "$SLAVE_COUNT" -gt 0 ]; then
-            ok "  $SLAVE_COUNT PTP slave(s) detected"
+            ok "  $SLAVE_COUNT unique PTP SLAVE clock identity(s) detected"
             PASS=$((PASS+1))
         else
             warn "  No PTP slaves detected — LiDARs may still be syncing (wait 30–60 s)"
@@ -338,43 +357,84 @@ verify_lidar_sync() {
         WARN_COUNT=$((WARN_COUNT+1))
     fi
 
-    # ── Test 5: ptp4l master offset (sync quality) ──
-    info "Test 5/6: ptp4l master offset quality"
-    PTP_LOG=$(sudo journalctl -u ptp4l-grandmaster --no-pager -n 100 2>/dev/null || true)
-    if [ -n "$PTP_LOG" ]; then
-        # Extract last 10 master offset values
-        OFFSETS=$(echo "$PTP_LOG" | grep -oP 'master offset\s+\K[-0-9]+' | tail -10)
-        if [ -n "$OFFSETS" ]; then
-            # Compute statistics
-            MAX_ABS=0
-            SUM=0
-            COUNT=0
-            for o in $OFFSETS; do
-                ABS_O=${o#-}
-                SUM=$((SUM + ABS_O))
-                COUNT=$((COUNT + 1))
-                if [ "$ABS_O" -gt "$MAX_ABS" ]; then MAX_ABS=$ABS_O; fi
-            done
-            if [ $COUNT -gt 0 ]; then
-                AVG=$((SUM / COUNT))
-                info "  Last $COUNT offsets: avg=${AVG} ns, max=${MAX_ABS} ns"
-                if [ $MAX_ABS -lt 1000 ]; then
-                    ok "  PTP offset < 1 µs — excellent (hardware timestamping)"
-                    PASS=$((PASS+1))
-                elif [ $MAX_ABS -lt 50000 ]; then
-                    ok "  PTP offset < 50 µs — good (software timestamping)"
-                    PASS=$((PASS+1))
-                else
-                    warn "  PTP offset > 50 µs — sync may be settling"
-                    WARN_COUNT=$((WARN_COUNT+1))
-                fi
+    # ── Test 5: remote slave offsets (sync quality) ──
+    info "Test 5/6: PTP slave offset quality"
+    CURRENT_DATA=$(sudo "$PMC_PATH" -u -b 1 'GET CURRENT_DATA_SET' 2>/dev/null || true)
+    # Correlate CURRENT_DATA_SET responses to the unique SLAVE identities from
+    # Test 4. Each identity must report an offset; duplicate ports retain the
+    # largest absolute value so they cannot hide jitter.
+    OFFSET_ROWS=$(
+        {
+            printf '%s\n' "$PTP_PORTS"
+            printf '%s\n' "__CURRENT_DATA_SET__"
+            printf '%s\n' "$CURRENT_DATA"
+        } | awk '
+            /^__CURRENT_DATA_SET__$/ {
+                section = "current"
+                identity = ""
+                next
+            }
+            section != "current" && /RESPONSE MANAGEMENT PORT_DATA_SET/ {
+                identity = $1
+                sub(/-[0-9]+$/, "", identity)
+                next
+            }
+            section != "current" &&
+                    /portState[[:space:]]+SLAVE/ && identity != "" {
+                slaves[identity] = 1
+                next
+            }
+            section == "current" &&
+                    /RESPONSE MANAGEMENT CURRENT_DATA_SET/ {
+                identity = $1
+                sub(/-[0-9]+$/, "", identity)
+                next
+            }
+            section == "current" &&
+                    /offsetFromMaster/ && identity in slaves {
+                value = $2
+                absolute = value < 0 ? -value : value
+                if (!(identity in maximum) || absolute > maximum[identity]) {
+                    maximum[identity] = absolute
+                    offsets[identity] = value
+                }
+            }
+            END {
+                for (identity in slaves) {
+                    if (identity in offsets) {
+                        print identity, offsets[identity]
+                    } else {
+                        print identity, "MISSING"
+                    }
+                }
+            }')
+    if [ -n "$OFFSET_ROWS" ]; then
+        MAX_ABS=0
+        COUNT=0
+        MISSING_COUNT=0
+        while read -r identity o; do
+            if [ "$o" = "MISSING" ]; then
+                warn "  $identity returned no CURRENT_DATA_SET offset"
+                MISSING_COUNT=$((MISSING_COUNT + 1))
+                continue
             fi
+            ABS_O=${o#-}
+            COUNT=$((COUNT + 1))
+            if [ "$ABS_O" -gt "$MAX_ABS" ]; then MAX_ABS=$ABS_O; fi
+        done <<< "$OFFSET_ROWS"
+        info "  $COUNT remote offset(s): max=${MAX_ABS} ns"
+        if [ "$MISSING_COUNT" -eq 0 ] && [ "$MAX_ABS" -le 50000 ]; then
+            ok "  All reported PTP offsets are within 50 µs"
+            PASS=$((PASS+1))
+        elif [ "$MISSING_COUNT" -gt 0 ]; then
+            warn "  $MISSING_COUNT SLAVE clock(s) lack an offset — sync is unverified"
+            WARN_COUNT=$((WARN_COUNT+1))
         else
-            warn "  No master offset values in ptp4l log yet"
+            warn "  A PTP slave offset exceeds 50 µs — sync is not ready"
             WARN_COUNT=$((WARN_COUNT+1))
         fi
     else
-        warn "  Could not read ptp4l journal"
+        warn "  No remote offsetFromMaster values returned by pmc"
         WARN_COUNT=$((WARN_COUNT+1))
     fi
 
@@ -407,7 +467,8 @@ verify_lidar_sync() {
     echo " Quick test: launch a LiDAR in ROS 2:"
     echo "   source ~/.bashrc && ros2 launch seyond start.py"
     echo ""
-    echo " Next: ./5_setup_camera_ptp.sh --eth $ETH_IFACE"
+    echo " Camera-free P1 + LiDAR setup is complete."
+    echo " Optional cameras only: ./5_setup_camera_ptp.sh --eth $ETH_IFACE"
     echo ""
 }
 

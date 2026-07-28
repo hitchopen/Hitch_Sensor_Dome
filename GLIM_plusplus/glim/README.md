@@ -39,7 +39,7 @@ If you find this package useful for your project, please consider leaving a comm
 
 ### Optional
 - [CUDA](https://developer.nvidia.com/cuda-toolkit)
-- [OpenCV](https://opencv.org/)
+- [OpenCV](https://opencv.org/) (`BUILD_WITH_OPENCV=OFF` by default)
 - [OpenMP](https://www.openmp.org/)
 - [ROS/ROS2](https://www.ros.org/)
 - [Iridescence](https://github.com/koide3/iridescence)
@@ -90,4 +90,3 @@ The GLIM framework involves ideas expanded from the following papers:
 ## Contact
 [Kenji Koide](https://staff.aist.go.jp/k.koide/), k.koide@aist.go.jp<br>
 National Institute of Advanced Industrial Science and Technology (AIST), Japan
-

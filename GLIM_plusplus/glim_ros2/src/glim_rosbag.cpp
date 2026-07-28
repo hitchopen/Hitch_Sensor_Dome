@@ -20,7 +20,9 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
+#ifdef BUILD_WITH_CV_BRIDGE
 #include <sensor_msgs/msg/compressed_image.hpp>
+#endif
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -134,8 +136,15 @@ int main(int argc, char** argv) {
 
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "/imu");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
-  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
-  std::vector<std::string> topics = {imu_topic, points_topic, image_topic};
+  std::vector<std::string> topics = {imu_topic, points_topic};
+#ifdef BUILD_WITH_CV_BRIDGE
+  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
+  if (!image_topic.empty()) {
+    topics.push_back(image_topic);
+  } else {
+    spdlog::info("camera input disabled (glim_ros.image_topic is empty)");
+  }
+#endif
 
   // Load multi-LiDAR concatenation config
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
@@ -888,7 +897,7 @@ int main(int argc, char** argv) {
         }
       }
 #ifdef BUILD_WITH_CV_BRIDGE
-      else if (msg->topic_name == image_topic) {
+      else if (!image_topic.empty() && msg->topic_name == image_topic) {
         if (topic_type == "sensor_msgs/msg/Image") {
           auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
           image_serialization.deserialize_message(&serialized_msg, image_msg.get());

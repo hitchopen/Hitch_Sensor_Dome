@@ -17,7 +17,7 @@
 # is stationary, which is useful when investigating slow Atlas Duo lock,
 # bag-trim correctness, or unexpected init delays.
 #
-# It reads the first N seconds of /imu/data from a rosbag (or live topic),
+# It reads the first N seconds of /gps_p1/imu from a rosbag (or live topic),
 # computes |‖a‖ − 9.81| and ‖ω‖ statistics, and prints a bold RED warning
 # if the data is non-stationary.  See GLIM_plusplus/docs/moving_start_initialization.md
 # for the full design of the C++-side init.
@@ -26,7 +26,7 @@
 #   # Live mode (subscribe for 3 s)
 #   python3 check_init_stationarity.py --live
 #
-#   # Bag mode (read first 3 s of /imu/data from an MCAP)
+#   # Bag mode (read first 3 s of /gps_p1/imu from an MCAP)
 #   python3 check_init_stationarity.py --bag recording/data/session_<ts>/rosbag2
 #
 #   # Strict: exit 2 if non-stationary (CI / launch gating)
@@ -259,8 +259,8 @@ def main(argv=None) -> int:
     src.add_argument("--bag",  type=Path, help="Path to a rosbag2 directory (MCAP).")
     src.add_argument("--live", action="store_true",
                      help="Subscribe live to --topic for --window seconds.")
-    p.add_argument("--topic", default="/imu/data",
-                   help="IMU topic name (default: /imu/data)")
+    p.add_argument("--topic", default="/gps_p1/imu",
+                   help="IMU topic name (default: /gps_p1/imu)")
     p.add_argument("--window", type=float, default=DEFAULT_WINDOW_S,
                    help=f"Window in seconds (default: {DEFAULT_WINDOW_S})")
     p.add_argument("--acc-dev-thresh", type=float,

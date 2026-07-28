@@ -29,13 +29,17 @@ Humble/Jazzy C++17 and `rclcpp` API surface.
 
 ## 1. Hardware retargeting
 
-Topic, frame, and URDF defaults throughout the configs target the Hitch Sensor Dome (3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM), matching [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml).
+Topic, frame, and URDF defaults target P1/Atlas plus up to three Seyond Robin W
+units, matching
+[`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml). Cameras are
+optional payload sensors: GICP++ has no camera subscription or camera
+requirement.
 
 | Surface | Hitch Sensor Dome setting |
 |---------|---------------------------|
 | Primary LiDAR topic | `/robin_w_front/points` |
 | Aux LiDAR topics | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
-| IMU topic | `/imu/data` live default; `/gps_p1/imu` supported for normalized replay |
+| IMU topic | `/gps_p1/imu` adapter-normalized default; `/imu/data` accepted for legacy bags |
 | GT odom topic | `/gps_p1/filtered_odom_rtk_fixed` (adapter fixed-only output) |
 | ENU datum metadata | `/gps_p1/local_enu_origin` (`std_msgs/String`, transient-local) |
 | `base_frame` | `base_link` (see §9) |
@@ -80,6 +84,12 @@ compatible: when the parameter is unset or explicitly empty, deprecated
 `localization/lidar_concat/enabled:=true` resolves to `three_lidar`, while its
 default `false` resolves to `front_only`; both paths emit a deprecation
 warning. The shipped YAML and launch layer always set `lidar_mode` explicitly.
+
+Operationally, a GICP deployment may therefore contain one, two, or three
+LiDARs as long as the front primary is present. Use `front_only` with a
+one- or two-LiDAR installation; any fitted rear stream is simply unused by the
+localizer. Select `three_lidar` only when both rear units are present. P1/Atlas
+remains mandatory as the IMU source in every mode.
 
 ```bash
 # Lowest LiDAR compute load: one front Robin W.
@@ -282,8 +292,8 @@ Two new bold-yellow one-shot warnings to surface common operator-side misconfigu
 Healthy state prints a single confirmation INFO line.
 
 **(b) IMU never arrived.** The check reports the resolved topic and publisher
-count. The live default is `/imu/data`; `/gps_p1/imu` is accepted for
-normalized adapter replays.
+count. The default is the adapter-normalized `/gps_p1/imu`; `/imu/data`
+remains accepted for legacy bags.
 
 Files touched: [`src/localization.cc`](src/localization.cc) (gt_odom timer at ~line 490; IMU topic warn around line 450).
 
@@ -410,7 +420,7 @@ against the locked pre-fix baseline.
   (acceptance/streaks, gicp_ms percentiles, fitness floor + suggested ratio
   thresholds, gt_err yaw-rate buckets, concat coverage).
 - **URDF-first extrinsics** (`urdf_transforms.hpp`, libxml2 dep) and the
-  single-IMU allowlist guard (`/imu/data` and `/gps_p1/imu`; exactly one
+  single-IMU allowlist guard (`/gps_p1/imu` and legacy `/imu/data`; exactly one
   subscription is used, and frame match is required against `imu_link`).
 - **Evidence-first defaults:** `debug/enable_pub` and `verbose_scan_log` are
   ON (and the `verbose:false` WARN clamp now spares the SCAN DEBUG lines).

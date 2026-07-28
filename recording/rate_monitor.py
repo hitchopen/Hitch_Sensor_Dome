@@ -9,7 +9,7 @@
 # panel then renders the live rates in the recording dashboard.
 #
 # Run standalone for debugging:
-#   python3 rate_monitor.py --topics /imu/data /robin_w_front/points
+#   python3 rate_monitor.py --topics /gps_p1/imu /robin_w_front/points
 # =============================================================
 
 from __future__ import annotations

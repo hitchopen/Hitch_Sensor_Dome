@@ -10,7 +10,7 @@ endif()
 
 option(BUILD_WITH_CUDA "Build with GPU support" ON)
 option(BUILD_WITH_VIEWER "Build with visualizer" ON)
-option(BUILD_WITH_CV_BRIDGE "Build with cv_bridge which enables support for processing of camera images" ON)
+option(BUILD_WITH_CV_BRIDGE "Build with cv_bridge which enables support for processing of camera images" OFF)
 
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
@@ -21,13 +21,18 @@ find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBXML2 REQUIRED libxml-2.0)
 
-if(DEFINED GLIM_USE_OPENCV AND NOT GLIM_USE_OPENCV AND BUILD_WITH_CV_BRIDGE)
-  message(WARNING "BUILD_WITH_CV_BRIDGE is disabled because glim is not built with OpenCV.")
-  set(BUILD_WITH_CV_BRIDGE OFF CACHE BOOL "glim is not built with OpenCV" FORCE)
-endif()
-
 if(BUILD_WITH_CV_BRIDGE)
+  if(NOT DEFINED GLIM_USE_OPENCV OR NOT GLIM_USE_OPENCV)
+    message(FATAL_ERROR
+      "BUILD_WITH_CV_BRIDGE=ON requires the glim package to be built with "
+      "BUILD_WITH_OPENCV=ON")
+  endif()
+  find_package(cv_bridge REQUIRED)
+  find_package(image_transport REQUIRED)
   add_definitions(-DBUILD_WITH_CV_BRIDGE)
+  message(STATUS "GLIM ROS camera intake: ENABLED (cv_bridge + image_transport)")
+else()
+  message(STATUS "GLIM ROS camera intake: DISABLED (default)")
 endif()
 
 if(BUILD_WITH_CUDA)
@@ -39,11 +44,13 @@ if(BUILD_WITH_CUDA)
   endif()
 endif()
 
-set(OLD_DISTRO "humble;galactic;foxy")
-if($ENV{ROS_DISTRO} IN_LIST OLD_DISTRO)
-  add_definitions(-DCV_BRIDGE_INCLUDE_H)
-else()
-  add_definitions(-DCV_BRIDGE_INCLUDE_HPP)
+if(BUILD_WITH_CV_BRIDGE)
+  set(OLD_DISTRO "humble;galactic;foxy")
+  if($ENV{ROS_DISTRO} IN_LIST OLD_DISTRO)
+    add_definitions(-DCV_BRIDGE_INCLUDE_H)
+  else()
+    add_definitions(-DCV_BRIDGE_INCLUDE_HPP)
+  endif()
 endif()
 
 ### glim_ros ###
@@ -59,6 +66,9 @@ target_link_libraries(glim_ros
   glim::glim
   ${LIBXML2_LIBRARIES}
 )
+if(BUILD_WITH_CV_BRIDGE)
+  ament_target_dependencies(glim_ros cv_bridge image_transport)
+endif()
 rclcpp_components_register_nodes(glim_ros "glim::GlimROS")
 
 ament_auto_add_library(rviz_viewer SHARED
@@ -82,6 +92,9 @@ target_link_libraries(glim_rosbag
   glim_ros
   ${LIBXML2_LIBRARIES}
 )
+if(BUILD_WITH_CV_BRIDGE)
+  ament_target_dependencies(glim_rosbag cv_bridge image_transport)
+endif()
 
 ### validator_node ###
 ament_auto_add_executable(validator_node

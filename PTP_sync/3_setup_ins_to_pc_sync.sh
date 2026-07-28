@@ -14,12 +14,12 @@
 #         → phc2sys: CLOCK_REALTIME → NIC PHC
 #         → ptp4l: NIC PHC → PTP announce on Ethernet
 #     - FusionEngine over TCP 30201
-#         → ros2-fusion-engine-driver → /pose, /imu, /gps/fix, /odom
+#         → deployment native-message driver → adapter → /gps_p1/*
 #     - NTRIP RTCM3 inbound from caster (RTK corrections)
 #
 # Steady-state accuracy: host CLOCK_REALTIME ~10–100 ms to GPS
 # (NMEA-only discipline, no PPS edge). Cross-sensor PTP is
-# unaffected; LiDARs and cameras still sync to the host NIC
+# unaffected; fitted LiDARs and optional cameras still sync to the host NIC
 # PHC at sub-µs (hardware timestamping) or sub-50 µs (software).
 # FusionEngine message headers carry GPS time directly from the
 # Atlas — that path is independent of host-clock drift.
@@ -29,7 +29,7 @@
 #   ./2_configure_host_network.sh
 #   ./3_setup_ins_to_pc_sync.sh      ← you are here
 #   ./4_setup_lidar_ptp.sh
-#   ./5_setup_camera_ptp.sh
+#   ./5_setup_camera_ptp.sh          (optional; cameras only)
 #
 # Prerequisites:
 #   - Sections 1 + 2 completed
@@ -257,31 +257,12 @@ sudo systemctl enable --now "${SERVICES[@]}" || \
     warn "One or more services did not start cleanly — check 'systemctl status <svc>'."
 ok "systemd services enabled and started."
 
-# ─── 6. Point One Nav driver + tools (TCP transport) ────────
-info "Installing Point One Nav ROS 2 driver..."
-source_ros_setup
-mkdir -p "$WS_DIR/src"
-
-cd "$WS_DIR/src"
-[ -d "ros2-fusion-engine-driver" ] || \
-    git clone https://github.com/PointOneNav/ros2-fusion-engine-driver.git
-
-# Fix <cstdint> for GCC 14
-find "$WS_DIR/src/ros2-fusion-engine-driver" \
-    \( -name "*.h" -o -name "*.hpp" -o -name "*.cc" -o -name "*.cpp" \) | \
-    xargs grep -l "uint8_t\|uint16_t\|uint32_t\|uint64_t" 2>/dev/null | \
-    while read -r f; do
-        grep -q "#include <cstdint>" "$f" || sed -i '1 a #include <cstdint>' "$f"
-    done
-
-cd "$WS_DIR"
-rosdep install -i --from-paths src/ros2-fusion-engine-driver --rosdistro "$ROS_DISTRO" -y \
-    --skip-keys fusion_engine_msgs
-colcon build --packages-up-to fusion_engine_driver
-
-grep -q "source ~/ros2_ws/install/setup.bash" "$HOME/.bashrc" 2>/dev/null || \
-    echo "source ~/ros2_ws/install/setup.bash" >> "$HOME/.bashrc"
-
+# ─── 6. Point One Nav host tools ─────────────────────────────
+# The public ros2-fusion-engine-driver stamps messages with host arrival time
+# and publishes geometry_msgs/PoseStamped. Hitch's adapter requires the
+# deployment's native fusion_engine_msgs/Pose stream, including solution type,
+# GPS time, and covariance, so installing the generic driver here would create
+# a plausible but incompatible data path.
 info "Installing Point One host tools..."
 cd "$HOME"
 [ -d "p1-host-tools" ] || git clone https://github.com/PointOneNav/p1-host-tools.git
@@ -289,13 +270,9 @@ cd p1-host-tools
 pip install -r requirements.txt --break-system-packages 2>/dev/null || true
 pip install "fusion-engine-client[all]" --break-system-packages 2>/dev/null || true
 
-ok "Point One Nav driver and tools installed."
-info "Driver invocation example (TCP transport):"
-echo "  ros2 run fusion_engine_driver fusion_engine_ros_driver --ros-args \\"
-echo "      -p connection_type:=tcp \\"
-echo "      -p tcp_ip:=$ATLAS_IP \\"
-echo "      -p tcp_port:=$ATLAS_FE_PORT \\"
-echo "      -p frame_id:=imu_link"
+ok "Point One Nav host tools installed."
+warn "The Atlas native-message ROS driver is deployment-provided and must be "
+warn "started separately before adapter/ and recording/sensor_recorder.py."
 
 # =============================================================
 # Self-test
@@ -379,24 +356,21 @@ verify_grandmaster() {
         ok "  ptp4l-grandmaster service is running"
         PASS=$((PASS+1))
 
-        GM_LOG=$(sudo journalctl -u ptp4l-grandmaster --no-pager -n 50 2>/dev/null || true)
-        if echo "$GM_LOG" | grep -q "assuming the grand master role"; then
-            ok "  ptp4l has assumed grandmaster role"
+        PMC_LOCAL=$(sudo pmc -u -b 0 "GET PORT_DATA_SET" 2>/dev/null || true)
+        if echo "$PMC_LOCAL" | grep -q "portState[[:space:]]*MASTER"; then
+            ok "  pmc confirms a local MASTER port"
             PASS=$((PASS+1))
         else
-            warn "  ptp4l may not be grandmaster — check: sudo journalctl -u ptp4l-grandmaster -f"
+            warn "  pmc did not report a local MASTER port"
             WARN_COUNT=$((WARN_COUNT+1))
         fi
-
-        LAST_OFFSET=$(echo "$GM_LOG" | grep "master offset" | tail -1)
-        [ -n "$LAST_OFFSET" ] && info "  Last ptp4l log: $LAST_OFFSET"
     else
         warn "  ptp4l-grandmaster not running"
         WARN_COUNT=$((WARN_COUNT+1))
     fi
 
-    # ── Test 6: phc2sys (HW timestamping only) + ROS 2 driver ──
-    info "Test 6/6: phc2sys + ROS 2 driver"
+    # ── Test 6: phc2sys (HW timestamping only) + host tools ──
+    info "Test 6/6: phc2sys + Point One host tools"
     if [ "$PTP_TIMESTAMPING" = "hardware" ]; then
         if systemctl is-active --quiet phc2sys-grandmaster 2>/dev/null; then
             ok "  phc2sys-grandmaster running"
@@ -410,12 +384,11 @@ verify_grandmaster() {
         PASS=$((PASS+1))
     fi
 
-    source_optional_setup "$WS_DIR/install/setup.bash" || true
-    if ros2 pkg list 2>/dev/null | grep -q "fusion_engine_driver"; then
-        ok "  fusion_engine_driver package found"
+    if python3 -c "import fusion_engine_client" 2>/dev/null; then
+        ok "  fusion_engine_client Python package found"
         PASS=$((PASS+1))
     else
-        warn "  fusion_engine_driver not found — rebuild: cd ~/ros2_ws && colcon build --packages-up-to fusion_engine_driver"
+        warn "  fusion_engine_client not importable — rerun the host-tools install"
         WARN_COUNT=$((WARN_COUNT+1))
     fi
 

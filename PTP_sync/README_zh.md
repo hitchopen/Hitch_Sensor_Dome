@@ -1,4 +1,4 @@
-# 传感器记录系统：Point One Nav Atlas Duo + Seyond Robin W LiDAR + RouteCAM 摄像头
+# 传感器记录系统：Point One Nav Atlas Duo + Seyond Robin W LiDAR
 
 在 Ubuntu 22.04 + ROS 2 Humble 或 Ubuntu 24.04 + ROS 2 Jazzy（可选 PREEMPT_RT 实时内核）上搭建的高性能 GNSS / IMU / LiDAR / 摄像头数据采集系统的安装与配置指南。
 
@@ -6,17 +6,18 @@
 - Ubuntu 22.04 或 24.04 LTS 工作站（在 Lenovo ThinkPad P1 Gen 6、Intel i9-13900H 上验证）
 - Point One Nav Atlas Duo（GNSS / INS，仅以太网）
 - 最多 3 台 Seyond Robin W 方向性 LiDAR
-- 4 台 e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision 摄像头（PoE、IEEE 1588 PTP、2MP 全局快门）
+- 可选：0–4 台 e-con RouteCAM_P_CU25_CXLC_IP67 GigE Vision 摄像头
 
-**部署流程。** 本目录下 5 个编号脚本按顺序运行。每个脚本只负责一个逻辑步骤，自带自检并在结束时提示下一步运行哪一个脚本。
+**部署流程。** 无摄像头的 P1 + LiDAR 管线只需依次运行脚本 1–4；只有实际安装
+RouteCAM 时才运行脚本 5。每个脚本只负责一个逻辑步骤并自带自检。
 
 | # | 脚本 | 功能 |
 |---|--------|--------|
 | 1 | [`1_install_packages.sh`](1_install_packages.sh) | apt 依赖、RT 调度权限、内核调优、ROS 2 Humble/Jazzy |
 | 2 | [`2_configure_host_network.sh`](2_configure_host_network.sh) | 主机 NIC 静态 IP、硬件时间戳检测、RUTM50 可达性 |
-| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd（TCP 上的 NMEA）、chrony、ptp4l grandmaster、phc2sys、fusion_engine_driver（TCP） |
+| 3 | [`3_setup_ins_to_pc_sync.sh`](3_setup_ins_to_pc_sync.sh) | gpsd（TCP 上的 NMEA）、chrony、ptp4l grandmaster、phc2sys、Point One 主机工具 |
 | 4 | [`4_setup_lidar_ptp.sh`](4_setup_lidar_ptp.sh) | Robin W PTP slave 启用 + Seyond ROS 2 驱动 |
-| 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | RouteCAM PTP slave 启用 + Aravis（仅 Tier 2） |
+| 5 | [`5_setup_camera_ptp.sh`](5_setup_camera_ptp.sh) | **可选：** RouteCAM PTP slave 启用 + Aravis（仅 Tier 2） |
 
 每台 LiDAR 的一次性配置由 [`provision_robin_w_multiunit.sh`](provision_robin_w_multiunit.sh) 负责 —— 见第 4 节。
 
@@ -75,7 +76,7 @@ chmod +x 1_install_packages.sh
 - **apt 依赖：** `build-essential`、`cmake`、`git`、`linuxptp`、`chrony`、`gpsd`、`pps-tools`、`tcpdump`、`ethtool`、`libyaml-cpp-dev`、Python 相关工具。
 - **RT 调度组 + 限制：** 建立 `realtime` 组并加入当前用户，写入 `/etc/security/limits.d/99-realtime.conf`，授予该组 `rtprio 99` 和 `memlock unlimited`。无论是否运行 RT 内核，这些限制都是 PTP 守护进程以实时优先级运行的必要条件。
 - **内核 `sysctl` 调优：** 大 UDP 缓冲区（`net.core.rmem_max=32 MiB`）和 `vm.swappiness=10`，应对高带宽 LiDAR / 摄像头流。
-- **ROS 2 Humble/Jazzy：** desktop + 开发工具 + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/默认存储插件。在 `~/.bashrc` 中 `source /opt/ros/$ROS_DISTRO/setup.bash`。
+- **ROS 2 Humble/Jazzy：** `ros-base` + 开发工具 + `rviz2` + `foxglove-bridge` + `pcl-ros` + `tf2-tools` + rosbag2 MCAP/默认存储插件。默认安装不包含摄像头软件包；只有可选脚本 5 会单独安装它们。在 `~/.bashrc` 中 `source /opt/ros/$ROS_DISTRO/setup.bash`。
 - **`tcpdump` 权限位：** `cap_net_raw+ep`，让录制脚本无需 `sudo` 即可抓 UDP。
 
 脚本末尾的自检会验证：RT 内核标志、组成员资格、`sysctl` 值、ROS 2 安装。
@@ -196,7 +197,7 @@ Tier 1 和 Tier 2 共用同一份地址表。所有静态设备都在 `.100` 以
 | .30 | Atlas Duo INS 以太网（静态，仅用于 NTRIP RTK） | ✓ | ✓ |
 | .100 – .249 | RUTM50 DHCP 池 —— 出厂默认，保持不动 | ✓ | ✓ |
 
-> **为什么 `.5` 和 `.30` 固定到这两个地址。** 在 RUTM50 的 Network → LAN → Static Leases 页通过 MAC 地址把 PC 静态租约到 .5、把 Atlas Duo 静态租约到 .30。这样两台设备重启之后还是同一地址，而设备端完全不需要写静态网络配置 —— RUTM50 每次都发同一个 IP。完整的 Static Leases 操作步骤见项目根目录 README 的网络小节。
+> **为什么 `.5` 和 `.30` 固定到这两个地址。** 在 RUTM50 的 Network → LAN → Static Leases 页通过 MAC 地址把 PC 静态租约到 .5、把 Atlas Duo 静态租约到 .30。这样两台设备重启之后还是同一地址，而设备端完全不需要写静态网络配置 —— RUTM50 每次都发同一个 IP。完整步骤：RUTM50 web UI → Network → LAN → Static Leases → Add，把每台设备的 MAC 绑定到你希望它固定使用的地址。重启两台设备并确认它们回到同一 IP 之后，再运行本目录中的任何脚本 —— 下文每一步都假定这些地址是稳定的。
 
 **Atlas Duo 以太网（时间 + 数据 + NTRIP）。** Atlas Duo 唯一对外暴露的时间与数据接口就是以太网口 —— 它的硬件不带 BNC PPS 引脚，也不带 USB 串口的数据输出。同一条网线既把 FusionEngine（TCP 30201）和 NMEA（TCP 30200）送到主机，也从你的 caster（Trimble VRS Now、本地基站等）反向拉取 RTK NTRIP 校正（RTCM3）。通过 Atlas Web UI 配置：静态 IP `192.168.1.30`（或 DHCP + 保留）、网关 `192.168.1.1`、DNS `192.168.1.1`，将 NTRIP 客户端指向你的 caster。整条时间同步链（gpsd → chrony → ptp4l）都跑在这同一条以太网上 —— 主机侧的配置见 §3。
 
@@ -291,7 +292,10 @@ chmod +x provision_robin_w_multiunit.sh
 
 ## 第 3 节：INS 到 PC 的 PTP 同步
 
-Point One Nav Atlas Duo 通过 TCP 输出 NMEA 用于规范主机 `CLOCK_REALTIME`，同时通过 TCP 输出 FusionEngine 把姿态 / IMU / GPSFix / 里程信息送给 ROS 2 驱动。主机则在传感器局域网上扮演 PTP grandmaster 角色 —— 第 4、5 节配置同步到它的传感器 *slave*。
+Point One Nav Atlas Duo 通过 TCP 输出 NMEA 用于规范主机
+`CLOCK_REALTIME`。FusionEngine 流则由部署提供的原生消息 ROS 驱动独立
+读取。主机在传感器局域网上扮演 PTP grandmaster；第 4、5 节配置同步到
+它的传感器 slave。
 
 ```
 ┌─────────────────────────┐
@@ -313,7 +317,7 @@ Point One Nav Atlas Duo 通过 TCP 输出 NMEA 用于规范主机 `CLOCK_REALTIM
 │  chrony ← SHM → CLOCK_REALTIME (~10–100 ms 到 GPS) │
 │  phc2sys: CLOCK_REALTIME → NIC PHC (/dev/ptp0)    │
 │  ptp4l:   NIC PHC → 在以太网上 announce PTP        │
-│  fusion_engine_driver: TCP 30201 → /pose /imu /…   │
+│  Atlas 原生驱动: TCP 30201 → 原生 ROS 数据          │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -342,8 +346,13 @@ chmod +x 3_setup_ins_to_pc_sync.sh
 - **`ptp4l` grandmaster：** 在传感器 NIC 上 announce。由于主机时钟不再被规范到 < 100 ns 的 GPS 精度，脚本默认把 `clockClass` 设为 **13**（应用专用、锁到内部参考），而不是 6（锁到一级 GPS 参考）。跨传感器 PTP 同步仍然紧密；改成 13 只是诚实告诉 PTP 从机当前的绝对时间归属。
 - **`phc2sys`：** 把 `CLOCK_REALTIME` 复制到 NIC PHC（仅硬件时间戳时相关）。
 - **systemd：** enable 并启动 `gpsd`、`chrony`、`ptp4l-grandmaster`；只有 NIC 支持硬件时间戳时才启用 `phc2sys-grandmaster`。整个链路无需重启即可生效。
-- **fusion_engine_driver：** 克隆并 `colcon build` Point One Nav ROS 2 驱动到 `~/ros2_ws/`。自动打 GCC 14 的 `<cstdint>` 补丁。驱动调用使用 `connection_type:=tcp` 加 Atlas Duo IP（不再使用 `connection_type:=tty`）。
 - **Point One host tools：** 把 `p1-host-tools/` 克隆到 `$HOME`，`pip install fusion-engine-client[all]`。
+
+脚本明确**不会**安装 Point One 的公开 `ros2-fusion-engine-driver`。固定的
+上游版本发布使用主机到达时间的 `geometry_msgs/msg/PoseStamped`，而
+Hitch adapter 要求部署提供的 `fusion_engine_msgs/msg/Pose`，其中必须保留
+设备时间、解算类型和协方差。运行 adapter 与录制器之前，需单独启动该原生
+消息驱动。
 
 ### 3.2 手动验证
 
@@ -371,10 +380,9 @@ chronyc sources -v
 chronyc tracking
 # "Reference ID" 应显示 NMEA，而不是 NTP 服务器 IP
 
-# PTP grandmaster
-sudo journalctl -u ptp4l-grandmaster -f
-# 应看到："assuming the grand master role"
-# master offset 应 < 1000 ns (硬件) 或 < 50 µs (软件)
+# 配置阶段的 PTP grandmaster 诊断
+sudo "$(command -v pmc)" -u -b 0 "GET PORT_DATA_SET"
+# 至少一个本机 portState 必须为 MASTER。
 
 # PHC 同步 (仅硬件时间戳)
 sudo journalctl -u phc2sys-grandmaster -f
@@ -390,7 +398,10 @@ sudo systemctl status phc2sys-grandmaster
 
 ## 第 4 节：PC 到 LiDAR 的 PTP 同步
 
-把 3 台 Seyond Robin W 配置为第 3 节中 grandmaster 的 PTP slave，并安装 Seyond ROS 2 驱动。假定 [§2.7](#27-每台-lidar-的一次性网络配置) 的一次性网络配置已经完成，把每台 Robin W 从工厂 IP `172.168.1.10` 改成穹顶 IP `192.168.1.10` / `.11` / `.12`。如果 `4_setup_lidar_ptp.sh` 在这些地址上 ping 不到 LiDAR，请先回到 §2.7 跑配置脚本。
+把 1–3 台 Seyond Robin W 配置为第 3 节中 grandmaster 的 PTP slave，并安装
+Seyond ROS 2 驱动。通过 `--ips` 只列出本机实际安装的设备：GICP 要求前向主
+LiDAR，可带 0–2 台后向 LiDAR；GLIM 要求三台全部存在。每台已安装 Robin W
+仍须先按 [§2.7](#27-每台-lidar-的一次性网络配置) 完成一次性网络配置。
 
 ### 4.1 运行 LiDAR PTP 同步脚本
 
@@ -418,7 +429,8 @@ chmod +x 4_setup_lidar_ptp.sh
 
 ## 第 5 节：PC 到摄像头的 PTP 同步
 
-> **仅 Tier 2。** 摄像头本身要求 PoE 且明显得益于 Planet WGS-6325-8UP2X 的边界时钟 —— 见 §2.2。如果你跑的是 Tier 1 仅 LiDAR 部署，整节都可以跳过。
+> **可选且仅适用于 Tier 2。** 未安装摄像头时，在第 4 节结束即可；录制器、
+> GICP++ 和 GLIM++ 都完整支持这种部署。只有实际安装摄像头时才需要本节。
 
 ### 5.1 运行摄像头 PTP 同步脚本
 
@@ -449,27 +461,46 @@ chmod +x 5_setup_camera_ptp.sh
 
 仓库支持的录制器是
 [`../recording/sensor_recorder.py`](../recording/sensor_recorder.py)。它启动已配置的
-ROS 2 传感器驱动，检查 chrony/PTP 与 RTK 门控，录制 MCAP rosbag，并启动
-Foxglove bridge。录制器本身无需 root；只有可选的 `pmc` 管理查询使用
-`sudo -n`。
+LiDAR/相机驱动，检查 chrony、实际传感器时间戳与 Atlas adapter 门控，录制
+MCAP rosbag，并启动 Foxglove bridge。录制器完全不需要 root，也不会调用
+`pmc`。运行时硬门控会在
+建包之前直接订阅每一个已选 LiDAR/相机话题，把各自 `header.stamp` 与主机
+`CLOCK_REALTIME` 比较，并检查消息年龄稳定性与漂移。配置脚本只在安装诊断时
+交互式调用 `sudo pmc`。
 
-生产 GLIM++ 数据包必须另行启动 Atlas adapter，并且只提供一个部署原点。
-录制器不会代替你启动 adapter：
+职责是单向且明确的：**本 `PTP_sync/` 目录负责配置并校准所有时钟；录制器只
+验证最终状态。** 录制预检失败时，录制器不会启用 PTP、调整时钟或重启任何
+同步服务。应在本目录中排除故障，然后重新运行录制器。
+
+生产 GLIM++ 数据包必须先启动部署使用的 Atlas 原生消息驱动。它必须在
+`/atlas/pose_filtered` 发布 `fusion_engine_msgs/msg/Pose`，并在
+`/atlas/imu_calibrated` 发布 `sensor_msgs/msg/Imu`；通用
+`fusion_engine_ros_driver` 不保留 adapter 的 RTK 门控所需的原生解算类型与
+协方差。然后另行启动 adapter，并且只提供一个部署原点。录制器不会启动这两个
+Atlas 组件：
 
 ```bash
-# 终端 1：标准化 Atlas 流和权威 Fixed-only 里程计。
+# 终端 1：启动部署使用的 Atlas 原生消息驱动，然后核对：
+ros2 topic type /atlas/pose_filtered
+ros2 topic type /atlas/imu_calibrated
+
+# 终端 2：标准化 Atlas 流和权威 Fixed-only 里程计。
 ros2 launch adapter adapter.launch.py \
+  use_sim_time:=false \
   use_p1_imu_pcap:=false \
+  pose_input_topic:=/atlas/pose_filtered \
+  imu_input_topic:=/atlas/imu_calibrated \
   local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
 
-# 终端 2：检测传感器、验证同步/RTK 并录制。
+# 终端 3：强制生产 GLIM profile 并录制。
 cd /path/to/Hitch_Sensor_Dome
-python3 recording/sensor_recorder.py
+python3 recording/sensor_recorder.py --profile glim
 ```
 
 输出位于 `recording/data/session_<timestamp>/rosbag2/*.mcap`，同时包含日志和
-`session_metadata.json`。发布端可用时，包内包括三路 Robin W 点云、相机、
-`/imu/data`、`/gps_p1/fix`、`/gps_p1/filtered_odom_rtk_fixed`、TF 和诊断。
+`session_metadata.json`。GLIM profile 包括三路 Robin W 点云、
+`/gps_p1/imu`、`/gps_p1/fix`、`/gps_p1/filtered_odom_rtk_fixed`、TF 和诊断；
+只有检测并选择摄像头时才包含相机话题。
 完整运行与配置说明见 [`../recording/README.md`](../recording/README.md) 和
 [`../recording/sensor_config.yaml`](../recording/sensor_config.yaml)。
 
@@ -539,7 +570,9 @@ NVIDIA 内核模块（`nvidia.ko`）无法在 PREEMPT_RT 内核上加载。RT �
 
 ### D. 故障排查
 
-**PTP 不同步（master offset 很大）：** 确认 `ptp4l` 配置中的接口名称与实际匹配。确认每台 Robin W 都启用了 PTP。检查电缆连接。
+**PTP 不同步：** 确认 `ptp4l` 配置中的接口名称与实际匹配，然后运行
+`sudo "$(command -v pmc)" -u -b 0 "GET PORT_DATA_SET"`，要求本机状态为
+`MASTER`。确认每台 Robin W 都启用了 PTP，并检查电缆连接。
 
 **chronyc 显示 NTP 为主源（不是 NMEA）：** gpsd 可能没拿到 Atlas Duo 的 TCP 流。先 `ping 192.168.1.30` 确认可达，再确认 Atlas Duo 已在 Web UI 上点了 Start Navigating（不启动导航引擎，就没有 NMEA 输出）。运行 `sudo systemctl status gpsd` 和 `gpsmon`。绕开 gpsd 直接测原始 NMEA：`nc -w 5 192.168.1.30 30200 | head`。
 

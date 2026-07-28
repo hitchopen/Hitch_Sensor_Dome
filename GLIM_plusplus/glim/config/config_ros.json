@@ -102,14 +102,17 @@
       "libimu_validator.so"
     ],
     // Topics — Hitch Sensor Dome conventions.
-    //   /imu/data               fusion_engine_driver (sensor_msgs/Imu @ 200 Hz)
+    //   /gps_p1/imu             adapter-normalized Atlas IMU
     //   /robin_w_front/points   seyond driver, the primary stitched cloud.
     //                           rear-left and rear-right are merged into
     //                           this topic by the lidar_concat block in
     //                           config_sensors.json.
-    "imu_topic": "/imu/data",
+    "imu_topic": "/gps_p1/imu",
     "points_topic": "/robin_w_front/points",
-    "image_topic": "/cam_front_left/image_raw",
+    // Cameras are optional payload sensors and are not consumed by the
+    // shipped mapping modules. Empty disables the live image subscription and
+    // omits images from the offline rosbag filter.
+    "image_topic": "",
     // Hitch Sensor Dome fork: external INS init with RTK-fixed gating.
     //
     // The C++ wrapper (glim_ros2/src/glim_ros/glim_ros.cpp) subscribes

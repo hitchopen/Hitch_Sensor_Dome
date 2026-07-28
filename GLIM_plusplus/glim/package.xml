@@ -11,9 +11,9 @@
   <depend>spdlog</depend>
   <depend>eigen</depend>
   <depend>libboost-serialization-dev</depend>
-  <depend>libopencv-dev</depend>
   <depend>libxml2</depend>
 
+  <!-- Camera support is a non-default, manually provisioned build option. -->
   <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
   <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
 

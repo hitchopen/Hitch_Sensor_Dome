@@ -31,6 +31,13 @@ endif()
 
 find_package(glim REQUIRED)
 
+if((ENABLE_ORBSLAM OR ENABLE_DBOW) AND
+   (NOT DEFINED GLIM_USE_OPENCV OR NOT GLIM_USE_OPENCV))
+  message(FATAL_ERROR
+    "ENABLE_ORBSLAM/ENABLE_DBOW require the glim package to be built with "
+    "BUILD_WITH_OPENCV=ON")
+endif()
+
 add_library(glim_ext SHARED
   src/glim_ext/util/config_ext.cpp
 )

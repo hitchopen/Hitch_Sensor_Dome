@@ -1,6 +1,6 @@
 # GLIM++ —— 面向 Hitch Sensor Dome 的深度改造 GLIM fork
 
-> **这不是原版 GLIM。** 文件夹名称特意采用 `GLIM_plusplus/`：本版本在算法行为层面（不仅是配置）已与上游 [`koide3/glim`](https://github.com/koide3/glim) 出现差异。如果您是来寻找原版 GLIM 的，原版仓库地址为 <https://github.com/koide3/glim>，并强烈建议从那里开始 —— 除非您拥有 [Hitch Sensor Dome](../README.md) 硬件。GLIM 算法与实现的全部功劳归 **Kenji Koide、Masashi Yokozuka、Shuji Oishi、Atsuhiko Banno（AIST）** 所有。详见 [Credits](#credits)、[License](#license)、[Citation](#citation)。
+> **这不是原版 GLIM。** 文件夹名称特意采用 `GLIM_plusplus/`：本版本在算法行为层面（不仅是配置）已与上游 [`koide3/glim`](https://github.com/koide3/glim) 出现差异。如果您是来寻找原版 GLIM 的，原版仓库地址为 <https://github.com/koide3/glim>，并强烈建议从那里开始 —— 除非您拥有 Hitch Sensor Dome 硬件。GLIM 算法与实现的全部功劳归 **Kenji Koide、Masashi Yokozuka、Shuji Oishi、Atsuhiko Banno（AIST）** 所有。详见 [Credits](#credits)、[License](#license)、[Citation](#citation)。
 
 本文档是 GLIM++ 与上游 `koide3/glim` 之间的**完整变更日志**。结构按机制分节，方便采用者逐项判断哪些改动适合自己的使用场景，哪些需要回退。
 
@@ -32,21 +32,29 @@
 
 ## 1. 面向 Hitch Sensor Dome 的传感器适配
 
-topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM）。
+topic、frame、字段名均面向 Hitch Sensor Dome 建图配置（3× Seyond Robin W +
+Point One Atlas Duo）。RouteCAM 是可选载荷；默认建图模块不要求也不消费摄像头。
 
 | 项目 | Hitch Sensor Dome 配置 |
 |------|-----|
-| IMU topic | `/imu/data` |
+| IMU topic | `/gps_p1/imu`（adapter 规范化 Atlas 数据流） |
 | 主 LiDAR | `/robin_w_front/points` |
 | 辅 LiDAR | `/robin_w_rear_left/points`、`/robin_w_rear_right/points` |
 | GNSS | `/gps_p1/fix`（适配器同步 NavSatFix 门控信号） |
-| 摄像头 | `/cam_front_left/image_raw` |
+| 摄像头 | 默认在编译阶段排除；只有可选扩展模块才需要显式启用 |
 | `intensity_field` | `intensity` |
 | `ring_field` | `ring` |
 | `flip_points_y` | `false`（Robin W 设置 `coordinate_mode:=3` 后符合 REP-103） |
 | LiDAR–IMU 外参来源 | 由 [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 生成的 URDF —— 见 §8 |
 
 涉及文件：`glim/config/config_sensors.json`、`glim/config/config_ros.json`。
+
+无摄像头由编译配置保证，而不只依赖运行期参数。
+`BUILD_WITH_OPENCV` 与 `BUILD_WITH_CV_BRIDGE` 均默认为 `OFF`；默认 package
+manifest 不声明 OpenCV、`cv_bridge` 或 `image_transport`，生成的 ROS 二进制
+不会包含在线图像订阅或离线图像反序列化路径。空 `image_topic` 仅为配置兼容
+而保留。GLIM 的必要传感器输入是 P1/Atlas 的 `/gps_p1/imu` 与三台 Robin W；
+生产 profile 仍会额外执行文档所述的 RTK-fixed 和航向质量门控。
 
 ### 1.1 单天线 vs 双天线模式
 
@@ -193,7 +201,7 @@ ins_init_timeout_s                默认 60.0
 fork 在 wrapper 内增加了一个进程内桥：
 
 ```
-fusion_engine_driver + adapter
+Atlas 原生消息驱动 + adapter
    ├── /gps_p1/filtered_odom_rtk_fixed (Odometry，仅 kRtkFixed)
    └── /gps_p1/fix    (适配器 NavSatFix, RTK 门控信号)
                   │
@@ -233,7 +241,7 @@ fusion_engine_driver + adapter
 |--------|----------|
 | [`config/`](config/) | `generate_sensor_dome_urdf.py` 把 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 转成 `sensor_dome.urdf`，GLIM 通过 `config_sensors.json` 中的 `urdf_path` 字段读取，既用于 `T_lidar_imu` 也用于多 LiDAR `lidar_concat`。是采集、可视化、建图三方共享的单一信息源。TF YAML 改动后重跑此脚本。 |
 | [`launch/`](launch/) | `hitch_sensor_dome.launch.py` 发布静态 TF、检查双天线/配置一致性、可选运行静止性诊断，并启动 Foxglove 支持。它**不会**启动 `glim_rosnode`；生产建图走离线流程。 |
-| [`scripts/`](scripts/) | `check_init_stationarity.py` —— 预飞诊断脚本；读 `/imu/data` 前 3 秒，若 bag 不静止则打印粗体红色警告。在 fork 中已退化为信息提示（C++ INS-init 路径自身能处理运动起步），但仍可用于排查 Atlas Duo 锁定缓慢、CI gating 等。 |
+| [`scripts/`](scripts/) | `check_init_stationarity.py` —— 预飞诊断脚本；读 `/gps_p1/imu` 前 3 秒，若 bag 不静止则打印粗体红色警告。在 fork 中已退化为信息提示（C++ INS-init 路径自身能处理运动起步），但仍可用于排查 Atlas Duo 锁定缓慢、CI gating 等。 |
 
 ## 9. 设计说明
 
@@ -427,7 +435,7 @@ z = 0.273 只是支架的名义高度，应按实际安装测量 —— 由于�
 cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 cd ../..
 
-# 编译（与上游一致：CMake / colcon、gtsam、gtsam_points、Iridescence）
+# 默认编译不包含摄像头数据入口及摄像头库。
 colcon build --packages-select glim glim_ext glim_ros \
              --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
@@ -445,7 +453,12 @@ ROS 2 包名（`glim`、`glim_ext`、`glim_ros`）与上游一致 —— 仅 wor
 
 ## 编译依赖
 
-与上游 GLIM 完全相同。具体清单见上游文档。
+默认编译只包含 LiDAR/IMU/GNSS。OpenCV、`cv_bridge` 与
+`image_transport` 不在默认 package manifest 中，也不是默认编译依赖。
+
+如果现有 workspace 曾缓存旧版的 `ON` 默认值，升级后的第一次编译请使用
+`colcon build --cmake-clean-cache ...`。全新的 build 目录会自动采用无摄像头
+默认值。
 
 ```bash
 sudo apt install -y libeigen3-dev libboost-all-dev libfmt-dev libomp-dev \
@@ -453,6 +466,22 @@ sudo apt install -y libeigen3-dev libboost-all-dev libfmt-dev libomp-dev \
                     ros-${ROS_DISTRO}-pcl-ros ros-${ROS_DISTRO}-foxglove-bridge
 # 之后是 GTSAM、gtsam_points、Iridescence —— 见上游 README。
 ```
+
+如需兼容上游的摄像头入口，必须手动安装依赖并同时开启两层编译开关：
+
+```bash
+sudo apt install -y libopencv-dev ros-${ROS_DISTRO}-cv-bridge \
+                    ros-${ROS_DISTRO}-image-transport
+colcon build --packages-select glim glim_ext glim_ros --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release \
+               -DBUILD_WITH_OPENCV=ON \
+               -DBUILD_WITH_CV_BRIDGE=ON
+```
+
+若只开启 ROS bridge 而核心 `glim` 未启用 OpenCV，CMake 会直接报错。
+`glim_ext` 的 `ENABLE_ORBSLAM` 与 `ENABLE_DBOW` 是另外两个依赖 OpenCV 的
+可选功能，默认也都是 `OFF`；启用任一功能时，核心 `glim` 也必须用
+`BUILD_WITH_OPENCV=ON` 编译。
 
 ## Credits
 
@@ -463,7 +492,7 @@ GLIM 由以下人员开发：
 - **Iridescence** —— Kenji Koide。<https://github.com/koide3/iridescence>
 - **GTSAM** —— Frank Dellaert 与 Georgia Tech Borg Lab。<https://github.com/borglab/gtsam>
 
-`GLIM_plusplus/{config, launch, scripts}/` 中的集成代码以及 §1 – §7 中所列改动属于 **Hitch Sensor Dome** 项目，由 Dr. Allen Y. Yang（Hitch Interactive · 加州大学伯克利分校）设计与维护。实现测试由 **Berkeley AI Racing Tech** 团队完成（见 [`../README.md`](../README.md) Credits）。
+`GLIM_plusplus/{config, launch, scripts}/` 中的集成代码以及 §1 – §7 中所列改动属于 **Hitch Sensor Dome** 项目，由 Dr. Allen Y. Yang（Hitch Interactive · 加州大学伯克利分校）设计与维护。实现测试与实地验证由 **Berkeley AI Racing Tech** 团队完成：来自加州大学伯克利分校（按姓氏字母序）—— Bryan Chang、Logan Kinajil-Moran、Moises Lopez Mendoza、Gary Passon、Tanishaa Viral Shah、Joshua Sun、Di Tian、Jovan Yap；来自加州大学圣地亚哥分校 —— Kevin Shin。
 
 ## License
 

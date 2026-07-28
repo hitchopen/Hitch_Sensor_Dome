@@ -13,8 +13,9 @@ GLIM++ mapping: `/gps_p1/filtered_odom_rtk_fixed` preserves FusionEngine's
 authoritative `solution_type == kRtkFixed` decision, which REP-145
 `NavSatFix` cannot express. `/gps_p1/fix` supplies a synchronized WGS84,
 freshness, and covariance cross-check for that same sample. GICP++ may still
-use its separate compatibility gate. See [README_HITCH_PORT.md](README_HITCH_PORT.md) and the
-[repo root README](../README.md) for the dome wiring.
+use its separate compatibility gate. See [README_HITCH_PORT.md](README_HITCH_PORT.md) for this package's role on
+the dome; the frame the adapter publishes into is defined by
+[`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml).
 
 The normalization contract:
 
@@ -30,15 +31,15 @@ sidecar. `map` is the local ENU frame.
 
 ## External Message Dependency
 
-`adapter` builds against Point One's `fusion_engine_msgs` package. That package
-is not released as a binary for every supported ROS 2 distro, so a clean
-machine needs the Point One driver source in the same colcon workspace before
-building this package:
+`adapter` builds against Point One's native `fusion_engine_msgs` package and
+requires a driver that publishes `fusion_engine_msgs/msg/Pose`. Obtain that
+native-message ROS package/driver from the Atlas deployment or Point One
+support and place it in the same colcon workspace before building. The public
+generic `ros2-fusion-engine-driver` publishes `geometry_msgs/PoseStamped`;
+installing it alone does not satisfy this contract.
 
 ```bash
 export ROS_DISTRO=${ROS_DISTRO:-jazzy}   # use humble on Ubuntu 22.04 hosts
-cd ~/ros2_ws/src
-git clone https://github.com/PointOneNav/ros2-fusion-engine-driver.git
 cd ~/ros2_ws
 rosdep install -i --from-paths src --rosdistro "$ROS_DISTRO" -y --skip-keys fusion_engine_msgs
 colcon build --packages-up-to adapter
@@ -51,7 +52,9 @@ be described as Fixed-only GNSS mapping.
 ## Inputs
 
 - `pose_input_topic` (default `/atlas/pose_filtered`): Atlas FusionEngine
-  WGS84 pose.
+  WGS84 pose as `fusion_engine_msgs/msg/Pose`. A generic
+  `geometry_msgs/PoseStamped` publisher is not compatible because it has
+  already discarded the native solution type and covariance.
 - `imu_input_topic` (default `/atlas/imu_calibrated`): Atlas IMUOutput
   stream.
 - Optionally, a Point One PCAP for IMU replay
@@ -134,7 +137,10 @@ frames silently disagree.
 ```bash
 # Live Atlas topics, deployment datum on the command line:
 ros2 launch adapter adapter.launch.py \
+  use_sim_time:=false \
   use_p1_imu_pcap:=false \
+  pose_input_topic:=/atlas/pose_filtered \
+  imu_input_topic:=/atlas/imu_calibrated \
   local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
 
 # PCAP IMU replay:

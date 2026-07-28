@@ -8,7 +8,7 @@
 #   - apt prerequisites (linuxptp, chrony, gpsd, build tooling)
 #   - real-time scheduling group + limits
 #   - kernel sysctl tuning for high-bandwidth sensor UDP
-#   - ROS 2 Humble or Jazzy desktop + dev tools
+#   - ROS 2 Humble or Jazzy base + explicit LiDAR/visualization tools
 #   - GCC 14 <cstdint> patch helper (sourced by §3 and §4 scripts)
 #
 # Network configuration and the PTP grandmaster chain are
@@ -18,7 +18,7 @@
 #   ./2_configure_host_network.sh    ← static IP + HW timestamping
 #   ./3_setup_ins_to_pc_sync.sh      ← gpsd + chrony + ptp4l + p1
 #   ./4_setup_lidar_ptp.sh           ← Robin W PTP enable + driver
-#   ./5_setup_camera_ptp.sh          ← RouteCAM PTP enable + Aravis
+#   ./5_setup_camera_ptp.sh          ← OPTIONAL: RouteCAM PTP + Aravis
 #
 # The PREEMPT_RT kernel itself is installed via Ubuntu Pro (free
 # for personal use on up to 5 machines) and is OPTIONAL for
@@ -141,7 +141,7 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-a
     sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
 sudo apt update
-sudo apt install -y ros-${ROS_DISTRO}-desktop ros-dev-tools \
+sudo apt install -y ros-${ROS_DISTRO}-ros-base ros-dev-tools \
     ros-${ROS_DISTRO}-rviz2 ros-${ROS_DISTRO}-foxglove-bridge \
     ros-${ROS_DISTRO}-pcl-ros ros-${ROS_DISTRO}-tf2-tools \
     ros-${ROS_DISTRO}-rosbag2-storage-mcap \
