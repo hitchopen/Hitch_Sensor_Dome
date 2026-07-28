@@ -184,7 +184,7 @@
 
     # Flip Y axis of incoming point cloud. Robin W in coordinate_mode:=3
     # already publishes REP-103 axes (X-forward / Y-left / Z-up), so leave
-    # this at false. When lidar_concat is enabled this runs AFTER merge.
+    # this at false. In three_lidar mode this runs AFTER merge.
     localization/flip_y: false
 
     # --- Raw LiDAR vertical-FOV quality gate ---
@@ -196,15 +196,17 @@
     localization/lidar_quality/min_vertical_fov_deg: 27.0
     localization/lidar_quality/min_valid_points: 100
 
-    # --- Multi-LiDAR concatenation (DISABLED by default for race-mode latency) ---
-    # When enabled, the node subscribes to each aux topic, buffers the latest
+    # --- LiDAR operating mode (front-only by default for race-mode latency) ---
+    # front_only subscribes only to the primary front Robin W. three_lidar
+    # subscribes to both rear Robin W streams and enables concatenation.
+    # When three_lidar is selected, the node buffers each auxiliary topic,
     # scans, and on every primary scan finds the nearest aux scan in time,
-    # transforms its XYZ into the primary sensor frame via TF (URDF), rebases
-    # per-point timestamps onto the primary clock, and appends the bytes to the
-    # primary PointCloud2. Downstream sees a single cloud in primary frame
-    # with one coherent timebase.
+    # transforms its XYZ into the primary sensor frame via TF (URDF), preserves
+    # absolute per-point timestamps on the shared PTP axis, and appends the
+    # bytes to the primary PointCloud2. Downstream sees a single cloud in the
+    # primary frame with one coherent timebase.
     #
-    # ⚡ Race-mode default: front-only (enabled=false).
+    # ⚡ Race-mode default: front_only.
     #   For self-position localization on a pre-built map, the front Robin W's
     #   120° FOV is sufficient — the map's prior + IMU integration already
     #   provide global context. Disabling concat:
@@ -214,7 +216,7 @@
     #   At race speeds (40–80 m/s) you're moving toward the unmapped area;
     #   rear LiDARs would mostly re-observe geometry already in the map.
     #
-    # 🛑 Set enabled=true if any of these apply:
+    # 🛑 Select three_lidar if any of these apply:
     #   - The vehicle operates at slow / parking speeds where rear-quadrant
     #     features (e.g., a recently-passed landmark) materially help GICP.
     #   - The map has feature-sparse zones to the front and feature-rich zones
@@ -222,11 +224,11 @@
     #   - You're using gicp_localization for not-strictly-localization tasks
     #     (e.g., live obstacle accumulation) that need 360° coverage.
     #
-    # The aux topic + frame lists below are retained so toggling enabled to
-    # true picks them up unchanged. Mirror of GLIM_plusplus's lidar_concat
-    # module — when enabled, the two pipelines consume the same three Robin W
-    # streams and produce equivalent stitched clouds.
-    localization/lidar_concat/enabled: false
+    # The aux topic + frame lists below are retained so changing lidar_mode to
+    # three_lidar picks them up unchanged. Mirror of GLIM_plusplus's
+    # lidar_concat module: in three_lidar mode, the two pipelines consume the
+    # same three Robin W streams and produce equivalent stitched clouds.
+    localization/lidar_mode: "front_only"
     localization/lidar_concat/aux_topics: ["/robin_w_rear_left/points", "/robin_w_rear_right/points"]
     localization/lidar_concat/aux_frames: ["lidar_rear_left_link", "lidar_rear_right_link"]
     # Absolute point-time endpoint gate. Robin W sweeps are matched by
@@ -289,8 +291,7 @@
     # stationary `dlio/imu/calibTime` path above.
 
     # --- P4 (2026-07): strict merge guard + buffer parity. Concat
-    # stays DISABLED by default on the Hitch dome until the three Robin W are
-    # PTP-validated; these keys govern behavior once enabled: true.
+    # stays disabled in front_only mode; these keys govern three_lidar mode.
     localization/lidar_concat/require_all_aux: false     # false = localize on whatever LiDARs merged
     localization/lidar_concat/abort_on_merge_failure: true
     localization/lidar_concat/max_consecutive_aux_merge_failures: 10

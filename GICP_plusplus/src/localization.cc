@@ -857,6 +857,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
     this->aux_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     auto aux_sub_opt = rclcpp::SubscriptionOptions();
     aux_sub_opt.callback_group = this->aux_cb_group_;
+    std::vector<std::string> resolved_aux_topics;
+    resolved_aux_topics.reserve(this->aux_lidars_.size());
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
       const std::string topic = this->aux_lidars_[i]->topic;
       const int idx = static_cast<int>(i);
@@ -866,8 +868,21 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
             this->callbackAuxPointCloud(idx, std::move(msg));
           },
           aux_sub_opt);
+      resolved_aux_topics.emplace_back(sub->get_topic_name());
       this->aux_subs_.push_back(sub);
-      RCLCPP_INFO(this->get_logger(), "Subscribed to aux LiDAR topic: %s", topic.c_str());
+    }
+    try {
+      validateResolvedLidarTopics(
+          this->pointcloud_sub->get_topic_name(), resolved_aux_topics);
+    } catch (const std::invalid_argument& e) {
+      RCLCPP_FATAL(
+          this->get_logger(), "Invalid resolved LiDAR topics: %s", e.what());
+      throw;
+    }
+    for (const auto& topic : resolved_aux_topics) {
+      RCLCPP_INFO(
+          this->get_logger(), "Subscribed to aux LiDAR topic: %s",
+          topic.c_str());
     }
   }
 
@@ -1606,7 +1621,11 @@ void gicp_localization::LocalizationNode::getParams() {
 
   // Multi-LiDAR concatenation: match auxiliary sweeps by absolute point-time
   // endpoints, then transform their XYZ into the primary sensor frame. Robin W
-  // timestamps remain unchanged on the shared PTP axis.
+  // timestamps remain unchanged on the shared PTP axis. lidar_mode is the
+  // authoritative sensor-set selector. The old enabled boolean remains only
+  // as a compatibility fallback when lidar_mode is empty.
+  this->declare_parameter<std::string>(
+      "localization/lidar_mode", kDefaultLidarModeParameter);
   this->declare_parameter<bool>("localization/lidar_concat/enabled", false);
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
@@ -1640,7 +1659,28 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/lidar_concat/abort_on_merge_failure", true);
   this->declare_parameter<int>("localization/lidar_concat/max_consecutive_aux_merge_failures", 10);
 
-  this->get_parameter("localization/lidar_concat/enabled", this->concat_enabled_);
+  std::string lidar_mode_param;
+  bool legacy_concat_enabled = false;
+  this->get_parameter("localization/lidar_mode", lidar_mode_param);
+  this->get_parameter(
+      "localization/lidar_concat/enabled", legacy_concat_enabled);
+  try {
+    const auto resolution =
+        resolveLidarModeParameter(lidar_mode_param, legacy_concat_enabled);
+    this->lidar_mode_ = resolution.mode;
+    if (resolution.used_legacy_fallback) {
+      RCLCPP_WARN(
+          this->get_logger(),
+          "localization/lidar_mode is unset; selected '%s' from deprecated "
+          "localization/lidar_concat/enabled. Set lidar_mode explicitly.",
+          lidarModeName(this->lidar_mode_));
+    }
+  } catch (const std::invalid_argument& e) {
+    RCLCPP_FATAL(this->get_logger(), "%s", e.what());
+    throw;
+  }
+  this->concat_enabled_ = lidarModeUsesAuxiliaries(this->lidar_mode_);
+
   std::vector<std::string> aux_topics_param, aux_frames_param;
   this->get_parameter("localization/lidar_concat/aux_topics", aux_topics_param);
   this->get_parameter("localization/lidar_concat/aux_frames", aux_frames_param);
@@ -1662,17 +1702,19 @@ void gicp_localization::LocalizationNode::getParams() {
   // Half the frame period is the ambiguity bound: at a larger gate two
   // different sweeps can both satisfy it. Derived from the CONFIGURED period,
   // not a 10 Hz constant, so a 20 FPS deployment gets a 0.025 s ceiling.
-  if (!std::isfinite(this->concat_sweep_time_threshold_) ||
-      this->concat_sweep_time_threshold_ < 0.0 ||
-      this->concat_sweep_time_threshold_ >=
-          0.5 * this->seyond_frame_duration_s_) {
+  if (this->concat_enabled_ &&
+      (!std::isfinite(this->concat_sweep_time_threshold_) ||
+       this->concat_sweep_time_threshold_ < 0.0 ||
+       this->concat_sweep_time_threshold_ >=
+           0.5 * this->seyond_frame_duration_s_)) {
     throw std::invalid_argument(
         "localization/lidar_concat/sweep_time_threshold must be finite, "
         "non-negative, and below half of localization/seyond_frame_duration_s");
   }
-  if (!std::isfinite(this->concat_future_sweep_wait_timeout_) ||
-      this->concat_future_sweep_wait_timeout_ < 0.0 ||
-      this->concat_future_sweep_wait_timeout_ > 1.0) {
+  if (this->concat_enabled_ &&
+      (!std::isfinite(this->concat_future_sweep_wait_timeout_) ||
+       this->concat_future_sweep_wait_timeout_ < 0.0 ||
+       this->concat_future_sweep_wait_timeout_ > 1.0)) {
     throw std::invalid_argument(
         "localization/lidar_concat/future_sweep_wait_timeout must be finite "
         "and within [0, 1] seconds");
@@ -1688,75 +1730,68 @@ void gicp_localization::LocalizationNode::getParams() {
   std::vector<double> aux_static_flat;
   this->get_parameter("localization/lidar_concat/aux_static_transforms", aux_static_flat);
 
+  try {
+    validateLidarModeConfiguration(
+        this->lidar_mode_, aux_topics_param, aux_frames_param,
+        this->concat_primary_frame_);
+  } catch (const std::invalid_argument& e) {
+    RCLCPP_FATAL(
+        this->get_logger(), "Invalid LiDAR mode configuration: %s", e.what());
+    throw;
+  }
+
+  RCLCPP_INFO(
+      this->get_logger(),
+      "LiDAR mode: %s (primary front Robin W%s)",
+      lidarModeName(this->lidar_mode_),
+      this->concat_enabled_ ? " + two rear Robin W auxiliaries" : " only");
+
   if (this->concat_enabled_) {
-    if (aux_topics_param.size() != aux_frames_param.size()) {
-      // A misconfigured REQUIRED merge must not silently degrade to primary-only.
-      // Hard-fail only when the strict path is also set to abort; otherwise warn
-      // and disable concat (non-fatal, consistent with abort_on_merge_failure=false).
-      if (this->concat_require_all_aux_ && this->concat_abort_on_merge_failure_) {
-        RCLCPP_FATAL(this->get_logger(),
-                     "lidar_concat: aux_topics size (%zu) != aux_frames size (%zu) with require_all_aux=true and "
-                     "abort_on_merge_failure=true; refusing to start. Fix the config, or set require_all_aux=false / "
-                     "abort_on_merge_failure=false.",
-                     aux_topics_param.size(), aux_frames_param.size());
-        throw std::runtime_error("lidar_concat: aux_topics/aux_frames size mismatch (require_all_aux)");
-      }
-      RCLCPP_ERROR(this->get_logger(),
-                   "lidar_concat: aux_topics size (%zu) != aux_frames size (%zu); disabling concat",
-                   aux_topics_param.size(), aux_frames_param.size());
-      this->concat_enabled_ = false;
-    } else if (aux_topics_param.empty()) {
-      if (this->concat_require_all_aux_ && this->concat_abort_on_merge_failure_) {
-        RCLCPP_FATAL(this->get_logger(),
-                     "lidar_concat enabled with no aux_topics, require_all_aux=true and abort_on_merge_failure=true; "
-                     "refusing to start. Configure aux_topics/aux_frames, or set require_all_aux=false / "
-                     "abort_on_merge_failure=false.");
-        throw std::runtime_error("lidar_concat: enabled but no aux_topics configured (require_all_aux)");
-      }
-      RCLCPP_WARN(this->get_logger(), "lidar_concat enabled but no aux_topics configured; disabling concat");
-      this->concat_enabled_ = false;
-    } else {
-      for (size_t i = 0; i < aux_topics_param.size(); ++i) {
-        auto aux = std::make_unique<AuxLidar>();
-        aux->topic = aux_topics_param[i];
-        aux->frame = aux_frames_param[i];
-        aux->T_primary_aux = Eigen::Matrix4f::Identity();
-        aux->extrinsic_cached = false;
-        this->aux_lidars_.push_back(std::move(aux));
-      }
-      RCLCPP_INFO(this->get_logger(),
-                  "lidar_concat enabled: %zu aux lidars, sweep_time_threshold=%.3fs "
-                  "(ceiling %.3fs = half the %.0f ms frame), buffer_size=%zu, "
-                  "future_wait=%.3fs",
-                  this->aux_lidars_.size(), this->concat_sweep_time_threshold_,
-                  0.5 * this->seyond_frame_duration_s_,
-                  this->seyond_frame_duration_s_ * 1.0e3,
-                  this->concat_buffer_size_,
-                  this->concat_future_sweep_wait_timeout_);
-      for (const auto& a : this->aux_lidars_) {
-        RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
-                    a->topic.c_str(), a->frame.c_str());
-      }
-
-      // Split the flat static-transform array (16 row-major doubles per aux, in
-      // aux order) into per-aux 4x4 matrices for the offline resolver.
-      std::vector<std::vector<double>> aux_static_transforms;
-      if (!aux_static_flat.empty()) {
-        if (aux_static_flat.size() == 16 * this->aux_lidars_.size()) {
-          aux_static_transforms.resize(this->aux_lidars_.size());
-          for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
-            aux_static_transforms[i].assign(aux_static_flat.begin() + 16 * i, aux_static_flat.begin() + 16 * (i + 1));
-          }
-        } else {
-          RCLCPP_WARN(this->get_logger(),
-                      "lidar_concat: aux_static_transforms has %zu values, expected %zu (16 x %zu aux); ignoring",
-                      aux_static_flat.size(), 16 * this->aux_lidars_.size(), this->aux_lidars_.size());
-        }
-      }
-
-      // Resolve aux extrinsics now, without live TF (URDF > static > TF-at-runtime).
-      this->resolveAuxExtrinsicsOffline(aux_static_transforms);
+    for (size_t i = 0; i < aux_topics_param.size(); ++i) {
+      auto aux = std::make_unique<AuxLidar>();
+      aux->topic = aux_topics_param[i];
+      aux->frame = aux_frames_param[i];
+      aux->T_primary_aux = Eigen::Matrix4f::Identity();
+      aux->extrinsic_cached = false;
+      this->aux_lidars_.push_back(std::move(aux));
     }
+    RCLCPP_INFO(this->get_logger(),
+                "lidar_concat enabled: %zu aux lidars, sweep_time_threshold=%.3fs "
+                "(ceiling %.3fs = half the %.0f ms frame), buffer_size=%zu, "
+                "future_wait=%.3fs",
+                this->aux_lidars_.size(), this->concat_sweep_time_threshold_,
+                0.5 * this->seyond_frame_duration_s_,
+                this->seyond_frame_duration_s_ * 1.0e3,
+                this->concat_buffer_size_,
+                this->concat_future_sweep_wait_timeout_);
+    for (const auto& a : this->aux_lidars_) {
+      RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
+                  a->topic.c_str(), a->frame.c_str());
+    }
+
+    // Split the flat static-transform array (16 row-major doubles per aux, in
+    // aux order) into per-aux 4x4 matrices for the offline resolver.
+    std::vector<std::vector<double>> aux_static_transforms;
+    if (!aux_static_flat.empty()) {
+      if (aux_static_flat.size() == 16 * this->aux_lidars_.size()) {
+        aux_static_transforms.resize(this->aux_lidars_.size());
+        for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+          aux_static_transforms[i].assign(aux_static_flat.begin() + 16 * i, aux_static_flat.begin() + 16 * (i + 1));
+        }
+      } else {
+        RCLCPP_WARN(this->get_logger(),
+                    "lidar_concat: aux_static_transforms has %zu values, expected %zu (16 x %zu aux); ignoring",
+                    aux_static_flat.size(), 16 * this->aux_lidars_.size(), this->aux_lidars_.size());
+      }
+    }
+
+    // Resolve aux extrinsics now, without live TF (URDF > static > TF-at-runtime).
+    this->resolveAuxExtrinsicsOffline(aux_static_transforms);
+  } else {
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Front-only mode: rear LiDAR subscriptions, buffers, startup FOV "
+        "waits, transforms, and merge work are disabled");
   }
 
   // IMU calibration time (seconds of stationary data to average for bias/gravity)

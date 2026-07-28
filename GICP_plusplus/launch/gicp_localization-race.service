@@ -79,6 +79,7 @@ ExecStart=/bin/bash -c 'source /opt/ros/${ROS_DISTRO}/setup.bash && \
                        exec ros2 launch gicp_localization \
                             localization_with_tf.launch.py \
                             mode:=race \
+                            lidar_mode:=front_only \
                             rviz:=false \
                             run_rtk_gate:=false \
                             local_enu_origin:=${LOCAL_ENU_ORIGIN}'

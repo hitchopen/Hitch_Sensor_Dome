@@ -4,6 +4,13 @@ A single Python orchestrator that activates every connected sensor on the dome, 
 
 This folder is the run-time companion to the one-time setup scripts in [`../PTP_sync/`](../PTP_sync/) and the static-TF definitions in [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml). Use `PTP_sync/` once at install time to bring up the synchronization plumbing; use this folder for every recording session afterward.
 
+The recorder starts sensor drivers but does **not** start the Atlas
+[`adapter/`](../adapter/). Start the adapter separately for every production
+mapping capture so `/gps_p1/fix`,
+`/gps_p1/filtered_odom_rtk_fixed`, and
+`/gps_p1/local_enu_origin` are present in the MCAP. The preflight check refuses
+or warns according to `rtk.mode` when that Fixed-only stream is absent.
+
 ## Architecture
 
 ```
@@ -60,6 +67,15 @@ What happens on a normal run:
 Run this from a shell where ROS 2 Humble or Jazzy and your colcon workspace are sourced.
 The recorder stays unprivileged; it only invokes `sudo -n pmc` for the PTP
 management query when sync verification needs it.
+
+In a separate sourced terminal, start the adapter with exactly one deployment
+origin before starting the recorder:
+
+```bash
+ros2 launch adapter adapter.launch.py \
+  use_p1_imu_pcap:=false \
+  local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
+```
 
 1. **Detect.** The script probes the Atlas Duo, Robin W LiDARs, and RouteCAM cameras listed in `sensor_config.yaml`, then prints a checklist tagged `[FOUND]` or `[MISSING]`. Press `ENTER` to record from everything found, or type space-separated indices to toggle items off.
 

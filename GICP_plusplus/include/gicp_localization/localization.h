@@ -4,6 +4,7 @@
 // DLIO types (PointType is a global typedef, not in dlio namespace)
 #include "dlio/dlio.h"
 #include "gicp_plusplus/small_gicp_backend.hpp"
+#include "gicp_localization/lidar_mode.hpp"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -275,7 +276,8 @@ private:
   std::vector<std::unique_ptr<AuxLidar>> aux_lidars_;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_subs_;
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
-  bool concat_enabled_;
+  LidarMode lidar_mode_ = LidarMode::FrontOnly;
+  bool concat_enabled_ = false;
   double concat_sweep_time_threshold_;
   double concat_future_sweep_wait_timeout_ = 0.15;
   size_t concat_buffer_size_;

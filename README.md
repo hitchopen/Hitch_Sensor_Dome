@@ -48,11 +48,11 @@ A 3D-printable modular sensor dome for mounting a multi-sensor mapping rig on a 
 >    The translation `(0, 0, 0)` that ships in the file is a **sentinel** that explicitly disables dual-antenna mode — any real installation will have a non-zero offset. Measure with a tape to ±1 cm; the launch file converts your offset into the expected RTK-fixed heading σ via `σ ≈ atan2(0.01 m, baseline_m)`, so a 1.2 m baseline yields σ ≈ 0.48° (well below the runtime sanity-check threshold described later in the orientation-prior section). Whatever offset you enter here must **also** be programmed into the Atlas Duo firmware as `gnss_lever_arm_secondary` (see the lever-arm callout below) — the two representations must agree.
 > 4. Regenerate the URDF: `cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`. The script prints `GNSS antenna mode: DUAL` along with the baseline length and the expected RTK-fixed heading σ. If you see `GNSS antenna mode: SINGLE`, the translation in step 3 is still at the sentinel and step 4 will refuse to enable dual-antenna mode.
 >
-> **Fallback if you have only one antenna:** leave `gnss_antenna_secondary_link` at its default `(0, 0, 0)`. GLIM++ detects the sentinel at launch time and runs in single-antenna mode — the system still works, the primary antenna alone provides RTK position for both GLIM++'s init pose and the session-long GNSS factor stream. The only loss is the dual-antenna heading benefit (init gates stay at single-antenna defaults and yaw drift remains an IMU concern). Keep `enable_orientation_prior` set to `false` in [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) — see the GLIM++ GNSS yaw prior callout below. See [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) for the side-by-side comparison of what changes between the two modes.
+> **Fallback if you have only one antenna:** leave `gnss_antenna_secondary_link` at its default `(0, 0, 0)`. The launch helper recognizes that sentinel and reports single-antenna hardware. The primary antenna still provides RTK position for GLIM++ initialization and session-long GNSS position factors; only the drift-free heading benefit is absent. The shipped algorithm configuration already matches this hardware default: `enable_orientation_prior` is `false` in the authoritative [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json).
 
 ## Sensor Layout
 
-The diagrams below (generated from the v17e SCAD model) label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).
+The diagrams below use the current SCAD coordinate convention and label every sensor position relative to the Atlas Duo Center of Navigation (origin) in the ROS REP 103 vehicle frame (+X forward, +Y left, +Z up).
 
 ![Top-down sensor layout](3D%20files/sensor_dome_layout_top.jpg)
 
@@ -66,8 +66,8 @@ The diagrams below (generated from the v17e SCAD model) label every sensor posit
 
 ```
 3D files/                  OpenSCAD model, READMEs, and exported STL files
-  sensor_dome.scad         Parametric OpenSCAD source (v17e) — TWO-PIECE
-                           bolted assembly (L1 + L2 joined by 12× M6 BHCS)
+  sensor_dome.scad         Parametric OpenSCAD source (v17r) — TWO-PIECE
+                           bolted assembly (L1 + L2 joined by 10× M6 BHCS)
   sensor_dome_unibody.scad UNIBODY variant — wraps sensor_dome.scad and
                            fuses L1 + brackets + L2 into ONE printable part
   README.md                Detailed design specifications (English)
@@ -128,7 +128,10 @@ Install [OpenSCAD](https://openscad.org/) and pick one of the two print options 
 
 ### Option A — Two-piece bolted assembly (default, recommended)
 
-The original design. L1 (base + 6 brackets, 139 mm tall) and L2 (top plate, 12 mm thick) print separately and bolt together with 12× M6×20 mm BHCS at the bracket tops. Faster prints, no support material, easy to disassemble for service, easy to swap one plate without reprinting the other.
+The original design. L1 (base + 6 supports, 139 mm tall) and L2 (top plate,
+12 mm thick) print separately and bolt together with 10× M6×25 mm BHCS at the
+support tops. Faster prints, no support material, easy to disassemble for
+service, and easy to swap one plate without reprinting the other.
 
 1. Open `3D files/sensor_dome.scad` in OpenSCAD.
 2. Set `RENDER_MODE = 1`, render (F6), export STL (F7) → that's the **L1 print**.
@@ -141,7 +144,7 @@ The original design. L1 (base + 6 brackets, 139 mm tall) and L2 (top plate, 12 m
 For deployments where you want zero bolted joints between L1 and L2 — slightly stiffer in torsion, no chance of bolt loosening over time, and one file to slice instead of two. Trade-off: a long print with significant support material under the L2 cantilever.
 
 1. Open `3D files/sensor_dome_unibody.scad` in OpenSCAD. This file `include`s `sensor_dome.scad`, so every parameter (pillar height, plate dimensions, sensor mount patterns) automatically tracks the two-piece version.
-2. Render (F6) and export STL (F7) → that's the **whole-dome print** (≈ 280 × 300 × 151 mm bounding box, fits a 305 × 305 × 300 mm bed in default L1-down orientation).
+2. Render (F6) and export STL (F7) → that's the **whole-dome print** (approximately 280 × 300 × 151 mm bounding box, fits a 305 × 305 × 300 mm bed in default L1-down orientation).
 3. **Support material is required.** The L2 plate cantilevers between bracket tops over a mostly-empty 280 × 300 mm volume. Use **tree / organic supports** (PrusaSlicer 2.6+, Bambu Studio, Cura "Tree") under L2's underside only — not between bracket walls. Expect ~1.5–2 kg of support PETG and ~28–36 h print time at typical settings; soluble support is impractical at this height. The 12 bracket bolts in the BOM are not needed for this variant.
 
 See [`3D files/README.md`](3D%20files/README.md) for full design specifications, BOM, and assembly instructions.
@@ -298,9 +301,10 @@ the Robin W contract above.
 Each Robin W must provide approximately its nominal **30 degree vertical field
 of view**. GLIM++ and GICP++ announce this gate at startup and validate the
 first usable raw PointCloud2 from each configured LiDAR before localization,
-mapping, transforms, or concatenation can begin. Each of the three streams is
-checked independently, so the wide angular union of a merged cloud cannot hide
-one degraded LiDAR. After all configured streams pass, FOV measurement is
+mapping, transforms, or concatenation can begin. GLIM++ checks all three
+configured mapping streams. GICP++ checks the front stream in its default
+`front_only` mode and all three independently in `three_lidar` mode, so a
+merged cloud cannot hide one degraded LiDAR. After all enabled streams pass, FOV measurement is
 disabled for the continuous run; this is a launch-time hardware/data-contract
 check, not a per-frame scene-content gate.
 
@@ -335,7 +339,7 @@ Once the dome is built and the sensors are connected, two folders take it from h
 
 ```bash
 # After PTP_sync/ has been run once:
-sudo python3 recording/sensor_recorder.py
+python3 recording/sensor_recorder.py
 # Then in Foxglove: Open Connection → ws://localhost:8765
 #                   Layouts → Import → recording/foxglove/sensor_dome_layout.json
 ```
@@ -349,7 +353,7 @@ For SLAM and 3D mapping the project ships **GLIM++**, a heavily modified fork of
 1. **Sensor adaptation** — topics, frames, and field names are set for the Hitch Sensor Dome (3× Robin W + Atlas Duo + 4× RouteCAM) out of the box: `/imu/data`, `/robin_w_*/points`, `imu_link`/`lidar_front_link` per [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml).
 2. **Vehicle-agnostic body frame** — GLIM++ builds the map anchored at `imu_link` (Atlas Duo Center of Navigation), so maps are portable across vehicles. The downstream localizer reports pose in `base_link` (ROS standard body frame), with a static `imu_link → base_link` transform in [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) — identity by default, override per vehicle (rear axle, chassis center, etc) without rebuilding the map.
 3. **Outdoor / vehicle-scale tuning** — 24 parameter changes (loosened IMU noise, larger voxels, longer init window, sub-mapping density) calibrated for highway / track / vehicle motion.
-4. **Multi-lap loop-closure fix** — wider VGICP convergence basin, looser implicit-loop thresholds, and a stronger GNSS z-prior to prevent the canonical second-lap-tilts-to-the-sky failure mode.
+4. **Multi-lap loop-closure fix** — wider VGICP convergence basin, looser implicit-loop thresholds, covariance-aware GNSS priors, and a hardened world/UTM fit to prevent the canonical second-lap-tilts-to-the-sky failure mode.
 5. **Initialization rewrite (C++)** — gravity-from-accelerometer is removed; the optimizer now requires an external INS pose to start. Allows recordings that begin in motion (mid-session restarts, race-track replays, bag trims).
 6. **RTK-fixed gating for the initial pose** — authoritative adapter `kRtkFixed` input plus fail-closed NavSatFix status/covariance and multi-sample stability checks, with a bold-RED CLI warning if the gate is not met within the timeout.
 7. **RTK-gated GNSS factor bridge** — soft GNSS prior factors are added to the global graph throughout the session, but only when RTK is fixed. Suspends silently in tunnels and resumes on re-fix.
@@ -381,33 +385,31 @@ A URDF generator and a `ros2 launch` helper round out the integration. See [`GLI
 >
 > **If the Atlas Duo is replaced by a non-tightly-coupled GNSS** (a raw RTK receiver such as SwiftNav / u-blox / NovAtel without onboard INS fusion, or any loosely-coupled stack that publishes positions at the **antenna** reference rather than the IMU origin), then lever-arm compensation must be **turned ON inside GLIM++** — the antenna-to-IMU correction is no longer being applied upstream. The recommended implementation reads `imu_link → gnss_antenna_primary_link` from [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) inside the wrapper's GNSS factor bridge (`try_publish_gnss_factor` in `glim_ros.cpp`) and applies `p_imu_utm = p_antenna_utm − R_world_imu · t_imu_gnss` before the message reaches `libgnss_global.so`.
 
-> ### 🧭 GLIM++ GNSS yaw prior — ON by default (dual-antenna RTK)
+> ### 🧭 GLIM++ GNSS yaw prior — OFF by default
 >
-> **GLIM++ ships with a GNSS yaw prior (`PoseRotationPrior`) enabled in [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json).** Each submap is constrained toward the RTK-derived heading, eliminating the slow yaw drift that LiDAR + IMU alone leave open over a long session. This is the **default configuration** for the Hitch Sensor Dome because the dome ships as a dual-antenna RTK platform.
+> The checked-in dome is a single-antenna reference design:
+> `gnss_antenna_secondary_link` uses the `(0, 0, 0)` sentinel and
+> `enable_orientation_prior` is `false` in the authoritative
+> [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json).
+> No configuration change is required for one-antenna operation.
 >
-> **How it works.** A dual-antenna RTK receiver measures heading directly from the baseline between the two antennas — drift-free, accurate to roughly 0.1°–4° depending on baseline length. The adapter's `/gps_p1/filtered_odom_rtk_fixed` topic carries that heading only while FusionEngine reports `kRtkFixed`; the wrapper republishes it on `/gnss/pose_rtk_only` with a tight yaw covariance, and `libgnss_global.so` consumes it as a `PoseRotationPrior` factor on every submap. The shipped weighting is `[1e-6, 1e-6, 1e2]` — yaw only, σ_yaw ≈ 0.1 rad (~5.7°), appropriate for a 0.3–1 m baseline. With a longer baseline (e.g. 2 m) the Atlas Duo's heading covariance shrinks and the weight can be raised (try `5e2` for ~2.6° σ). Roll and pitch are kept at near-zero weight because GNSS does not observe them — the IMU + gravity already does.
->
-> ### ⚠ GLIM++ GNSS yaw prior — MUST be turned OFF for single-antenna installations
->
-> **If the dome runs with only one GNSS antenna, the yaw prior must be disabled.** With a single antenna, the heading on `/pose` is gyro-integrated from the INS — drifting over the session. Tying the optimizer to a drifting reference is worse than leaving yaw under LiDAR + IMU control alone, and the multi-lap z-drift / yaw-drift failure modes that GLIM++ was forked to fix re-appear.
->
-> **To switch to single-antenna mode, two changes are required, both before launching GLIM++:**
->
-> 1. **TF YAML.** Leave (or set back) `gnss_antenna_secondary_link` to its sentinel `(0, 0, 0)` in [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml). The launch file will then print `single-antenna mode` instead of `dual-antenna mode ENABLED`.
-> 2. **GNSS factor config.** Open [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) and flip:
->
->    ```jsonc
->      "enable_orientation_prior": false,
->    ```
->
-> Step 2 is the load-bearing one: if you change the TF YAML to single-antenna but leave the orientation prior on, the wrapper publishes a loose-covariance quaternion (gyro-integrated INS yaw) and the rotation prior factor will still fire and drag the optimizer toward that drifting heading. The flag must be flipped explicitly.
+> Enable `PoseRotationPrior` only after installing a rigid secondary antenna,
+> measuring both lever arms, and configuring Atlas Duo dual-antenna heading.
+> Record the measured secondary transform in
+> [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml), regenerate
+> `sensor_dome.urdf`, configure `dual_antenna_enabled`, the baseline, and
+> heading uncertainty in
+> [`GLIM_plusplus/glim/config/config_ros.json`](GLIM_plusplus/glim/config/config_ros.json),
+> then set `"enable_orientation_prior": true` in the authoritative GNSS file.
+> The factor consumes only RTK-fixed adapter samples and rejects heading
+> samples whose reported yaw sigma exceeds the configured limit.
 >
 > ### 🛡 Three-layered defense against orientation-prior misconfiguration
 >
 > The yaw prior is the most consequential dual-antenna feature and the most subtly wrong if any of the three configurations involved (physical mounting, our config files, Atlas firmware) drifts out of sync. GLIM++ runs three independent checks:
 >
 > 1. **Atlas firmware prerequisite (documented).** The Atlas Duo's `gnss_lever_arm_secondary` and dual-antenna heading mode must be configured in the Atlas web UI to match the physical mounting. This cannot be verified from our code — it has to be set up correctly during Atlas commissioning. See the GNSS antenna lever-arm callout above for the matching parameters.
-> 2. **Launch-time consistency check (automatic).** `hitch_sensor_dome.launch.py` reads [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) and [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) at startup, and emits a bold-yellow warning if the TF YAML's antenna count disagrees with `enable_orientation_prior`. This catches operator-side mistakes in our own config files.
+> 2. **Launch-time consistency check (automatic).** `hitch_sensor_dome.launch.py` reads [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) and [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json), then warns if physical dual-antenna intent disagrees with `enable_orientation_prior`. This helper diagnoses the configuration; it does not rewrite the JSON or start GLIM.
 > 3. **Runtime yaw σ sanity check (automatic).** Once GLIM++ is running, the C++ wrapper compares the Atlas-reported yaw σ on each `/odom` message (the value the Atlas itself publishes in its pose covariance) against the σ we expect from the dual-antenna baseline. After the first ~20 samples, if the Atlas is consistently reporting a much wider σ than expected, a bold-yellow one-shot warning fires explaining that the Atlas firmware is probably *not* in dual-antenna heading mode despite our config saying so. The check requires `ins_odom_topic` to be wired (Odometry carries covariance; PoseStamped does not). A healthy check prints a single info-level confirmation that the dual-antenna heading is live.
 
 ```bash
@@ -428,16 +430,24 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 
 ## Localization (GICP++)
 
-For online scan-to-map localization against a pre-built PCD, the project ships **GICP++**, a heavily modified fork of **DLIO** (*Direct LiDAR-Inertial Odometry* by Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez at UCLA's VECTR Lab, upstream at <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>). The fork lives at [`GICP_plusplus/`](GICP_plusplus/) (the double-plus signals it is *not* stock DLIO). GICP++ ships in **two operating modes** selectable at launch time:
+For online scan-to-map localization against a pre-built PCD, the project ships **GICP++**, a heavily modified fork of **DLIO** (*Direct LiDAR-Inertial Odometry* by Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez at UCLA's VECTR Lab, upstream at <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>). The fork lives at [`GICP_plusplus/`](GICP_plusplus/) (the double-plus signals it is *not* stock DLIO). GICP++ ships with two tuning profiles:
 
-- **🏁 Race mode (default)** — front Robin W only, 40 m crop, 32 GICP iterations, yaw-rate-adaptive Kp/Kq attenuation, all debug topics off. Targets ~3–5 ms IMU-to-pose latency for a downstream 200 Hz controller on a pre-built race-track map.
-- **🛡 Safe mode** — all three Robin W LiDARs concatenated, 100 m crop, upstream-strict 128 GICP iterations, tighter convergence epsilons, all debug topics on. Targets maximum sensor coverage + diagnostic visibility when CPU headroom is plentiful and latency isn't the bottleneck.
+- **🏁 Race mode (default)** — 40 m crop, 32 GICP iterations, yaw-rate-adaptive Kp/Kq attenuation, and reduced logging. It defaults to the front Robin W for minimum compute load.
+- **🛡 Safe mode** — 100 m crop, upstream-strict 128 GICP iterations, tighter convergence epsilons, and full diagnostics. LiDAR selection remains front-only unless explicitly changed.
+
+LiDAR selection is independent and defaults to `lidar_mode:=front_only` for
+every profile. Use `lidar_mode:=three_lidar` for full-dome input.
+`lidar_mode:=auto` is an explicit opt-in that follows the selected race/safe
+profile. Front-only mode does not subscribe to, buffer, transform,
+quality-check, or merge the rear streams. Three-LiDAR mode requires exactly
+two configured rear topics and frames and validates every sensor before
+localization starts.
 
 Key project upgrades vs. the upstream VECTR DLIO:
 
 1. **Robin W + Atlas Duo targeting** — defaults use low-latency `/imu/data`, adapter `/gps_p1/filtered_odom_rtk_fixed`, and `/robin_w_*/points`; adapter `/gps_p1/imu` is also allowed for normalized replay. Frames come from `config/sensor_dome_tf.yaml`.
 2. **Fixed-only RTK policy** — the adapter checks FusionEngine `solution_type == RTK_FIXED` and covariance before publishing `/gps_p1/filtered_odom_rtk_fixed`. Float/no-fix periods use LiDAR+IMU only. The optional [`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc) compatibility bridge is fail-closed for covariance and freshness, but REP-145 `STATUS_GBAS_FIX` is only RTK-class and cannot itself distinguish float from fixed.
-3. **Two-mode design** — `cfg/localization.yaml` (race base) + `cfg/localization_safe.yaml` (overlay) layered by the launch file's `mode:=race|safe|custom` arg, with paired mutually-exclusive systemd units for production deployment.
+3. **Independent tuning and LiDAR modes** — `mode:=race|safe|custom` selects the tuning profile, while `lidar_mode:=front_only|three_lidar|auto` selects the sensor set. Front-only is the launch default; the paired systemd units explicitly pin race/front and safe/three-LiDAR production deployments.
 4. **Verified GLIM++ map bridge** — `GLIM_plusplus/scripts/export_glim_dump_to_pcd.py` decodes the exact compact layout, applies each `T_world_origin` and `inverse(T_world_utm)`, and writes an ENU PCD plus datum manifest. The adapter publishes its resolved datum on transient-local `/gps_p1/local_enu_origin`; GICP refuses point clouds and RTK odometry until that live datum matches the manifest.
 5. **GICP warm-start** — eager kd-tree build at init + one dummy align to burn OpenMP thread-pool spin-up, Eigen JIT, and source-side kd-tree allocation before the first real scan.
 6. **Yaw-rate adaptive observer** — `Kp` and `Kq` in the geometric observer auto-attenuate at high body-frame yaw rate so the IMU prediction takes precedence through corner entries where GICP is most likely to slide.
@@ -456,14 +466,15 @@ python3 GLIM_plusplus/scripts/export_glim_dump_to_pcd.py \
     /tmp/dump /tmp/race_map.pcd \
     --frame enu --enu-origin "${ENU_ORIGIN}" --voxel-size 0.4
 
-# 2. Run the localizer in race mode (default):
+# 2. Run race tuning with the single front LiDAR (lowest compute load):
 ros2 launch gicp_localization localization_with_tf.launch.py \
+    mode:=race lidar_mode:=front_only \
     map_path:=/tmp/race_map.pcd \
     local_enu_origin:="${ENU_ORIGIN}"
 
-# Or safe mode (3× LiDARs, full coverage, all debug on):
+# Or safe tuning with all three LiDARs:
 ros2 launch gicp_localization localization_with_tf.launch.py \
-    mode:=safe \
+    mode:=safe lidar_mode:=three_lidar \
     map_path:=/tmp/race_map.pcd \
     local_enu_origin:="${ENU_ORIGIN}"
 ```

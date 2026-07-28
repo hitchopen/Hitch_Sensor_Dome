@@ -41,21 +41,35 @@ Files touched: `glim/config/config_sensors.json`, `glim/config/config_ros.json`.
 
 ### 1.1 Single-antenna vs dual-antenna mode
 
-The Hitch Sensor Dome supports either one or two GNSS antennas (a second antenna at a known offset enables drift-free RTK heading). The mode is auto-detected from [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml): the secondary antenna's translation defaults to the sentinel `(0, 0, 0)` (single-antenna), and any non-zero translation (norm ≥ 0.05 m) flips GLIM++ into dual-antenna mode at launch time. The full root-README walkthrough for enabling dual-antenna is in the project's [main README](../README.md#-dual-gnss-antenna--strongly-recommended); the algorithmic differences GLIM++ makes between the two modes are summarized below.
+The Hitch Sensor Dome supports either one or two GNSS antennas. The launch
+helper inspects [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml)
+and reports whether the secondary translation is the `(0, 0, 0)` sentinel or a
+real baseline (norm at least 0.05 m). This is a diagnostic only. Runtime
+behavior is controlled explicitly by `dual_antenna_enabled`,
+`dual_antenna_baseline_m`, and `dual_antenna_heading_sigma_rad` in
+[`glim/config/config_ros.json`](glim/config/config_ros.json), plus
+`enable_orientation_prior` in
+[`glim/config/config_gnss_global.json`](glim/config/config_gnss_global.json).
+The checked-in values are single-antenna and orientation-prior OFF.
 
 | Aspect | Single-antenna | Dual-antenna |
 |--------|----------------|--------------|
 | **Heading source** | IMU gyroscope integration (drifts with bias over time) | RTK-fixed dual-antenna baseline (drift-free, ≈ 0.1°–1° depending on baseline) |
-| **Init gate `ins_max_attitude_residual_deg`** | `2.5°` attitude residual | auto-tightened to `0.8°` |
-| **Init gate `ins_min_pose_window_samples`** | `10` consecutive consistent samples | auto-shortened to `5` (orientation locks faster) |
-| **Init gate `ins_init_timeout_s`** | `60 s` | auto-shortened to `30 s` |
+| **Init gate `ins_max_attitude_residual_deg`** | `2.5°` attitude residual | tightened by code to at most `0.8°` when configured |
+| **Init gate `ins_min_pose_window_samples`** | `10` consecutive consistent samples | shortened by code to at most `5` when configured |
+| **Init gate `ins_init_timeout_s`** | `60 s` | shortened by code to at most `30 s` when configured |
 | **Factor-bridge orientation covariance** | not populated (no usable orientation info from single antenna's PoseStamped) | tight yaw σ derived from baseline length, loose pitch/roll — see §7 |
-| **Session-long heading drift** | accumulates with IMU bias; mitigated only by LiDAR scan matching | bounded by RTK heading available throughout the session (data path in place, factor module deferred — see §10 "Session-long heading correction") |
+| **Session-long heading drift** | accumulates with IMU bias; mitigated only by LiDAR scan matching | bounded by optional RTK heading factors while Fixed samples pass the yaw-quality gate |
 | **Map quality on long / multi-lap trajectories** | depends on LiDAR feature richness for yaw stability; ground-truth z-anchor still good if RTK position is fixed | better orientation accuracy at init, with a clean data path for further session-long heading correction |
 | **Hardware needed** | one SP1 (or compatible) | two antennas at fixed offset (1.0–1.5 m baseline recommended) |
-| **Operator UX at launch** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
+| **Operator UX at launch** | helper reports the sentinel and verifies the OFF config | helper prints the three `config_ros.json` values to set and warns until config matches |
 
-The mode switch is **fully automatic** — there is no separate "dual-antenna" launch arg. GLIM++ reads the TF YAML at startup, computes the secondary translation norm, and chooses. To revert from dual to single (e.g., the second antenna failed in the field), edit `sensor_dome_tf.yaml` and zero out the secondary translation; everything else continues to work because the primary antenna alone provides RTK position, which is what GLIM++'s init gate (§6) and factor bridge (§7) actually require.
+To enable dual-antenna behavior, configure the physical Atlas baseline, update
+the TF YAML and regenerate the URDF, copy the helper's three values into
+`config_ros.json`, and set `enable_orientation_prior: true` in the authoritative
+GNSS config. To return to one antenna, clear the TF baseline and restore all
+four keys to their checked-in single-antenna values. The helper never mutates
+mapping configuration.
 
 ## 2. Vehicle-agnostic body frame
 
@@ -93,7 +107,9 @@ Files touched: every `glim/config/*.json` and `glim_ext/config/*.json` listed ab
 
 ## 4. Multi-lap loop closure fix
 
-A targeted three-layer fix in `glim/config/config_global_mapping_gpu.json` and `glim_ext/config/config_gnss_global.json` for the canonical "second-lap-tilts-to-the-sky" failure mode of upstream GLIM:
+A targeted three-layer fix in `glim/config/config_global_mapping_gpu.json` and
+the authoritative `glim/config/config_gnss_global.json` for the canonical
+"second-lap-tilts-to-the-sky" failure mode of upstream GLIM:
 
 | Knob | Was | Now |
 |------|-----|-----|
@@ -204,7 +220,7 @@ A periodic 10-second log line reports `N published, M rejected` so the operator 
 
 **Behavior on RTK loss.** When RTK degrades to float / no-fix (tunnel, urban canyon), the adapter's Fixed-only odometry topic goes silent; `gnss_global` sees no bridge output and adds no factor for that interval. The optimizer's LiDAR cost carries the trajectory through the gap. When RTK locks again, factors resume on the next Fixed odometry sample. The session-long RTK requirement only applies to the initial pose (§6); per-message gating during the session is a soft suspend, not a hard block.
 
-Files touched: [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp), [`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json), [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py).
+Files touched: [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp), [`glim/config/config_gnss_global.json`](glim/config/config_gnss_global.json), and [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py).
 
 ## 8. Optional GNSS yaw prior
 
@@ -212,7 +228,7 @@ Upstream `gnss_global` adds **translation-only** prior factors (`PoseTranslation
 
 GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp) so the module can also emit a `PoseRotationPrior` factor on each submap, pulling its yaw toward the heading carried in the incoming `PoseWithCovarianceStamped` / `Odometry` quaternion. The change is opt-in via two JSON keys; the checked-in default is **OFF** because `sensor_dome_tf.yaml` ships with the single-antenna sentinel for the secondary antenna.
 
-| Config key (`glim_ext/config/config_gnss_global.json`) | Default | Meaning |
+| Config key (`glim/config/config_gnss_global.json`) | Default | Meaning |
 |---|---|---|
 | `enable_orientation_prior` | `false` | Emit a `PoseRotationPrior` factor each submap when dual-antenna heading is configured and the interpolated GNSS sample carries a valid quaternion. |
 | `orientation_prior_inf_scale` | `[1e-6, 1e-6, 1e2]` | Information matrix diagonal in `(roll, pitch, yaw)`. Only yaw is meaningfully constrained; roll/pitch get a tiny ε to keep the noise model strictly positive-definite. |
@@ -226,13 +242,18 @@ GLIM++ extends [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_glob
 - When `enable_orientation_prior && latest.has_orientation`, after the existing translation prior, the module composes `R_world_imu = R_world_utm · R_utm_imu` and inserts `gtsam::PoseRotationPrior<gtsam::Pose3>` with the configured information matrix.
 - `T_world_utm` is still initialized from position alone (SVD of the planar centered covariance) — orientation does not help us solve for the unknown UTM-to-world rotation; we use it only after the alignment is locked.
 
-**Dual-antenna gating end-to-end.** The factor is only safe after a secondary antenna is installed and the Atlas is configured for dual-antenna heading. The Hitch Sensor Dome therefore enforces dual-antenna intent at three independent points (see `README.md` "Three-layered defense"): the Atlas firmware (operator setup), the launch-time consistency check (mismatch between `sensor_dome_tf.yaml` and `enable_orientation_prior`), and the runtime yaw-σ sanity check inside `try_publish_gnss_factor`. The third one is the only check that can catch a misconfigured Atlas firmware.
+**Dual-antenna gating end-to-end.** The factor is only safe after a secondary
+antenna is installed and the Atlas is configured for dual-antenna heading.
+Intent is checked at three points: Atlas firmware commissioning, the launch
+helper's TF/config mismatch warning, and the runtime yaw-sigma sanity check
+inside `try_publish_gnss_factor`. Only the third check can detect firmware that
+does not actually emit dual-antenna heading.
 
 **Why no lever-arm compensation here.** A related branch of work in the broader GLIM ecosystem pairs the orientation prior with antenna-to-IMU lever-arm compensation (`urdf_gnss_frame`-style). GLIM++ intentionally **does not** apply that compensation, because the Atlas Duo is a tightly-coupled GNSS+INS that already resolves antenna observations to the IMU origin in firmware and publishes `/pose` there. Adding a second lever-arm correction would double-compensate. The prerequisite is that the Atlas firmware's `gnss_lever_arm_primary` / `gnss_lever_arm_secondary` are programmed to match the dome's `sensor_dome_tf.yaml`; see the root README's "GLIM++ GNSS antenna lever-arm compensation" callout. If a future deployment swaps the Atlas Duo for a non-tightly-coupled GNSS, lever-arm compensation must be re-introduced inside the `try_publish_gnss_factor` bridge before publishing to `libgnss_global.so`.
 
 **Behavior on RTK loss.** Same as §7: the wrapper bridge drops samples that fail the RTK gate, so the orientation prior never sees them and never fires during outages. There is no fallback to IMU-derived yaw — when RTK heading isn't available, yaw stays under LiDAR scan-matching control, which is correct (substituting drifting INS yaw for missing GNSS yaw would defeat the purpose of the factor).
 
-Files touched: [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp), [`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json), [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) (runtime sanity check), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) (member fields), [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py) (launch-time consistency check).
+Files touched: [`glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp`](glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp), [`glim/config/config_gnss_global.json`](glim/config/config_gnss_global.json), [`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp) (runtime sanity check), [`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp) (member fields), and [`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py) (launch-time consistency check).
 
 ## 9. Project integration
 
@@ -241,7 +262,7 @@ Three new top-level folders inside `GLIM_plusplus/` that hold integration-only c
 | Folder | Contents |
 |--------|----------|
 | [`config/`](config/) | `generate_sensor_dome_urdf.py` converts [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) into `sensor_dome.urdf`, which GLIM consumes via the `urdf_path` field in `config_sensors.json` for both `T_lidar_imu` and multi-LiDAR `lidar_concat`. Single source of truth across recording, visualization, and mapping. Re-run when the TF YAML changes. |
-| [`launch/`](launch/) | `hitch_sensor_dome.launch.py` — publishes static TFs from `sensor_dome_tf.yaml`, starts `glim_rosnode` against the project's tuned configs, spawns `foxglove_bridge` for visualization, runs the pre-flight stationarity check. |
+| [`launch/`](launch/) | `hitch_sensor_dome.launch.py` publishes static TFs, checks dual-antenna/config consistency, optionally runs the stationarity diagnostic, and starts Foxglove support. It deliberately does **not** start `glim_rosnode`; production mapping is offline. |
 | [`scripts/`](scripts/) | `check_init_stationarity.py` — pre-flight diagnostic; reads first 3 s of `/imu/data` and prints a bold-RED warning if the bag is non-stationary. Now informational only (the C++ INS-init pathway handles moving starts), but useful for diagnosing slow Atlas Duo lock and for CI gating. |
 
 ## 10. Design notes
@@ -457,7 +478,8 @@ Important — so adopters know what stayed identical to upstream and can rely on
 | `glim/config/config_odometry_gpu.json` | modified | §3 (voxel scale, smoother window) |
 | `glim/config/config_sub_mapping_gpu.json` | modified | §3 (sub-map keyframes, voxels) |
 | `glim/config/config_global_mapping_gpu.json` | modified | §3 §4 (loop-closure thresholds) |
-| `glim_ext/config/config_gnss_global.json` | modified | §4 §7 (prior_inf_scale, bridge topic/type) |
+| `glim/config/config_gnss_global.json` | modified, authoritative | §4 §7 §8 (fit gates, priors, bridge topic/type) |
+| `glim_ext/config/config_gnss_global.json` | retained fallback mirror | Used only when a config tree omits the authoritative root key |
 | `glim_ros2/include/glim_ros/glim_ros.hpp` | modified | §5 §6 §7 (subs, params, factor bridge state) |
 | `glim_ros2/src/glim_ros/glim_ros.cpp` | modified | §5 §6 §7 (full ROS-side implementation) |
 | `config/generate_sensor_dome_urdf.py` | new | §8 |
@@ -491,9 +513,9 @@ replacing the in-file copy in `glim_rosbag.cpp`):
   the 2026-07-27 re-merge — see §14: the header dt is acquisition phase, not
   a residual clock-offset estimate, and must never be copied into a
   correction.)
-- Robin W note: per-point time handling was reworked in the 2026-07-27
-  re-merge and is now **encoding-agnostic**. See §14 — including an open
-  question about which encoding the driver actually emits.
+- Robin W per-point time handling was reworked in the 2026-07-27 re-merge and
+  is encoding-aware. The production contract is now definitive: Seyond emits
+  hydrated `timestamp/FLOAT64` absolute Unix seconds; see §14.
 
 **GNSS global module** (extends §7/§8):
 
@@ -614,13 +636,14 @@ emits `lidar_quality.min_vertical_fov_deg` and
 - **Covariance-adaptive position priors** (PR #15): precision =
   `clamp(1/variance, prior_inf_floor, prior_inf_cap)` per axis, with optional
   Huber wrapping (`position_prior_robust_width`). Fed by the per-sample
-  covariance the P1 bridge already publishes. **Off by default** (negative
-  floor/cap ⇒ legacy fixed `prior_inf_scale`).
+  covariance the P1 bridge already publishes. The shipped profile enables it
+  with floor `[100,100,25]`, cap `[2500,2500,1000]`, and Huber width `1.5`.
 - **Anchor-divergence health gate** (PR #15): rolling median of the
   *post-optimization* GNSS residual; if it exceeds `anchor_abort_median_m`
   for `anchor_abort_consecutive_updates` global updates, the module reports
   unhealthy via `ok()` and the offline run aborts instead of writing a
-  quietly-misanchored map. **Off by default** (`0.0`).
+  quietly-misanchored map. The shipped profile enables this at a `0.5 m`
+  median, 100-sample window, 20-sample minimum, and five consecutive updates.
 - **Optional gravity prior** (`gravity_prior_sigma_deg`, PR #15): a
   `Pose3AttitudeFactor` constraining roll/pitch from the INS orientation
   without touching yaw. **Off by default** — enable only for a validated
@@ -688,10 +711,10 @@ colcon build --packages-select glim glim_ext glim_ros \
              --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 
-# Live mapping (subscribes directly to the recording stack):
+# Support nodes and configuration diagnostics (does not start mapping):
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# Offline replay against an MCAP bag:
+# Production offline replay against an MCAP bag:
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
@@ -700,7 +723,7 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 Optional extras:
 
 ```bash
-# Unit tests (per-point time decoding + aux sweep matching, 12 cases)
+# Unit tests (per-point time decoding + aux sweep matching)
 colcon build --packages-select glim_ros --cmake-args -DBUILD_TESTING=ON
 colcon test --packages-select glim_ros && colcon test-result --verbose
 

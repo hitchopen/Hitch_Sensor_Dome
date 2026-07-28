@@ -50,21 +50,31 @@ topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond R
 
 ### 1.1 单天线 vs 双天线模式
 
-Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位置加装第二根天线即可启用无漂移 RTK 航向）。模式由 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 自动检测：副天线平移默认为哨兵值 `(0, 0, 0)`（单天线模式），任何非零平移（范数 ≥ 0.05 m）都会让 GLIM++ 在启动时切换到双天线模式。启用双天线的完整步骤参见项目 [根 README](../README_zh.md#-双-gnss-天线--强烈推荐)；GLIM++ 在两种模式间的算法差异汇总如下。
+Hitch Sensor Dome 支持单天线或双天线 GNSS。启动助手会检查
+[`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml)，并报告副天线
+平移是 `(0, 0, 0)` 哨兵还是范数不小于 0.05 m 的真实基线；这只是诊断。
+算法行为由 [`glim/config/config_ros.json`](glim/config/config_ros.json) 中的
+`dual_antenna_enabled`、`dual_antenna_baseline_m`、
+`dual_antenna_heading_sigma_rad`，以及权威
+[`glim/config/config_gnss_global.json`](glim/config/config_gnss_global.json)
+中的 `enable_orientation_prior` 显式控制。仓库默认是单天线，航向先验关闭。
 
 | 维度 | 单天线 | 双天线 |
 |--------|----------------|--------------|
 | **航向来源** | IMU 陀螺仪积分（随 bias 漂移） | RTK-fixed 双天线基线（无漂移，约 0.1°–1°，取决于基线长度） |
-| **Init 门控 `ins_max_attitude_residual_deg`** | 姿态残差 `2.5°` | 自动收紧到 `0.8°` |
-| **Init 门控 `ins_min_pose_window_samples`** | `10` 条连续一致样本 | 自动缩短到 `5`（航向锁定更快） |
-| **Init 门控 `ins_init_timeout_s`** | `60 s` | 自动缩短到 `30 s` |
+| **Init 门控 `ins_max_attitude_residual_deg`** | 姿态残差 `2.5°` | 配置启用后由代码收紧到至多 `0.8°` |
+| **Init 门控 `ins_min_pose_window_samples`** | `10` 条连续一致样本 | 配置启用后由代码缩短到至多 `5` |
+| **Init 门控 `ins_init_timeout_s`** | `60 s` | 配置启用后由代码缩短到至多 `30 s` |
 | **Factor-bridge 朝向协方差** | 不填充（PoseStamped 的朝向信息不可用） | 由基线长度推导出的紧 yaw σ，松 pitch/roll —— 见 §7 |
-| **会话期航向漂移** | 随 IMU bias 累积；只能靠 LiDAR 扫描匹配抑制 | 在整段会话中由 RTK 航向约束（数据通路已就绪，因子模块暂缓 —— 见 §9「会话期航向修正」） |
+| **会话期航向漂移** | 随 IMU bias 累积；只能靠 LiDAR 扫描匹配抑制 | RTK Fixed 航向通过质量门后，由可选航向因子约束 |
 | **长 / 多圈轨迹下的地图质量** | yaw 稳定性依赖 LiDAR 特征丰富度；只要 RTK 位置 fixed，z 锚点仍可靠 | 初始化时朝向精度更高，并为后续会话期航向修正预留了清晰数据路径 |
 | **硬件需求** | 一根 SP1（或同级天线） | 两根天线，固定偏置（推荐基线 1.0–1.5 m） |
-| **启动时操作员看到的日志** | `Hitch fork: SINGLE-antenna mode — heading derived from IMU (drift-prone).` | `Hitch fork: DUAL-antenna mode — baseline=1.000 m, expected heading σ=0.010 rad (0.57°). Init gates auto-tightened.` |
+| **启动时操作员看到的日志** | 助手报告哨兵并核对关闭状态 | 助手打印应写入 `config_ros.json` 的三个值，并在配置一致前告警 |
 
-模式切换**完全自动** —— 没有独立的"双天线"启动参数。GLIM++ 启动时读取 TF YAML、计算副天线平移范数、自行选择。如要从双天线回退到单天线（例如现场副天线失效），把 `sensor_dome_tf.yaml` 里副天线平移清零即可，其它部分照常工作 —— 主天线一根就足以为 GLIM++ 的初始化门控（§6）和因子桥（§7）提供 RTK 位置。
+启用双天线行为时，先配置 Atlas 的物理基线，更新 TF YAML 并重新生成
+URDF，再把助手打印的三个值写入 `config_ros.json`，最后把权威 GNSS
+配置的 `enable_orientation_prior` 设为 `true`。回退单天线时恢复四个
+默认值。启动助手不会自动改写建图配置。
 
 ## 2. 车辆无关主体坐标系
 
@@ -102,7 +112,9 @@ Hitch Sensor Dome 支持单天线或双天线 GNSS 配置（在已知偏置位�
 
 ## 4. 多圈回环修复
 
-针对上游 GLIM 经典的"第二圈翘向天空"失败模式，在 `glim/config/config_global_mapping_gpu.json` 与 `glim_ext/config/config_gnss_global.json` 中做了三层修复：
+针对上游 GLIM 经典的"第二圈翘向天空"失败模式，在
+`glim/config/config_global_mapping_gpu.json` 与权威
+`glim/config/config_gnss_global.json` 中做了三层修复：
 
 | 参数 | 原值 | 现值 |
 |------|-----|-----|
@@ -211,7 +223,7 @@ fusion_engine_driver + adapter
 
 **RTK 失锁时的行为。** 当 RTK 退化为 float / no-fix（隧道、城市峡谷），adapter 的 Fixed-only topic 会停止发布；`gnss_global` 本段时间不加任何因子，优化器靠 LiDAR-IMU SLAM 撑过空档。RTK 重新锁定后，下一条 Fixed odometry 起恢复因子。
 
-涉及文件：[`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp)、[`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp)、[`glim_ext/config/config_gnss_global.json`](glim_ext/config/config_gnss_global.json)、[`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py)。
+涉及文件：[`glim_ros2/src/glim_ros/glim_ros.cpp`](glim_ros2/src/glim_ros/glim_ros.cpp)、[`glim_ros2/include/glim_ros/glim_ros.hpp`](glim_ros2/include/glim_ros/glim_ros.hpp)、[`glim/config/config_gnss_global.json`](glim/config/config_gnss_global.json)、[`launch/hitch_sensor_dome.launch.py`](launch/hitch_sensor_dome.launch.py)。
 
 ## 8. 项目集成
 
@@ -220,7 +232,7 @@ fusion_engine_driver + adapter
 | 目录 | 内容 |
 |--------|----------|
 | [`config/`](config/) | `generate_sensor_dome_urdf.py` 把 [`../config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 转成 `sensor_dome.urdf`，GLIM 通过 `config_sensors.json` 中的 `urdf_path` 字段读取，既用于 `T_lidar_imu` 也用于多 LiDAR `lidar_concat`。是采集、可视化、建图三方共享的单一信息源。TF YAML 改动后重跑此脚本。 |
-| [`launch/`](launch/) | `hitch_sensor_dome.launch.py` —— 从 `sensor_dome_tf.yaml` 发布静态 TF、用项目调好的配置启动 `glim_rosnode`、起 `foxglove_bridge` 做可视化、跑一次预飞静止性检查。 |
+| [`launch/`](launch/) | `hitch_sensor_dome.launch.py` 发布静态 TF、检查双天线/配置一致性、可选运行静止性诊断，并启动 Foxglove 支持。它**不会**启动 `glim_rosnode`；生产建图走离线流程。 |
 | [`scripts/`](scripts/) | `check_init_stationarity.py` —— 预飞诊断脚本；读 `/imu/data` 前 3 秒，若 bag 不静止则打印粗体红色警告。在 fork 中已退化为信息提示（C++ INS-init 路径自身能处理运动起步），但仍可用于排查 Atlas Duo 锁定缓慢、CI gating 等。 |
 
 ## 9. 设计说明
@@ -397,7 +409,8 @@ z = 0.273 只是支架的名义高度，应按实际安装测量 —— 由于�
 | `glim/config/config_odometry_gpu.json` | 修改 | §3（voxel 尺度、smoother 窗口） |
 | `glim/config/config_sub_mapping_gpu.json` | 修改 | §3（submap 关键帧、voxel） |
 | `glim/config/config_global_mapping_gpu.json` | 修改 | §3 §4（回环阈值） |
-| `glim_ext/config/config_gnss_global.json` | 修改 | §4 §7（prior_inf_scale、桥的 topic / type） |
+| `glim/config/config_gnss_global.json` | 修改，权威配置 | §4 §7（拟合门、先验、桥的 topic / type） |
+| `glim_ext/config/config_gnss_global.json` | 保留的回退镜像 | 仅在配置树缺少根级权威键时使用 |
 | `glim_ros2/include/glim_ros/glim_ros.hpp` | 修改 | §5 §6 §7（订阅、参数、因子桥状态） |
 | `glim_ros2/src/glim_ros/glim_ros.cpp` | 修改 | §5 §6 §7（ROS 侧完整实现） |
 | `config/generate_sensor_dome_urdf.py` | 新增 | §8 |
@@ -419,10 +432,10 @@ colcon build --packages-select glim glim_ext glim_ros \
              --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 
-# 实时建图（直接对接采集栈）：
+# 支持节点与配置诊断（不启动建图）：
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# 离线对 MCAP 包重放：
+# 生产环境离线对 MCAP 包重放：
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>

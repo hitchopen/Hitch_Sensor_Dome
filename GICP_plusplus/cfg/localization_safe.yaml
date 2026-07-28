@@ -6,19 +6,18 @@
     #
     # Layer this AFTER cfg/localization.yaml in the launch file's --params-file
     # chain (ros2 launch's `mode:=safe` does this automatically). Each entry
-    # below intentionally overrides the race-mode default to reclaim sensor
-    # coverage, registration robustness, and operator diagnostic visibility
-    # at the cost of CPU time.
+    # below intentionally overrides the race-mode default to increase
+    # registration robustness and operator diagnostic visibility at the cost
+    # of CPU time. LiDAR topology remains a separate launch choice.
     #
     # Choose safe mode when:
     #   - The vehicle operates at parking / pedestrian / urban speeds where
-    #     rear-quadrant features materially help GICP.
-    #   - The map is sparse to the front, or has long feature-poor stretches
-    #     that benefit from 360° coverage.
+    #     tighter registration is worth additional compute.
     #   - You're debugging an alignment issue and want every debug topic on.
-    #   - The localizer is doing not-strictly-localization work (live obstacle
-    #     accumulation, 360° awareness) that needs all three LiDARs.
     #   - The host PC has CPU headroom and latency is not the bottleneck.
+    #
+    # Add lidar_mode:=three_lidar when 360° coverage is also required. The
+    # launch default remains front_only even with this overlay.
     #
     # Choose race mode (no overlay) when:
     #   - The vehicle is operating at race speed on a feature-rich pre-built
@@ -31,12 +30,11 @@
     # Every override below carries a one-line comment explaining the trade.
     # ==========================================================================
 
-    # --- Multi-LiDAR concatenation (full 360° coverage) ---
-    # Brings the two rear Robin Ws back into the localizer's input. Roughly
-    # 2-3× more points per scan, ~50 ms of aux-buffering jitter, ~3× GICP
-    # alignment cost. The tradeoff is worth it when feature-poor front
-    # stretches benefit from rear-quadrant returns.
-    localization/lidar_concat/enabled: true
+    # --- Multi-LiDAR merge policy ---
+    # LiDAR selection is independent of this tuning overlay and remains
+    # front_only unless the launch receives lidar_mode:=three_lidar (the safe
+    # systemd unit does so explicitly) or lidar_mode:=auto. These parameters
+    # make every rear sweep mandatory once three_lidar is selected.
     localization/lidar_concat/require_all_aux: true
     localization/lidar_concat/future_sweep_wait_timeout: 0.15
 

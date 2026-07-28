@@ -12,7 +12,7 @@ Humble/Jazzy C++17 and `rclcpp` API surface.
 ## Index of changes
 
 1. [Hardware retargeting — Robin W + Atlas Duo](#1-hardware-retargeting)
-2. [Two-mode operation — race vs. safe](#2-two-mode-operation)
+2. [Tuning profiles and LiDAR selection](#2-tuning-profiles-and-lidar-selection)
 3. [RTK-gated INS odometry republisher (`nav_sat_gated_odom`)](#3-rtk-gated-ins-odometry-republisher)
 4. [GLIM++ map bridge (`merge_glim_submaps.py`)](#4-glim-map-bridge)
 5. [small_gicp backend and warm-start](#5-small_gicp-backend-and-warm-start)
@@ -48,17 +48,57 @@ Topic, frame, and URDF defaults throughout the configs target the Hitch Sensor D
 
 Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py), [`include/dlio/dlio.h`](include/dlio/dlio.h), [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h), [`src/localization.cc`](src/localization.cc).
 
-## 2. Two-mode operation
+## 2. Tuning profiles and LiDAR selection
 
-Upstream DLIO ships one config. GICP++ ships two clearly-defined modes selectable at launch time via `mode:=race|safe|custom`.
+Upstream DLIO ships one config. GICP++ ships two clearly-defined tuning
+profiles selectable at launch time via `mode:=race|safe|custom`. LiDAR
+selection is an independent launch choice:
+`lidar_mode:=auto|front_only|three_lidar`.
 
-The base [`cfg/localization.yaml`](cfg/localization.yaml) carries **race-mode** defaults; [`cfg/localization_safe.yaml`](cfg/localization_safe.yaml) is an overlay applied on top when `mode:=safe`. ROS 2's parameter chain layers the overlay's keys over the base, so the safe-mode YAML only carries the entries that differ.
+The base [`cfg/localization.yaml`](cfg/localization.yaml) carries **race-mode**
+defaults; [`cfg/localization_safe.yaml`](cfg/localization_safe.yaml) is an
+overlay applied on top when `mode:=safe`. ROS 2's parameter chain layers the
+overlay's keys over the base, so the safe-mode YAML only carries the entries
+that differ.
+
+`front_only` is the effective node default and the explicit YAML and launch
+default for every tuning profile. Selecting `mode:=safe` changes registration
+and diagnostic tuning but does not enable the rear LiDARs. Use
+`lidar_mode:=three_lidar` to opt into full-dome input. `lidar_mode:=auto` is
+also an explicit opt-in: it follows the selected profile (`safe` resolves to
+`three_lidar`; `race` and `custom` resolve to `front_only`). Thus `mode:=safe`
+alone keeps conservative GICP tuning without rear-cloud cost, while
+`mode:=race lidar_mode:=three_lidar` combines race tuning with all three Robin
+W units.
+
+`front_only` creates no rear-LiDAR subscriptions, buffers, extrinsic lookups,
+merge waits, or rear startup-FOV checks. `three_lidar` requires exactly two
+distinct auxiliary topics and frames and checks all three LiDARs independently
+before localization starts. The node's declared `localization/lidar_mode`
+default is intentionally empty so hand-written legacy parameter files remain
+compatible: when the parameter is unset or explicitly empty, deprecated
+`localization/lidar_concat/enabled:=true` resolves to `three_lidar`, while its
+default `false` resolves to `front_only`; both paths emit a deprecation
+warning. The shipped YAML and launch layer always set `lidar_mode` explicitly.
+
+```bash
+# Lowest LiDAR compute load: one front Robin W.
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  mode:=race
+
+# Full dome input: front plus both rear Robin W units.
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  mode:=safe lidar_mode:=three_lidar
+
+# Explicit profile-following selection (safe -> three_lidar).
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  mode:=safe lidar_mode:=auto
+```
 
 ### Side-by-side knob comparison
 
 | Knob | 🏁 Race mode | 🛡 Safe mode | Why they differ |
 |---|---|---|---|
-| `lidar_concat/enabled` | `false` (front-only) | `true` (3× LiDARs) | Race trades 360° coverage for ~50 ms less jitter + ~3× faster GICP. Safe restores full coverage. |
 | `cropBoxFilter/size` | `40.0` m | `100.0` m | Race clips to the immediate vicinity. Safe uses ~Robin W's effective range. |
 | `voxelFilter/res` | `0.5` m | `0.3` m | Safe spends ~2.4× more points per scan on cleaner alignment. |
 | `gicp/maxIterations` | `32` | `128` | Race caps iterations; safe uses the upstream safety margin. |
@@ -73,10 +113,12 @@ The base [`cfg/localization.yaml`](cfg/localization.yaml) carries **race-mode** 
 
 Each mode also gets its own systemd unit:
 
-- [`launch/gicp_localization-race.service`](launch/gicp_localization-race.service): `SCHED_FIFO` priority 50, `CPUAffinity=4-7`, `Nice=-15`, `OOMScoreAdjust=-1000`.
-- [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service): default scheduling, unlimited cores, `OOMScoreAdjust=-500`.
+- [`launch/gicp_localization-race.service`](launch/gicp_localization-race.service): explicitly selects `front_only`, with `SCHED_FIFO` priority 50, `CPUAffinity=4-7`, `Nice=-15`, and `OOMScoreAdjust=-1000`.
+- [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service): explicitly selects `three_lidar`, with default scheduling, unlimited cores, and `OOMScoreAdjust=-500`.
 
-The two units carry `Conflicts=` directives so starting one auto-stops the other; you can never accidentally run both.
+The services deliberately pin different sensor topologies; this does not
+change the launch default. Their `Conflicts=` directives prevent both from
+running at once.
 
 Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`cfg/localization_safe.yaml`](cfg/localization_safe.yaml), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py), [`launch/gicp_localization-race.service`](launch/gicp_localization-race.service), [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service).
 
@@ -239,8 +281,9 @@ Two new bold-yellow one-shot warnings to surface common operator-side misconfigu
 
 Healthy state prints a single confirmation INFO line.
 
-**(b) IMU never arrived.** The check reports the adapter default
-`/gps_p1/imu` and the resolved publisher count.
+**(b) IMU never arrived.** The check reports the resolved topic and publisher
+count. The live default is `/imu/data`; `/gps_p1/imu` is accepted for
+normalized adapter replays.
 
 Files touched: [`src/localization.cc`](src/localization.cc) (gt_odom timer at ~line 490; IMU topic warn around line 450).
 
@@ -266,7 +309,7 @@ Beyond the structural changes above, race mode also bundles latency-focused para
 | Robin W FPS expectation | 10 Hz typical | 20 Hz documented | LiDAR firmware setting; halves scan-to-correction interval. |
 | `cropBoxFilter/size` | ~80 m | `40.0` m | At race speed anything beyond 40 m doesn't affect self-position. |
 | `gicp/maxIterations` | `128` | `32` | Feature-rich pre-built map converges in 5–15 iterations. |
-| All debug publishers | typically on | `false` | Per-scan publisher overhead eliminated for race mode. |
+| Evidence publishers / `SCAN DEBUG` | typically on | `true` | Kept on so the scorecard can validate every deployment; only verbose and jump logs are off. |
 | `voxelFilter/res` | `0.3` | `0.5` | Sparse spatial density bounds GICP point count. |
 
 Roll-back path is one YAML diff (`mode:=safe` overlay or per-key edits in `cfg/localization.yaml`).
@@ -387,9 +430,9 @@ point, so a zero timestamp is invalid and rejects the whole cloud. The
 deskewer uses the validated absolute
 capture times directly. Aux scans merged by
 `lidar_concat` remain on the shared PTP axis and are not rebased by the
-inter-header delta (`lidar_concat` remains disabled by default here until
-3x Robin W sweep alignment is validated; the strict-merge guard and per-frame
-evidence are ready when it is enabled).
+inter-header delta. The race profile selects `front_only`; select
+`three_lidar` after validating the three Robin W units' PTP and sweep
+alignment. The strict-merge guard and per-frame evidence apply in that mode.
 
 **LiDAR quality gate.** Before timestamp validation, crop, deskew, or
 concatenation, GICP++ measures the first usable raw cloud from each configured

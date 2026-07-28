@@ -132,6 +132,11 @@ if(BUILD_TESTING)
   ament_target_dependencies(lidar_fov_gate_test sensor_msgs)
   target_include_directories(lidar_fov_gate_test PRIVATE include)
 
+  ament_add_gtest(lidar_mode_test
+    test/lidar_mode_test.cpp
+  )
+  target_include_directories(lidar_mode_test PRIVATE include)
+
   ament_add_gtest(map_manifest_test
     test/map_manifest_test.cpp
   )

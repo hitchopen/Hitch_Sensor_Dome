@@ -92,13 +92,12 @@ def generate_launch_description():
         description='Require transient-local datum metadata from the live '
                     'adapter before accepting point clouds or GT odometry.')
 
-    # Hitch Sensor Dome — two-mode selector.
-    # race (default): front-only LiDAR, tight crop, fewer GICP iters,
-    #   yaw-rate Kp/Kq attenuation, debug publishers off. Tuned for
-    #   lowest latency on a pre-built race-track map.
-    # safe: 3× LiDAR concat, full 100 m crop, upstream GICP iter count,
-    #   tighter convergence, all debug topics on, no yaw-rate attenuation.
-    #   Tuned for maximum sensor coverage and robustness.
+    # Hitch Sensor Dome tuning-profile selector. LiDAR topology is controlled
+    # independently by lidar_mode and defaults to front_only for every profile.
+    # race (default): tight crop, fewer GICP iterations, yaw-rate Kp/Kq
+    #   attenuation, and reduced verbose/jump logging.
+    # safe: full 100 m crop, upstream GICP iteration count, tighter
+    #   convergence, all diagnostics on, and no yaw-rate attenuation.
     # custom: skips the mode overlay entirely; the base localization.yaml
     #   plus any operator-supplied --params-file is what loads.
     # The selected overlay file is layered AFTER cfg/localization.yaml in
@@ -106,9 +105,16 @@ def generate_launch_description():
     # without touching the base file.
     declare_mode_arg = DeclareLaunchArgument(
         'mode', default_value='race',
-        description='Localization mode: "race" (front-only, low-latency), '
-                    '"safe" (3× LiDARs, max coverage, all debug on), or '
-                    '"custom" (no overlay; base YAML only). Default: race.')
+        description='Localization tuning profile: "race" (low-latency; '
+                    'front-only by default), "safe" (max robustness; LiDAR '
+                    'selection remains independent), or "custom" (no overlay; '
+                    'base YAML only). Default: race.')
+    declare_lidar_mode_arg = DeclareLaunchArgument(
+        'lidar_mode', default_value='front_only',
+        description='LiDAR input mode: "front_only" uses only the primary '
+                    'front Robin W, "three_lidar" uses front plus both rear '
+                    'Robin W units, and "auto" follows the race/safe profile. '
+                    'Default: front_only.')
 
     # Hitch Sensor Dome: RTK-gating republisher controls.
     declare_run_rtk_gate_arg = DeclareLaunchArgument(
@@ -178,6 +184,8 @@ def generate_launch_description():
             'local_enu_origin').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         mode_value = LaunchConfiguration('mode').perform(context).strip().lower()
+        lidar_mode_value = LaunchConfiguration(
+            'lidar_mode').perform(context).strip().lower()
 
         params = [localization_yaml_path]
 
@@ -197,6 +205,22 @@ def generate_launch_description():
         else:
             print(f"[gicp_localization launch] WARN: unknown mode '{mode_value}' "
                   f"— falling back to RACE defaults")
+
+        if lidar_mode_value not in ('auto', 'front_only', 'three_lidar'):
+            raise RuntimeError(
+                "lidar_mode must be 'auto', 'front_only', or 'three_lidar'")
+        if lidar_mode_value == 'auto':
+            resolved_lidar_mode = (
+                'three_lidar' if mode_value == 'safe' else 'front_only')
+            print("[gicp_localization launch] lidar_mode = AUTO "
+                  f"({resolved_lidar_mode} from {mode_value} profile)")
+        else:
+            resolved_lidar_mode = lidar_mode_value
+            print("[gicp_localization launch] lidar_mode override = "
+                  f"{resolved_lidar_mode}")
+        params.append({
+            'localization/lidar_mode': resolved_lidar_mode,
+        })
 
         params.append({'localization/lidar_frame': child_frame_value})
         params.append({
@@ -299,6 +323,7 @@ def generate_launch_description():
         declare_local_enu_origin_arg,
         declare_require_live_enu_origin_arg,
         declare_mode_arg,
+        declare_lidar_mode_arg,
         declare_run_rtk_gate_arg,
         declare_ins_odom_topic_arg,
         declare_ins_fix_topic_arg,

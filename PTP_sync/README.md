@@ -453,186 +453,51 @@ Expected post-sync accuracy through the Planet WGS-6325-8UP2X boundary clock:
 
 ## Section 6: Recording Data
 
-### 6.1 Recording architecture
+The supported recorder is
+[`../recording/sensor_recorder.py`](../recording/sensor_recorder.py). It
+launches the configured ROS 2 sensor drivers, verifies chrony/PTP and the RTK
+gate, records an MCAP rosbag, and starts the Foxglove bridge. It runs
+unprivileged; only the optional `pmc` management query uses `sudo -n`.
 
-This system uses a **zero-ROS recording approach** for maximum performance:
-
-| Sensor | Capture Method | Format | CPU Load |
-|--------|---------------|--------|----------|
-| Seyond Robin W LiDARs | `tcpdump` (kernel-level) | .pcap | ~1% per LiDAR |
-| Point One Nav Atlas Duo | `p1_runner` (native binary) | .p1log | ~1% |
-| RouteCAM cameras | Aravis / `tcpdump` | .pcap or raw frames | ~2–5% per camera |
-
-Compared to rosbag recording (~30–50% CPU), this skips point cloud decoding, ROS serialization, and DDS middleware during capture. Data is decoded on replay.
-
-### 6.2 Configure Atlas Duo message rates
+For a production GLIM++ bag, start the Atlas adapter separately with exactly
+one deployment datum. The recorder does not launch it:
 
 ```bash
-cd ~/p1-host-tools
+# Terminal 1: normalized Atlas streams and authoritative Fixed-only odometry.
+ros2 launch adapter adapter.launch.py \
+  use_p1_imu_pcap:=false \
+  local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
 
-python3 bin/config_tool.py apply uart2_message_rate fe ROSPoseMessage 100ms
-python3 bin/config_tool.py apply uart2_message_rate fe ROSGPSFixMessage 100ms
-python3 bin/config_tool.py apply uart2_message_rate fe ROSIMUMessage on
-python3 bin/config_tool.py save
+# Terminal 2: detect sensors, verify sync/RTK, and record.
+cd /path/to/Hitch_Sensor_Dome
+python3 recording/sensor_recorder.py
 ```
 
-### 6.3 Recording with the fast recorder script
-
-```bash
-# Single LiDAR
-sudo python3 sensor_recorder_fast.py
-
-# 3 LiDARs
-sudo python3 sensor_recorder_fast.py --num-lidars 3 \
-    --lidar1-ip 192.168.1.10 \
-    --lidar2-ip 192.168.1.11 \
-    --lidar3-ip 192.168.1.12
-
-# With YAML config
-sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
-```
-
-Interactive commands: `R` start recording, `S` stop, `H` health, `Q` quit.
-
-### 6.4 Session output structure
-
-```
-~/recordings/session_20260311_143022/
-├── lidar_pcap/
-│   ├── robin_w_front.pcap       # Raw network capture (kernel-level)
-│   ├── robin_w_rear_left.pcap   # All timestamps PTP-synchronized
-│   └── robin_w_rear_right.pcap
-├── camera_pcap/
-│   ├── cam_front_left.pcap       # GigE Vision raw packets (PTP-stamped)
-│   ├── cam_front_right.pcap
-│   ├── cam_rear_left.pcap
-│   └── cam_rear_right.pcap
-├── p1nav/
-│   └── *.p1log                  # FusionEngine binary (GNSS + IMU + pose)
-├── session_metadata.json
-└── session_stats.json
-```
-
-All sensors are PTP-synchronized, so timestamps share the same GPS time base and can be aligned in post-processing without additional clock correction.
-
-### 6.5 YAML configuration reference
-
-```yaml
-point_one_nav:
-  connection_type: "tcp"
-  tcp_ip: "192.168.1.30"
-  tcp_port: 30201
-
-lidars:
-  - name: "robin_w_front"
-    ip: "192.168.1.10"
-    port: 8337
-  - name: "robin_w_rear_left"
-    ip: "192.168.1.11"
-    port: 8338
-  - name: "robin_w_rear_right"
-    ip: "192.168.1.12"
-    port: 8339
-
-recording:
-  output_dir: "~/recordings"
-  interface: "eth0"
-```
-
-### 6.6 Alternative: ROS 2 native recording
-
-If you prefer rosbag (higher CPU but simpler replay):
-
-```bash
-# Terminal 1 — Point One Nav (FusionEngine over TCP)
-ros2 run fusion_engine_driver fusion_engine_ros_driver --ros-args \
-    -p connection_type:=tcp \
-    -p tcp_ip:=192.168.1.30 \
-    -p tcp_port:=30201
-
-# Terminal 2 — Seyond Robin W
-ros2 launch seyond start.py
-
-# Terminal 3 — Record
-ros2 bag record -a -o my_dataset
-```
-
-Ensure `use_sim_time` is `false` in all nodes. When `use_sim_time` is `false`, ROS 2 message headers use `CLOCK_REALTIME`, which is GPS-disciplined through the PTP chain.
-
-```bash
-# Verify timestamps are realistic (not zeros)
-ros2 topic echo /robin_w_front/points --field header.stamp --once
-```
+The output is `recording/data/session_<timestamp>/rosbag2/*.mcap` plus logs and
+`session_metadata.json`. The bag includes the three Robin W clouds, camera
+streams, `/imu/data`, `/gps_p1/fix`,
+`/gps_p1/filtered_odom_rtk_fixed`, TF, and diagnostics when their publishers
+are available. See [`../recording/README.md`](../recording/README.md) and
+[`../recording/sensor_config.yaml`](../recording/sensor_config.yaml) for the
+complete runtime and configuration reference.
 
 ---
 
 ## Section 7: Replay and Visualization
 
-### 7.1 Replay Point One Nav data (.p1log)
+Open the MCAP directly in Foxglove Studio and import
+`recording/foxglove/sensor_dome_layout.json`, or replay it into ROS 2:
 
 ```bash
-SESSION=~/recordings/session_20260311_143022
+cd /path/to/Hitch_Sensor_Dome
+ros2 bag play recording/data/session_<timestamp>/rosbag2
 
-# Interactive trajectory + IMU + GNSS plots
-p1_display $SESSION/p1nav/
-
-# Decode messages to terminal
-p1_print $SESSION/p1nav/*.p1log
-
-# Export to CSV / KML
-p1_extract $SESSION/p1nav/
-p1_extract --kml $SESSION/p1nav/
-```
-
-### 7.2 Replay Seyond Robin W PCAPs into ROS 2
-
-```bash
-ros2 launch seyond start.py \
-    pcap_file:=$SESSION/lidar_pcap/robin_w_front.pcap \
-    lidar_name:=robin_w_front \
-    frame_id:=robin_w_front \
-    frame_topic:=/robin_w_front/points
-```
-
-### 7.3 Visualize in RViz2 / Foxglove Studio
-
-```bash
-# RViz2
+# In another terminal:
 rviz2
-# Add → By topic → PointCloud2. Set Fixed Frame. Set Point Size ~0.02.
-
-# Foxglove Studio
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-foxglove-studio
-# Connect to ws://localhost:8765
 ```
 
-### 7.4 Inspect raw PCAPs
-
-```bash
-tshark -r $SESSION/lidar_pcap/robin_w_front.pcap -q -z io,stat,1
-wireshark $SESSION/lidar_pcap/robin_w_front.pcap
-```
-
-### 7.5 Convert replayed data to rosbag
-
-```bash
-ros2 bag record -o $SESSION/replayed_rosbag \
-    /robin_w_front/points /robin_w_left/points /robin_w_right/points \
-    /tf /tf_static
-```
-
-### 7.6 Tool summary
-
-| Tool | Purpose | Input |
-|------|---------|-------|
-| `p1_display` | Interactive trajectory/IMU/GNSS plots | .p1log |
-| `p1_extract` | Export to CSV / KML | .p1log |
-| `p1_print` | Decode messages to terminal | .p1log |
-| `rviz2` | 3D point cloud visualization | ROS 2 topics |
-| `foxglove-studio` | Multi-panel sensor dashboard | ROS 2 topics |
-| `tshark` / `wireshark` | Raw packet inspection | .pcap |
-| `arv-viewer-0.8` | Live GigE Vision camera viewer | Camera stream |
+Keep `use_sim_time=false` unless the entire replay graph is deliberately
+configured for `/clock`.
 
 ---
 

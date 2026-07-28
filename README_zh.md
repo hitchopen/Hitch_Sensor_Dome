@@ -57,11 +57,11 @@
 >    文件中默认的 `(0, 0, 0)` 是显式禁用双天线模式的**哨兵值** —— 任何实际安装都会有非零偏置。用卷尺测量到 ±1 cm 即可；启动脚本会按 `σ ≈ atan2(0.01 m, baseline_m)` 把基线换算成预期 RTK-fixed 航向 σ，例如 1.2 m 基线对应 σ ≈ 0.48°（远低于下文运行期合理性检查的阈值）。此处填入的偏置**还必须**写入 Atlas Duo 固件的 `gnss_lever_arm_secondary`（见下文杆臂补偿说明）—— 两处必须一致。
 > 4. 重新生成 URDF：`cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py`。脚本会打印 `GNSS antenna mode: DUAL` 以及基线长度和预期的 RTK-fixed 航向 σ。如果输出是 `GNSS antenna mode: SINGLE`，说明第 3 步的平移仍是哨兵值，URDF 生成器拒绝切换到双天线模式。
 >
-> **若只装单根天线作为回退：** 保留 `gnss_antenna_secondary_link` 的默认 `(0, 0, 0)` 即可。GLIM++ 启动时识别该哨兵值并自动切换到单天线模式 —— 系统仍然可用，主天线一根就足以为 GLIM++ 的初始位姿和整段会话的 GNSS 因子流提供 RTK 位置。唯一损失的是双天线带来的航向收益（初始化门控保持单天线默认值，yaw 漂移仍然由 IMU 主导）。同时保持 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) 中的 `enable_orientation_prior: false` —— 详情见下文 GLIM++ GNSS 航向先验说明。两种模式下的具体差异参见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md) 中的对比表。
+> **若只装单根天线作为回退：** 保留 `gnss_antenna_secondary_link` 的默认 `(0, 0, 0)` 即可。启动助手会识别该哨兵并报告单天线硬件；主天线仍为 GLIM++ 初始化和整段会话的 GNSS 位置因子提供 RTK 位置，只缺少无漂移航向。仓库算法配置已经与该硬件默认值一致：权威配置 [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json) 中的 `enable_orientation_prior` 为 `false`。
 
 ## 传感器布局
 
-下方示意图（由 v17e SCAD 模型生成）以 ROS REP 103 车体坐标系（+X 前、+Y 左、+Z 上）标注每个传感器相对于 Atlas Duo 导航中心 (原点) 的位置。
+下方示意图采用当前 SCAD 坐标约定，以 ROS REP 103 车体坐标系（+X 前、+Y 左、+Z 上）标注每个传感器相对于 Atlas Duo 导航中心（原点）的位置。
 
 ![俯视图](3D%20files/sensor_dome_layout_top.jpg)
 
@@ -75,8 +75,8 @@
 
 ```
 3D files/                  OpenSCAD 模型、READMEs、导出的 STL 文件
-  sensor_dome.scad         参数化 OpenSCAD 源 (v17e) —— 两件式螺栓装配版
-                           (L1 + L2 由 12 颗 M6 BHCS 螺栓连接)
+  sensor_dome.scad         参数化 OpenSCAD 源 (v17r) —— 两件式螺栓装配版
+                           (L1 + L2 由 10 颗 M6 BHCS 螺栓连接)
   sensor_dome_unibody.scad 一体式 (unibody) 变体 —— 包装 sensor_dome.scad，
                            将 L1 + 支柱 + L2 融合为单一可打印件
   README.md                详细设计规范 (英文)
@@ -118,7 +118,7 @@ GLIM_plusplus/                LiDAR-Inertial 建图 (koide3/glim 的 fork)
   launch/                 hitch_sensor_dome.launch.py
   glim/                   上游 GLIM 核心 (附项目调参)
   glim_ext/               上游扩展模块 (GNSS 先验已重新启用)
-  glim_ros2/              上游 ROS 2 封装 (未改动)
+  glim_ros2/              ROS 2 封装（多 LiDAR 拼接、INS/GNSS bag 输入）
   README.md               Fork 声明、集成说明、多圈修复
 
 GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
@@ -136,7 +136,9 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
 
 ### 方案 A —— 两件式螺栓装配 (默认，推荐)
 
-原始设计。L1（底板 + 6 根支柱，整体高 139 mm）与 L2（顶板，厚 12 mm）分开打印，再由 12 颗 M6×20 mm BHCS 螺栓在支柱顶端连接。打印更快、无需支撑材料、便于拆卸维护，单独更换其中一块板时也无需重新打印另一块。
+原始设计。L1（底板 + 6 根支撑，整体高 139 mm）与 L2（顶板，厚
+12 mm）分开打印，再由 10 颗 M6×25 mm BHCS 螺栓在支撑顶端连接。
+打印更快、无需支撑材料、便于拆卸维护，单独更换其中一块板时也无需重新打印另一块。
 
 1. 在 OpenSCAD 中打开 `3D files/sensor_dome.scad`。
 2. 设置 `RENDER_MODE = 1`，渲染 (F6)，导出 STL (F7) —— 这是 **L1 打印件**。
@@ -149,7 +151,7 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
 适用于希望 L1 与 L2 之间没有任何螺栓接合的部署 —— 抗扭刚度略高、长期使用不会出现螺栓松动、切片时只处理一个文件。代价：打印时间长，L2 下方需要相当数量的支撑材料。
 
 1. 在 OpenSCAD 中打开 `3D files/sensor_dome_unibody.scad`。该文件通过 `include` 引用了 `sensor_dome.scad`，所以所有参数 (支柱高度、板尺寸、传感器孔位等) 都会自动与两件式版本保持同步。
-2. 渲染 (F6) 并导出 STL (F7) —— 这是 **整体穹顶打印件** (大约 280 × 300 × 151 mm，在默认 L1 朝下的方向下可放进 305 × 305 × 300 mm 床面)。
+2. 渲染（F6）并导出 STL（F7）—— 这是**整体穹顶打印件**（约 280 × 300 × 151 mm，在默认 L1 朝下的方向下可放进 305 × 305 × 300 mm 床面）。
 3. **必须开启支撑材料。** L2 顶板悬挂在支柱顶端之间，跨度覆盖 280 × 300 mm 的近乎空腔区域。请使用 **树形 / 有机支撑** (PrusaSlicer 2.6+、Bambu Studio、Cura "Tree")，**仅** 放在 L2 下表面、不要放进支柱之间。常规参数下约需 1.5–2 kg PETG 支撑材料，打印时间约 28–36 小时；这种高度下溶解性支撑并不实用。本方案不需要 BOM 中的 12 颗 M6 BHCS 支柱螺栓。
 
 完整设计规范、BOM 和装配说明见 [`3D files/README.md`](3D%20files/README.md)。
@@ -160,11 +162,11 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
 
 1. **一次性搭建** —— 运行 [`PTP_sync/`](PTP_sync/) 中的脚本，把主机配置成 GPS 校准的 PTP 主时钟，并在每台 LiDAR 与每台摄像头上启用 IEEE 1588 PTP。完成后所有传感器共享亚微秒级的 GPS 时间基准。
 
-2. **逐次采集** —— 运行 [`recording/sensor_recorder.py`](recording/sensor_recorder.py) 自动检测已连接的传感器、验证时钟同步链路、并把 GNSS / IMU / LiDAR / 摄像头数据流录制成 Foxglove 原生的 MCAP rosbag。配套的 Foxglove Studio 布局会在采集过程中实时显示三路 Robin W 点云在 IMU 坐标系下的叠加、四个摄像头视图、GNSS 地图、IMU 曲线，以及每个 topic 的实时帧率。
+2. **逐次采集** —— 同时运行 [`adapter/`](adapter/) 与 [`recording/sensor_recorder.py`](recording/sensor_recorder.py)。录制器自动检测已连接的传感器、验证时钟同步链路和 adapter 的 Fixed-only 里程计，并把 GNSS / IMU / LiDAR / 摄像头数据流录制成 Foxglove 原生的 MCAP rosbag。录制器不会代替你启动 adapter。
 
 ```bash
 # 在 PTP_sync/ 已经跑过一次之后：
-sudo python3 recording/sensor_recorder.py
+python3 recording/sensor_recorder.py
 # 然后在 Foxglove 中：Open Connection → ws://localhost:8765
 #                     Layouts → Import → recording/foxglove/sensor_dome_layout.json
 ```
@@ -178,11 +180,11 @@ sudo python3 recording/sensor_recorder.py
 1. **传感器适配** —— topic、frame、字段名开箱即为 Hitch Sensor Dome（3× Robin W + Atlas Duo + 4× RouteCAM）配置：`/imu/data`、`/robin_w_*/points`，frame 采用 `config/sensor_dome_tf.yaml` 中的 `imu_link`/`lidar_front_link`。
 2. **车辆无关主体坐标系** —— GLIM++ 的地图锚定在 `imu_link`（Atlas Duo 导航中心），可跨车辆平台复用。下游定位节点把位姿报告在 `base_link`（ROS 标准车体坐标系）下，由 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中的 `imu_link → base_link` 静态变换桥接 —— 默认 identity，按车辆需要重写（后轴、底盘几何中心等），无需重新建图。
 3. **户外 / 车辆尺度调参** —— 24 项参数变更（放宽 IMU 噪声、增大 voxel、加长初始化窗口、提高 sub-mapping 密度），针对高速公路 / 赛道 / 车辆机动场景。
-4. **多圈回环修复** —— 拓宽 VGICP 收敛域、放宽隐式回环阈值、提升 GNSS z 先验权重，防止经典的"第二圈轨迹翘向天空"现象。
+4. **多圈回环修复** —— 拓宽 VGICP 收敛域、放宽隐式回环阈值、使用协方差感知 GNSS 先验并加固 world/UTM 拟合，防止经典的"第二圈轨迹翘向天空"现象。
 5. **C++ 重写初始化** —— 移除"由加速度计估计重力"路径；优化器现在必须由外部 INS 位姿启动。这使得从运动状态开始的录制（中途重启、赛道重放、被截过的 bag）也能正常使用。
 6. **初始位姿的 RTK-fixed 准入门控** —— 三阶段门控（NavSatFix 状态、协方差、多采样稳定性），未通过时打印粗体红色 CLI 警告。
 7. **RTK 门控的 GNSS 因子桥** —— 整段会话期间向全局图持续注入 GNSS 软先验因子，但仅在 RTK 锁定时段；隧道期间静默暂停，重新锁定后自动恢复。
-8. **GNSS 航向先验（仅适用于双天线）** —— 当配置为双天线 RTK 时，使用 `PoseRotationPrior` 因子把每个 submap 的 yaw 拉向 RTK 测得的航向。出厂默认开启；若改用单天线则必须手动关闭。
+8. **GNSS 航向先验（仅适用于双天线）** —— 当配置为双天线 RTK 时，可使用 `PoseRotationPrior` 因子把每个 submap 的 yaw 拉向 RTK 测得的航向。仓库默认关闭；安装并配置副天线后才显式开启。
 
 URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更日志、上游致谢、license 保留、引用方式与编译说明请见 [`GLIM_plusplus/README.md`](GLIM_plusplus/README.md)。
 
@@ -210,45 +212,37 @@ URDF 生成器与 `ros2 launch` 助手补全了集成。完整的逐文件变更
 >
 > **若将 Atlas Duo 替换为非紧耦合的 GNSS**（例如 SwiftNav / u-blox / NovAtel 等无板载 INS 融合的裸 RTK 接收机，或任何把位置以**天线**参考点而非 IMU 原点发布的松耦合方案），则必须**在 GLIM++ 中开启杆臂补偿** —— 因为天线到 IMU 的修正不再由上游设备完成。建议的实现方式：在 wrapper 的 GNSS 因子桥（`glim_ros.cpp` 的 `try_publish_gnss_factor`）中读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 的 `imu_link → gnss_antenna_primary_link`，在消息进入 `libgnss_global.so` 之前做 `p_imu_utm = p_antenna_utm − R_world_imu · t_imu_gnss` 修正。
 
-> ### 🧭 GLIM++ GNSS 航向先验 —— 默认开启（双天线 RTK）
+> ### 🧭 GLIM++ GNSS 航向先验 —— 默认关闭
 >
-> **GLIM++ 在 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json) 中默认启用 GNSS 航向先验（`PoseRotationPrior`）。** 每个 submap 的 yaw 都被约束到 RTK 测得的航向上，消除单靠 LiDAR + IMU 长时间会留下的 yaw 缓慢漂移。这是 Hitch Sensor Dome 的**默认配置**，因为本项目出厂即为双天线 RTK 平台。
+> 仓库默认是单天线参考设计：`gnss_antenna_secondary_link` 使用
+> `(0, 0, 0)` 哨兵，权威配置
+> [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json)
+> 中的 `enable_orientation_prior` 为 `false`。单天线运行无需修改配置。
 >
-> **工作原理。** 双天线 RTK 接收机直接从两根天线之间的基线测得航向 —— 无漂移，精度约 0.1°–4°，取决于基线长度。Atlas Duo 的 `/pose` topic 在四元数字段中携带该航向；wrapper 把它转发到 `/gnss/pose_rtk_only` 并附上紧的 yaw 协方差，`libgnss_global.so` 在每个 submap 上把它消费为一个 `PoseRotationPrior` 因子。出厂权重为 `[1e-6, 1e-6, 1e2]` —— 只约束 yaw，σ_yaw ≈ 0.1 rad（~5.7°），适用于 0.3–1 m 的基线。基线更长（例如 2 m）时，Atlas Duo 的航向协方差会变小，可以把权重提高（如 `5e2` 对应 ~2.6° σ）。roll 与 pitch 保持几乎为零的权重，因为 GNSS 不观测这两个轴 —— IMU + 重力已经处理。
->
-> ### ⚠ GLIM++ GNSS 航向先验 —— 单天线安装必须关闭
->
-> **如果只装一根 GNSS 天线，必须关闭该航向先验。** 单天线情况下，`/pose` 上的航向是由 INS 陀螺仪积分得来的 —— 会随会话时间漂移。把优化器绑定到一个本身就在漂移的参考上，比让 yaw 完全由 LiDAR + IMU 控制更糟糕，正是 GLIM++ 当初要解决的多圈 z-drift / yaw-drift 失败模式会再次出现。
->
-> **切换到单天线模式需要两处改动，都必须在启动 GLIM++ 之前完成：**
->
-> 1. **TF YAML。** 把 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 中的 `gnss_antenna_secondary_link` 保留（或恢复）到哨兵值 `(0, 0, 0)`。启动 log 此时会打印 `single-antenna mode` 而不是 `dual-antenna mode ENABLED`。
-> 2. **GNSS 因子配置。** 打开 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json)，把下面这一行翻成 false：
->
->    ```jsonc
->      "enable_orientation_prior": false,
->    ```
->
-> 第 2 步是承重部分：如果你只把 TF YAML 改成单天线，但忘了关闭航向先验，wrapper 仍会发布松协方差的四元数（陀螺积分出的 INS yaw），rotation prior 因子照样会触发，把优化器拉向那个漂移的航向。这个开关必须显式翻转。
+> 只有在刚性安装副天线、测量两根天线杆臂并在 Atlas Duo 中启用双天线航向后，
+> 才能开启 `PoseRotationPrior`。把实测副天线变换写入
+> [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)，重新生成 URDF，
+> 在 [`GLIM_plusplus/glim/config/config_ros.json`](GLIM_plusplus/glim/config/config_ros.json)
+> 中设置 `dual_antenna_enabled`、基线和航向不确定度，最后在权威 GNSS
+> 配置中把 `enable_orientation_prior` 改为 `true`。航向因子只消费
+> adapter 的 RTK Fixed 样本，并按配置的 yaw sigma 上限拒绝劣化航向。
 >
 > ### 🛡 航向先验配置错误的三层防御
 >
 > 航向先验是双天线下最有用的功能，但也是三处配置（物理安装、本仓库的配置文件、Atlas 固件）若有一处错配时最隐蔽的失败点。GLIM++ 设置了三道独立的检查：
 >
 > 1. **Atlas 固件前置条件（文档约定）。** Atlas Duo 内部的 `gnss_lever_arm_secondary` 与双天线航向模式必须在 Atlas Web UI 中按物理安装方式正确配置。这一项无法由本仓库的代码自动验证 —— 只能在 Atlas 调试期间手动确认。具体参数对应关系见上文的 GNSS 杆臂补偿说明。
-> 2. **启动期一致性检查（自动）。** `hitch_sensor_dome.launch.py` 启动时同时读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 和 [`GLIM_plusplus/glim_ext/config/config_gnss_global.json`](GLIM_plusplus/glim_ext/config/config_gnss_global.json)，若 TF YAML 中的天线数与 `enable_orientation_prior` 的取值不一致，打印粗体黄色警告。该检查只能发现本仓库自己的配置文件错配。
+> 2. **启动期一致性检查（自动）。** `hitch_sensor_dome.launch.py` 同时读取 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 和 [`GLIM_plusplus/glim/config/config_gnss_global.json`](GLIM_plusplus/glim/config/config_gnss_global.json)，若物理双天线意图与 `enable_orientation_prior` 不一致则告警。该助手只做诊断，不会改写 JSON，也不会启动 GLIM 建图进程。
 > 3. **运行期 yaw σ 合理性检查（自动）。** GLIM++ 启动后，C++ wrapper 会读取每条 `/odom` 消息中 Atlas 自己上报的 yaw σ（pose 协方差中的对应项），与我们根据双天线基线长度估计出的预期 σ 做对比。前约 20 条样本采集完毕后，若 Atlas 持续上报远宽于预期的 σ，打印粗体黄色一次性警告，说明 Atlas 固件很可能**没有**真正进入双天线航向模式（即便本仓库的配置说它在）。该检查要求 `ins_odom_topic` 已经接入（Odometry 携带协方差，PoseStamped 不携带）。检查通过时会输出一行 info 级别的确认日志，确认双天线航向已生效。
 
 ```bash
 # (一次性) 从 sensor_dome_tf.yaml 生成 sensor_dome.urdf
 cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 
-# 对接采集栈做实时建图：
-#   1. 把车停在天空开阔的位置等 Atlas Duo RTK-fixed 锁定。
-#   2. 启动：
+# 启动 TF、配置一致性检查与可视化支持节点（不启动建图）：
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
-# 或对已采集的 MCAP 包做离线建图（bag 中必须包含 adapter 的
+# 生产建图使用已采集的 MCAP 包（bag 中必须包含 adapter 的
 # /gps_p1/filtered_odom_rtk_fixed 与 /gps_p1/fix）：
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
@@ -259,14 +253,19 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 
 针对在线 scan-to-map 定位（对预建 PCD 地图），本项目搭载 **GICP++**，一个对 **DLIO**（*Direct LiDAR-Inertial Odometry*，UCLA VECTR Lab 的 Kenny J. Chen / Ryan Nemiroff / Brett T. Lopez，上游 <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>）做了深度修改的 fork。本 fork 位于 [`GICP_plusplus/`](GICP_plusplus/)（双加号意在提示这并非原版 DLIO）。GICP++ 在启动时可选 **两种运行模式**：
 
-- **🏁 赛车模式（默认）** —— 只用前置 Robin W、40 m 裁剪、32 次 GICP 迭代、yaw-rate 自适应 Kp/Kq 衰减、所有 debug topic 关闭。目标是预建赛道地图上为 200 Hz 控制环提供 ~3–5 ms IMU 到位姿延迟。
-- **🛡 安全模式** —— 三台 Robin W 全部拼接、100 m 裁剪、上游严格的 128 次 GICP 迭代、更紧的收敛阈值、所有 debug topic 开启。目标是 CPU 富余、延迟非瓶颈时获得最大传感器覆盖与诊断可见性。
+- **🏁 赛车模式（默认）** —— 40 m 裁剪、32 次 GICP 迭代、yaw-rate 自适应 Kp/Kq 衰减和较少日志。
+- **🛡 安全模式** —— 100 m 裁剪、上游严格的 128 次 GICP 迭代、更紧的收敛阈值和完整诊断。
+
+LiDAR 拓扑与调参模式独立。`lidar_mode:=front_only` 是所有 profile
+的启动默认值；`mode:=safe` 本身不会开启后置 LiDAR。需要完整穹顶输入时显式使用
+`lidar_mode:=three_lidar`。`lidar_mode:=auto` 是显式选择的 profile
+跟随模式：safe 解析为三台，race/custom 解析为前置一台。
 
 相对上游 VECTR DLIO 的项目改进：
 
 1. **针对 Robin W + Atlas Duo** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶（低延迟实时 IMU `/imu/data`、adapter 的 RTK-fixed-only `/gps_p1/filtered_odom_rtk_fixed`、`/robin_w_*/points`；frame 来自 `config/sensor_dome_tf.yaml` 的 `base_link`/`imu_link`/`lidar_front_link`）。
 2. **固定解门控与失效回退** —— 生产路径直接使用 adapter 按 FusionEngine `solution_type == RTK_FIXED` 发布的固定解里程计。协方差必须为有限、正值且不超过阈值；RTK float、过期/未知质量或无解时不允许初始化或恢复跳变，而是继续使用 LiDAR + IMU。`nav_sat_gated_odom` 仅用于旧 bag 的 REP-145 兼容路径，因为 `STATUS_GBAS_FIX` 本身无法可靠区分 float 与 fixed。
-3. **双模式设计** —— `cfg/localization.yaml`（race 基线）+ `cfg/localization_safe.yaml`（覆盖）通过 launch 文件的 `mode:=race|safe|custom` 参数分层，配套两个互斥的 systemd 单元用于生产部署。
+3. **调参模式与 LiDAR 模式独立** —— `mode:=race|safe|custom` 选择参数 profile，`lidar_mode:=front_only|three_lidar|auto` 选择传感器。启动默认前置一台；两个互斥 systemd 单元分别显式固定 race/front 与 safe/three-lidar。
 4. **GLIM++ ENU 地图桥接** —— 规范导出器 `GLIM_plusplus/scripts/export_glim_dump_to_pcd.py` 精确读取 compact 点格式，依次应用 `T_world_origin` 与 `inverse(T_world_utm)`，输出 surveyed local-ENU PCD 及 `<map>.manifest.yaml`。GICP++ 默认要求 manifest，并在处理点云前把其 datum 与 adapter 的 transient-local `/gps_p1/local_enu_origin` 比对；旧脚本仅保留为该导出器的兼容包装。
 5. **GICP 预热** —— 启动时即急切构建 kd-tree + 一次 dummy align，把 OpenMP 线程池启动、Eigen JIT、source 端 kd-tree 分配等首次接触开销在第一次真实扫描之前烧掉。
 6. **Yaw-rate 自适应观测器** —— 几何观测器中的 `Kp` 与 `Kq` 在车体系 yaw rate 较高时自动衰减，让 IMU 预测在转弯入弯（此时 GICP 最易滑动）瞬间占主导。

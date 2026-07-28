@@ -404,7 +404,8 @@ chmod +x 4_setup_lidar_ptp.sh
 - 校验第 3 节的 PTP grandmaster 正在运行。
 - ping 每台 LiDAR 的配置后 IP。
 - 通过 `innovusion_lidar_util` 在每台 Robin W 上启用标准 IEEE 1588 PTP（不是 automotive gPTP）。
-- 克隆并构建 Seyond ROS 2 驱动（在 `seyond_ros_driver/` 内运行 `./build.bash`，因为从工作区根目录的 `colcon build` 在 Seyond 上不起作用）。
+- 克隆 Seyond ROS 2 驱动并固定到已审查的 commit；清除旧安装中的仓库级相对时间覆盖，并在构建时核验 PointCloud2 使用 `timestamp/FLOAT64` 数值 Unix 秒（包起始绝对时间加点内偏移）。
+- 在 `seyond_ros_driver/` 内运行 `./build.bash` 构建，因为从工作区根目录的 `colcon build` 在 Seyond 上不起作用。
 - 对每台 LiDAR 自检 PTP slave 同步状态。
 
 配置完成后预期精度：
@@ -446,186 +447,48 @@ chmod +x 5_setup_camera_ptp.sh
 
 ## 第 6 节：数据采集
 
-### 6.1 采集架构
+仓库支持的录制器是
+[`../recording/sensor_recorder.py`](../recording/sensor_recorder.py)。它启动已配置的
+ROS 2 传感器驱动，检查 chrony/PTP 与 RTK 门控，录制 MCAP rosbag，并启动
+Foxglove bridge。录制器本身无需 root；只有可选的 `pmc` 管理查询使用
+`sudo -n`。
 
-本系统采用 **零 ROS 采集方案** 以追求最大性能：
-
-| 传感器 | 采集方式 | 格式 | CPU 负载 |
-|--------|---------|------|---------|
-| Seyond Robin W LiDAR | `tcpdump`（内核级） | .pcap | 每台 ~1% |
-| Point One Nav Atlas Duo | `p1_runner`（原生二进制） | .p1log | ~1% |
-| RouteCAM 摄像头 | Aravis / `tcpdump` | .pcap 或原始帧 | 每台 ~2–5% |
-
-相比 rosbag 录制（约 30–50% CPU），跳过了点云解码、ROS 序列化、DDS 中间件等开销。数据在回放时再解码。
-
-### 6.2 配置 Atlas Duo 报文速率
+生产 GLIM++ 数据包必须另行启动 Atlas adapter，并且只提供一个部署原点。
+录制器不会代替你启动 adapter：
 
 ```bash
-cd ~/p1-host-tools
+# 终端 1：标准化 Atlas 流和权威 Fixed-only 里程计。
+ros2 launch adapter adapter.launch.py \
+  use_p1_imu_pcap:=false \
+  local_enu_origin:="<lat_deg>,<lon_deg>,<alt_m>"
 
-python3 bin/config_tool.py apply uart2_message_rate fe ROSPoseMessage 100ms
-python3 bin/config_tool.py apply uart2_message_rate fe ROSGPSFixMessage 100ms
-python3 bin/config_tool.py apply uart2_message_rate fe ROSIMUMessage on
-python3 bin/config_tool.py save
+# 终端 2：检测传感器、验证同步/RTK 并录制。
+cd /path/to/Hitch_Sensor_Dome
+python3 recording/sensor_recorder.py
 ```
 
-### 6.3 用快速录制脚本采集
-
-```bash
-# 单台 LiDAR
-sudo python3 sensor_recorder_fast.py
-
-# 3 台 LiDAR
-sudo python3 sensor_recorder_fast.py --num-lidars 3 \
-    --lidar1-ip 192.168.1.10 \
-    --lidar2-ip 192.168.1.11 \
-    --lidar3-ip 192.168.1.12
-
-# 使用 YAML 配置
-sudo python3 sensor_recorder_fast.py --config sensor_config.yaml
-```
-
-交互命令：`R` 开始录制、`S` 停止、`H` 健康检查、`Q` 退出。
-
-### 6.4 会话输出结构
-
-```
-~/recordings/session_20260311_143022/
-├── lidar_pcap/
-│   ├── robin_w_front.pcap       # 原始网络抓包（内核级）
-│   ├── robin_w_rear_left.pcap   # 所有时间戳均经 PTP 同步
-│   └── robin_w_rear_right.pcap
-├── camera_pcap/
-│   ├── cam_front_left.pcap      # GigE Vision 原始包（带 PTP 时间戳）
-│   ├── cam_front_right.pcap
-│   ├── cam_rear_left.pcap
-│   └── cam_rear_right.pcap
-├── p1nav/
-│   └── *.p1log                  # FusionEngine 二进制 (GNSS + IMU + 姿态)
-├── session_metadata.json
-└── session_stats.json
-```
-
-所有传感器都已 PTP 同步，时间戳共享 GPS 时间基准，后处理无需额外时钟修正即可对齐。
-
-### 6.5 YAML 配置参考
-
-```yaml
-point_one_nav:
-  connection_type: "tcp"
-  tcp_ip: "192.168.1.30"
-  tcp_port: 30201
-
-lidars:
-  - name: "robin_w_front"
-    ip: "192.168.1.10"
-    port: 8337
-  - name: "robin_w_rear_left"
-    ip: "192.168.1.11"
-    port: 8338
-  - name: "robin_w_rear_right"
-    ip: "192.168.1.12"
-    port: 8339
-
-recording:
-  output_dir: "~/recordings"
-  interface: "eth0"
-```
-
-### 6.6 备选：ROS 2 原生录制
-
-如果你更习惯 rosbag（CPU 占用更高但回放更简单）：
-
-```bash
-# 终端 1 —— Point One Nav（TCP 上的 FusionEngine）
-ros2 run fusion_engine_driver fusion_engine_ros_driver --ros-args \
-    -p connection_type:=tcp \
-    -p tcp_ip:=192.168.1.30 \
-    -p tcp_port:=30201
-
-# 终端 2 —— Seyond Robin W
-ros2 launch seyond start.py
-
-# 终端 3 —— 录制
-ros2 bag record -a -o my_dataset
-```
-
-确保所有节点的 `use_sim_time` 为 `false`。`use_sim_time=false` 时 ROS 2 消息头使用 `CLOCK_REALTIME`，该时钟通过 PTP 链路由 GPS 规范。
-
-```bash
-# 验证时间戳合理（不是 0）
-ros2 topic echo /robin_w_front/points --field header.stamp --once
-```
+输出位于 `recording/data/session_<timestamp>/rosbag2/*.mcap`，同时包含日志和
+`session_metadata.json`。发布端可用时，包内包括三路 Robin W 点云、相机、
+`/imu/data`、`/gps_p1/fix`、`/gps_p1/filtered_odom_rtk_fixed`、TF 和诊断。
+完整运行与配置说明见 [`../recording/README.md`](../recording/README.md) 和
+[`../recording/sensor_config.yaml`](../recording/sensor_config.yaml)。
 
 ---
 
 ## 第 7 节：回放与可视化
 
-### 7.1 回放 Point One Nav 数据 (.p1log)
+可以在 Foxglove Studio 中直接打开 MCAP，并导入
+`recording/foxglove/sensor_dome_layout.json`；也可回放到 ROS 2：
 
 ```bash
-SESSION=~/recordings/session_20260311_143022
+cd /path/to/Hitch_Sensor_Dome
+ros2 bag play recording/data/session_<timestamp>/rosbag2
 
-# 交互式轨迹 + IMU + GNSS 图
-p1_display $SESSION/p1nav/
-
-# 终端解码消息
-p1_print $SESSION/p1nav/*.p1log
-
-# 导出 CSV / KML
-p1_extract $SESSION/p1nav/
-p1_extract --kml $SESSION/p1nav/
-```
-
-### 7.2 把 Seyond Robin W PCAP 回放为 ROS 2
-
-```bash
-ros2 launch seyond start.py \
-    pcap_file:=$SESSION/lidar_pcap/robin_w_front.pcap \
-    lidar_name:=robin_w_front \
-    frame_id:=robin_w_front \
-    frame_topic:=/robin_w_front/points
-```
-
-### 7.3 在 RViz2 / Foxglove Studio 中可视化
-
-```bash
-# RViz2
+# 另一个终端：
 rviz2
-# Add → By topic → PointCloud2。设置 Fixed Frame、Point Size ~0.02。
-
-# Foxglove Studio
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-foxglove-studio
-# 连接到 ws://localhost:8765
 ```
 
-### 7.4 检视原始 PCAP
-
-```bash
-tshark -r $SESSION/lidar_pcap/robin_w_front.pcap -q -z io,stat,1
-wireshark $SESSION/lidar_pcap/robin_w_front.pcap
-```
-
-### 7.5 把回放数据转为 rosbag
-
-```bash
-ros2 bag record -o $SESSION/replayed_rosbag \
-    /robin_w_front/points /robin_w_left/points /robin_w_right/points \
-    /tf /tf_static
-```
-
-### 7.6 工具一览
-
-| 工具 | 用途 | 输入 |
-|------|------|------|
-| `p1_display` | 交互式轨迹 / IMU / GNSS 图 | .p1log |
-| `p1_extract` | 导出 CSV / KML | .p1log |
-| `p1_print` | 终端解码消息 | .p1log |
-| `rviz2` | 3D 点云可视化 | ROS 2 主题 |
-| `foxglove-studio` | 多面板传感器面板 | ROS 2 主题 |
-| `tshark` / `wireshark` | 原始包检视 | .pcap |
-| `arv-viewer-0.8` | 实时 GigE Vision 摄像头查看 | 摄像头流 |
+除非整个回放图都明确配置为使用 `/clock`，否则保持 `use_sim_time=false`。
 
 ---
 
