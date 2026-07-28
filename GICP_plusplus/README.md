@@ -1,8 +1,13 @@
 # GICP++ — A heavily modified fork of DLIO for Hitch Sensor Dome
 
-> **This is not stock DLIO.** The folder name `GICP_plusplus/` is intentional: this version diverges from upstream [`vectr-ucla/direct_lidar_inertial_odometry`](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) in ways that change algorithmic behavior — not just configuration. If you came here looking for the original DLIO, that lives at the link above and we strongly recommend starting there if you do not have the [Hitch Sensor Dome](../README.md) hardware. All algorithmic and implementation credit for DLIO + nano_gicp belongs to **Kenny J. Chen, Ryan Nemiroff, and Brett T. Lopez (UCLA's Verifiable & Control-Theoretic Robotics Lab)**. See [Credits](#credits-and-license).
+> **This is not stock DLIO.** The folder name `GICP_plusplus/` is intentional: this version diverges from upstream [`vectr-ucla/direct_lidar_inertial_odometry`](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) in ways that change algorithmic behavior, not just configuration. The DLIO foundation is credited to **Kenny J. Chen, Ryan Nemiroff, and Brett T. Lopez (UCLA VECTR Lab)**. Registration now uses Kenji Koide's [`small_gicp`](https://github.com/koide3/small_gicp), migrated through the reviewed `augcog/DLIO_plusplus` implementation. See [Credits](#credits-and-license).
 
 This document is a **complete change log** between GICP++ and upstream `vectr-ucla/direct_lidar_inertial_odometry`. It is organized so an adopter can decide, mechanism by mechanism, which changes apply to their use case and which would need to be reverted.
+
+The supported ROS 2 targets are **Humble on Ubuntu 22.04** and **Jazzy on
+Ubuntu 24.04**. Humble compatibility is a hard requirement for the official
+Seyond deployment path; GICP++ and the adapter therefore stay on the common
+Humble/Jazzy C++17 and `rclcpp` API surface.
 
 ## Index of changes
 
@@ -10,7 +15,7 @@ This document is a **complete change log** between GICP++ and upstream `vectr-uc
 2. [Two-mode operation — race vs. safe](#2-two-mode-operation)
 3. [RTK-gated INS odometry republisher (`nav_sat_gated_odom`)](#3-rtk-gated-ins-odometry-republisher)
 4. [GLIM++ map bridge (`merge_glim_submaps.py`)](#4-glim-map-bridge)
-5. [GICP warm-start at init](#5-gicp-warm-start)
+5. [small_gicp backend and warm-start](#5-small_gicp-backend-and-warm-start)
 6. [Yaw-rate-adaptive observer gains](#6-yaw-rate-adaptive-observer)
 7. [Motion-variance gate on stationary IMU calibration](#7-motion-variance-gate)
 8. [Operator-side health checks](#8-operator-side-health-checks)
@@ -30,15 +35,16 @@ Topic, frame, and URDF defaults throughout the configs target the Hitch Sensor D
 |---------|---------------------------|
 | Primary LiDAR topic | `/robin_w_front/points` |
 | Aux LiDAR topics | `/robin_w_rear_left/points`, `/robin_w_rear_right/points` |
-| IMU topic | `/imu/data` (fusion_engine_driver, Atlas Duo) |
-| GT odom topic | `/odom_rtk_only` (via §3 republisher) |
+| IMU topic | `/imu/data` live default; `/gps_p1/imu` supported for normalized replay |
+| GT odom topic | `/gps_p1/filtered_odom_rtk_fixed` (adapter fixed-only output) |
+| ENU datum metadata | `/gps_p1/local_enu_origin` (`std_msgs/String`, transient-local) |
 | `base_frame` | `base_link` (see §9) |
 | `imu_frame` | `imu_link` (Atlas Duo CoN) |
 | `lidar_frame` | `lidar_front_link` |
 | Aux LiDAR frames | `lidar_rear_left_link`, `lidar_rear_right_link` |
 | URDF auto-discovery | walks up for `GLIM_plusplus/config/sensor_dome.urdf` |
 | `sensor_type` | `seyond` (`timestamp/FLOAT64`, numeric Unix seconds) |
-| Absolute timestamp handling | Robin W uses numeric absolute seconds; the separate `luminar` path retains raw uint64 epoch-ns support |
+| Absolute timestamp handling | Robin W uses numeric `FLOAT64` Unix seconds, a 10 us point-time quantum, and a 100 ms frame contract |
 
 Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py), [`include/dlio/dlio.h`](include/dlio/dlio.h), [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h), [`src/localization.cc`](src/localization.cc).
 
@@ -76,47 +82,83 @@ Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`cfg/localizat
 
 ## 3. RTK-gated INS odometry republisher
 
-Upstream DLIO assumes that whatever lands on the `gt_odom` topic is trustworthy — it consumes the message immediately for the bootstrap path and the GT-snap recovery path. That assumption holds when the upstream INS / RTK voter embeds quality gating; on the Hitch dome the Atlas Duo publishes `/odom` continuously regardless of `/gps/fix` status, so the assumption breaks.
+Production uses the adapter's `/gps_p1/filtered_odom_rtk_fixed` output. It is
+published only when FusionEngine reports `solution_type == RTK_FIXED` and all
+position variances are finite, positive, and within the configured bounds.
+Initial pose, RTK calibration, diagnostics, and recovery apply the same
+fail-closed covariance gate. RTK float or no-fix therefore falls back to
+LiDAR+IMU state estimation.
 
-GICP++ adds a small C++ executable, `nav_sat_gated_odom` ([`src/nav_sat_gated_odom.cc`](src/nav_sat_gated_odom.cc)), that subscribes to `/odom` + `/gps/fix` and republishes on `/odom_rtk_only` only when **all four gates pass**:
-
-1. A NavSatFix has been received at least once.
-2. The fix is fresh (`now − fix.stamp ≤ max_fix_age_s`, default 0.5 s).
-3. `status.status >= STATUS_GBAS_FIX` when `require_rtk_fixed=true`.
-4. Position σ from `position_covariance` diag is ≤ `max_position_stddev` (default 0.10 m — matches GLIM++'s factor-bridge default).
-
-A 10 s periodic log reports `published=N rejected=M (no_fix=… stale=… status=… cov=…) last_reject="…"`. The localizer's `gt_odom_topic` defaults to `/odom_rtk_only` so the gate is transparent to the localization code — it still treats arrival as RTK-fixed, but now that's actually true.
-
-The launch file auto-spawns `nav_sat_gated_odom` alongside the localizer via `run_rtk_gate:=true` (default). Disable with `run_rtk_gate:=false` if your bag already contains a pre-gated odometry topic.
+`nav_sat_gated_odom` remains as an optional compatibility bridge for legacy
+bags. It requires a fresh, non-future NavSatFix, non-UNKNOWN finite positive
+covariance, an RTK-class status, and the configured sigma limit. It never
+reuses a stale fix. Because REP-145 `STATUS_GBAS_FIX` does not distinguish
+RTK float from RTK fixed, this bridge is not the production discriminator.
+The launch default is `run_rtk_gate:=false`.
 
 Files added: [`src/nav_sat_gated_odom.cc`](src/nav_sat_gated_odom.cc).  
 Files touched: [`CMakeLists.txt`](CMakeLists.txt), [`launch/localization_with_tf.launch.py`](launch/localization_with_tf.launch.py).
 
 ## 4. GLIM++ map bridge
 
-Upstream DLIO loads a single PCD via `localization/map_path`. GLIM++ dumps **per-submap** subdirectories (`<dump_path>/NNNNNN/`), each containing the submap's local point cloud + `T_world_origin` metadata. The upstream workflow assumes the operator manually merges them via `ros2 run glim_ros offline_viewer` (GUI), exports a PLY, and converts with `convert_ply_to_pcd.py` — a three-step process with a GUI in the middle.
+Use [`../GLIM_plusplus/scripts/export_glim_dump_to_pcd.py`](../GLIM_plusplus/scripts/export_glim_dump_to_pcd.py).
+It reads the exact `float32 × 3` compact format, applies
+`T_world_origin`, then `inverse(T_world_utm)`, and writes the PCD in the same
+surveyed local-ENU frame as the adapter. It also writes
+`<map>.manifest.yaml` with the datum and transform provenance.
 
-GICP++ adds [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py) (~360 lines of Python with numpy + open3d) to close that gap. It:
+GICP++ requires that manifest by default and compares its datum with
+the adapter's transient-local `/gps_p1/local_enu_origin` metadata within
+`localization/enu_origin_tolerance_m`. Point clouds, initial poses, and GT
+odometry are ignored until this live check passes. For legacy offline bags
+without metadata, set `require_live_enu_origin=false` and provide
+`expected_enu_origin` explicitly. Leave
+`localization/utm_transform_path` empty: the ENU transform has already been
+applied. [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py) is
+now only a compatibility wrapper around this canonical exporter.
 
-1. Walks `<dump_dir>/NNNNNN/` submap directories in numeric order.
-2. Reads `data.txt` and pulls out `T_world_origin` (Eigen-formatted 4×4 double).
-3. Reads `points_compact.bin` with **auto-detected layout** — tries 32-byte `Vector4d`, 16-byte `Vector4f`, 24-byte `Vector3d`, 12-byte `Vector3f`, picks the one whose size divides cleanly into the file AND whose decoded points pass sanity checks.
-4. Applies `T_world_origin` to bring each submap into the map frame, then concatenates.
-5. Applies race-mode filters in order (each optional via CLI flag):
-    - **Z-clip** (`--z-min` / `--z-max`) — drop sky reflections + below-ground returns.
-    - **Centerline corridor** (`--track-csv` / `--mask-width`) — for race tracks, keeps only points within N m of the racing line. Uses `scipy.cKDTree` if installed; brute-force fallback otherwise.
-    - **Statistical outlier removal** (`--outlier-k` / `--outlier-std`) — kills dust / rain phantoms.
-    - **Voxel downsample** (`--voxel-res`) — uniform spatial density.
-6. Writes binary PCD by default.
-7. With `--copy-utm`, also mirrors `T_world_utm.txt` next to the output for easy `localization/utm_transform_path` pickup.
+## 5. small_gicp backend and warm-start
 
-The legacy [`scripts/convert_ply_to_pcd.py`](scripts/convert_ply_to_pcd.py) is still shipped for operators who prefer the offline_viewer route or whose `gtsam_points` build uses an unsupported binary layout.
+The old nanoGICP/nanoflann implementation has been replaced by the vendored,
+header-only `small_gicp` backend. The adapter preserves the localizer's matcher
+call surface while using small_gicp's parallel kd-tree, covariance estimation,
+GICP factors, and OpenMP reduction. It also preserves the Hitch safety
+contract: non-finite results fail closed, the reported Hessian is re-linearized
+at the final pose, and a degeneracy-projected pose is rescored before use.
 
-Files added: [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py).
+Large-map handling adopts the device-neutral part of
+[`augcog/DLIO_plusplus#14`](https://github.com/augcog/DLIO_plusplus/pull/14):
+the complete GLIM map is voxelized and assigned covariances once at startup,
+then each registration uses a bounded XY target around the predicted pose.
+Local targets copy each point together with its cached full-map covariance and
+build only their KD-tree. An asynchronous rebuild starts before the active
+target loses scan coverage; if it is late, the scan thread rebuilds
+synchronously and continues LiDAR+IMU localization. It does not authorize a
+GNSS reset. Snap-back still requires the repository's fresh RTK-fixed stream
+and fail-closed covariance gate.
 
-## 5. GICP warm-start
+The PR's wrong-lock check is retained only as
+`localization/gt_recovery/sanity_radius`: a fresh, time-matched RTK-fixed pose
+may reject and immediately recover a GICP candidate outside that radius.
+RTK-float, stale, unknown-covariance, and absent fixes cannot operate this gate.
+The lookup uses the median point time represented by `T_prior`, rather than the
+Robin W frame-start header stamp.
 
-Upstream nano_gicp builds the target kd-tree at `setInputTarget()` and computes per-target covariances at `calculateTargetCovariances()` — both at constructor time. By the time the first scan arrives, the target side is ready. But the **first real `gicp.align()`** still pays ~5–20 ms of first-touch overhead: OpenMP thread-pool spin-up, Eigen kernel JIT warm-up, source-side kd-tree allocation, page-faults through the just-loaded map.
+The shipped controls are `localization/local_map/enabled`, `radius`,
+`min_points`, and `build_threads`. Disabling `enabled` restores full-map
+registration. The local radius must exceed `sqrt(2) * cropBoxFilter/size +
+maxCorrespondenceDistance`, which is validated at startup.
+
+The **first real `gicp.align()`** would still pay first-touch overhead for
+OpenMP, Eigen, source-tree allocation, and map pages.
+
+The adapter exposes upstream's optional ground-vehicle LM constraints through
+`gicp/dof/*` and `gicp/prior/*`. The shipped mode remains `6dof`, with prior
+information disabled, to preserve the validated nanoGICP-era behavior during
+the backend migration. Enable `4dof` or nonzero prior information only after a
+Robin W replay has established new fitness, Hessian, and correction baselines:
+small_gicp fitness is mean GICP residual energy, not nanoGICP's mean Euclidean
+nearest-neighbor squared distance.
 
 GICP++ runs **one dummy align** at init against ~200 randomly-sampled map points to burn those costs at startup instead of on the first localization scan:
 
@@ -134,7 +176,10 @@ this->gicp.align(aligned_scratch, Eigen::Matrix4f::Identity());
 
 Logs the wall time at INFO so operators see it land cleanly before the first scan arrives. Free to run; no configuration knob.
 
-Files touched: [`src/localization.cc`](src/localization.cc) (lines ~389–421).
+Files touched: [`include/gicp_plusplus/small_gicp_backend.hpp`](include/gicp_plusplus/small_gicp_backend.hpp),
+[`include/gicp_localization/localization.h`](include/gicp_localization/localization.h),
+[`src/localization.cc`](src/localization.cc), and
+[`cfg/localization.yaml`](cfg/localization.yaml).
 
 ## 6. Yaw-rate-adaptive observer
 
@@ -184,12 +229,13 @@ Two new bold-yellow one-shot warnings to surface common operator-side misconfigu
 
 **(a) `gt_odom` never arrived.** At 10 s after node start, if `gt_recovery/enable=true` AND `gt_odom/enable=true` AND zero messages have arrived on the `gt_odom` topic, the timer fires once with a diagnostic:
 
-- **Zero publishers**: `nav_sat_gated_odom` isn't running OR `gt_odom_topic` arg points at the wrong topic.
-- **Publishers exist, no messages**: `/gps/fix` has never reached STATUS_GBAS_FIX since startup (RTK convergence, NTRIP outage, blocked sky view).
+- **Zero publishers**: the adapter is not running or `gt_odom_topic` is wrong.
+- **Publishers exist, no messages**: the adapter has not observed a genuine RTK_FIXED solution.
 
 Healthy state prints a single confirmation INFO line.
 
-**(b) IMU never arrived.** The upstream-inherited check suggests `/imu/data` (the Atlas Duo default) in its typo example.
+**(b) IMU never arrived.** The check reports the adapter default
+`/gps_p1/imu` and the resolved publisher count.
 
 Files touched: [`src/localization.cc`](src/localization.cc) (gt_odom timer at ~line 490; IMU topic warn around line 450).
 
@@ -224,19 +270,16 @@ Files touched: [`cfg/localization.yaml`](cfg/localization.yaml), [`../recording/
 
 ## 11. What was removed from upstream
 
-A small set of upstream additions that don't apply on the Hitch dome were removed to keep the code base tight:
+A small set of upstream additions that do not apply on the Hitch dome were
+removed to keep the code base tight:
 
-- **`SensorType::LUMINAR`** enum value and its per-sensor branches were
-  removed in the original retarget — and then RESTORED by the 2026-07 P1–P5
-  improvements (§14), whose deskew/merge code paths reference them. The enum
-  is now `{ OUSTER, VELODYNE, SEYOND, HESAI, LIVOX, LUMINAR, UNKNOWN }` and
-  `sensor_type: "luminar"` parses (uint64 epoch-ns per-point timestamps);
-  the value is unused on the dome (Robin W uses numeric FLOAT64 seconds via
-  the explicit `seyond` branch).
-- **`is_luminar_` dead member** in `localization.h` (declared but never used) — still removed.
-- **`luminar_uint64` parameter** on `shiftCloudTimestamps` — removed in the
-  retarget, re-introduced with §14 (it selects the absolute-epoch no-shift
-  path).
+- **nanoGICP and its standalone nanoflann adapter.** Registration is provided
+  by the reviewed, vendored small_gicp backend described in section 5.
+- Unsupported vendor-specific naming from the deployed path. Generic
+  compatibility decoders remain for the documented Ouster, Velodyne, Hesai,
+  and Livox layouts, while the Robin W path accepts only
+  `timestamp/FLOAT64/count=1` numeric Unix seconds and validates every raw
+  cloud against the configured frame-period contract.
 - **Earlier-deployment comment strings and topic name hints** throughout the code (`/gps_na/imu`, `novatel_a`, `gps_bottom`, `imu_bottom`, etc.).
 - **VECTR copyright headers** are RETAINED on files that originated there — that's legal attribution, not project text.
 
@@ -244,12 +287,13 @@ A small set of upstream additions that don't apply on the Hitch dome were remove
 
 Important — so adopters can rely on the existing DLIO body of work and literature:
 
-- The nano_gicp algorithm itself (kd-tree, correspondence search, Levenberg-Marquardt) — unchanged.
+- ROS topic names, ENU map/datum checks, RTK-fixed recovery, and the
+  three-Robin merge/deskew interfaces are unchanged by the small_gicp
+  migration.
 - The geometric observer math (`updateState`, `propagateState`, error formulation) — unchanged structurally; only Kp/Kq scale at the application step has been added.
 - The IMU integration (gravity compensation, bias estimation, deskewing) — unchanged.
 - The Init-Phase state machine (`WAITING` / `RTK_CALIBRATING` / `STATIONARY_CALIBRATING` / `DONE`) — unchanged structurally; only the motion-variance gate was added inside `STATIONARY_CALIBRATING`.
-- nanoflann + nano_gicp vendored code — unchanged.
-- License texts — every upstream LICENSE / NOTICE preserved verbatim.
+- The vendored small_gicp license and source notices are preserved verbatim.
 - Per-scan publisher schema and topic names — unchanged.
 
 ## 13. File-by-file diff summary
@@ -262,16 +306,18 @@ Important — so adopters can rely on the existing DLIO body of work and literat
 | [`launch/gicp_localization-race.service`](launch/gicp_localization-race.service) | NEW | systemd unit, SCHED_FIFO + CPU affinity, `Conflicts=safe` |
 | [`launch/gicp_localization-safe.service`](launch/gicp_localization-safe.service) | NEW | systemd unit, default scheduling, `Conflicts=race` |
 | [`src/nav_sat_gated_odom.cc`](src/nav_sat_gated_odom.cc) | NEW | RTK-gated INS odometry republisher (§3) |
-| [`src/localization.cc`](src/localization.cc) | MODIFIED | Sensor scrub + warm-start + yaw-rate attenuation + motion gate + gt_odom health + §14 P1–P5 improvements (incl. LUMINAR branches) |
-| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum: explicit `SEYOND` absolute-seconds path; LUMINAR retained for §14 |
+| [`src/localization.cc`](src/localization.cc) | MODIFIED | Seyond timestamp validation and endpoint matching + warm-start + yaw-rate attenuation + motion gate + gt_odom health + §14 P1–P5 improvements |
+| [`include/dlio/dlio.h`](include/dlio/dlio.h) | MODIFIED | SensorType enum with explicit `SEYOND` absolute-seconds path |
 | [`include/gicp_localization/localization.h`](include/gicp_localization/localization.h) | MODIFIED | New member fields for yaw-rate attenuation + motion gate + gt_odom timer |
+| [`include/gicp_plusplus/small_gicp_backend.hpp`](include/gicp_plusplus/small_gicp_backend.hpp) | NEW | Reviewed small_gicp adapter, final-pose scoring/Hessian, and fail-closed result handling |
+| [`thirdparty/small_gicp`](thirdparty/small_gicp) | NEW | Vendored header-only small_gicp implementation and MIT license |
 | [`scripts/merge_glim_submaps.py`](scripts/merge_glim_submaps.py) | NEW | GLIM++ submap → single PCD bridge (§4) |
 | [`scripts/convert_ply_to_pcd.py`](scripts/convert_ply_to_pcd.py) | UNCHANGED | Legacy single-file PLY→PCD; still shipped for fallback |
 | [`scripts/visualize_lidar_topic.py`](scripts/visualize_lidar_topic.py) | MODIFIED | Defaults retargeted to Robin W |
 | [`scripts/live_gps_localization.py`](scripts/live_gps_localization.py) | MODIFIED | Defaults retargeted to Atlas Duo |
 | `scripts/debug_pose_inspector.py`, `scripts/plot_*.py`, `scripts/profile_*.py` | UNCHANGED | Generic diagnostic / plotting; not vehicle-specific |
-| `include/nano_gicp/*`, `src/nano_gicp/*` | UNCHANGED | Vendored nano_gicp / nanoflann |
-| [`CMakeLists.txt`](CMakeLists.txt) | MODIFIED | Add `nav_sat_gated_odom` executable + install rule |
+| `include/nano_gicp/*`, `src/nano_gicp/*` | REMOVED | Replaced by small_gicp |
+| [`CMakeLists.txt`](CMakeLists.txt) | MODIFIED | Header-only small_gicp target, localizer, compatibility bridge, and tests |
 | [`package.xml`](package.xml) | MODIFIED | Adds `libxml2` (URDF parsing for offline extrinsics); package name stays `gicp_localization` for ROS / colcon compatibility |
 | [`README.md`](README.md) | REWRITTEN | This file |
 
@@ -311,22 +357,44 @@ against the locked pre-fix baseline.
   `degen_*`, `yaw_veto`, `merged_aux_count`, `aux<i>_merge_dt_s`,
   `aux<i>_points`, `scan_time_span_s`), the same fields in `SCAN DEBUG`,
   per-aux clock-offset stats (warns at |mean| > 20 ms), concat buffer 200,
+  rejected-candidate endpoint-delta statistics for tuning the sweep gate,
   and the **turnkey scorecard** `scripts/analyze_scan_debug_log.py`
   (acceptance/streaks, gicp_ms percentiles, fitness floor + suggested ratio
   thresholds, gt_err yaw-rate buckets, concat coverage).
 - **URDF-first extrinsics** (`urdf_transforms.hpp`, libxml2 dep) and the
-  single-IMU allowlist guard (Hitch default `/imu/data`; frame-match check
-  left OFF until the Atlas Duo driver's `header.frame_id` is verified).
+  single-IMU allowlist guard (`/imu/data` and `/gps_p1/imu`; exactly one
+  subscription is used, and frame match is required against `imu_link`).
 - **Evidence-first defaults:** `debug/enable_pub` and `verbose_scan_log` are
   ON (and the `verbose:false` WARN clamp now spares the SCAN DEBUG lines).
 
 **Robin W notes.** `localization/sensor_type: "seyond"` validates
 `timestamp/FLOAT64/count=1` and interprets it as numeric Unix seconds. The
-deskewer uses those absolute capture times directly. Aux scans merged by
+Seyond source offset has a 10 us quantum within one frame period; GICP++ does
+not round or rescale the hydrated doubles. The frame period is configuration,
+not a constant: `localization/seyond_frame_duration_s` defaults to `0.100`
+(10 FPS, the slowest supported rate, so the default can only be permissive) and
+**must be set to `0.05` when running the documented 20 FPS race configuration**
+— otherwise the contract check accepts a fused double-frame and the
+`lidar_concat` ambiguity ceiling widens to a whole frame period. The node
+tracks the observed frame period and warns when it disagrees. The official
+driver filters invalid returns before publishing and hydrates every retained
+point, so a zero timestamp is invalid and rejects the whole cloud. The
+deskewer uses the validated absolute
+capture times directly. Aux scans merged by
 `lidar_concat` remain on the shared PTP axis and are not rebased by the
 inter-header delta (`lidar_concat` remains disabled by default here until
 3x Robin W sweep alignment is validated; the strict-merge guard and per-frame
 evidence are ready when it is enabled).
+
+**LiDAR quality gate.** Before timestamp validation, crop, deskew, or
+concatenation, GICP++ measures each raw stream's robust vertical elevation
+span. Robin W is nominally 30 degrees; the shipped profile rejects spans below
+27 degrees or clouds with fewer than 100 valid sampled returns. The outer
+0.5 percent of elevation samples is trimmed at each end so isolated outliers
+cannot make a narrow stream pass. The primary and both auxiliaries are checked
+independently, with startup-pass and throttled rejection logs. Configure this
+with `localization/lidar_quality/min_vertical_fov_deg` and
+`localization/lidar_quality/min_valid_points`.
 
 **Also included:** the Atlas `adapter` package at the repo root (optional
 alternative ingestion, see
@@ -341,9 +409,16 @@ bag through, read the scorecard's suggested thresholds, then tune.
 
 ## Credits and license
 
-Original Direct LiDAR-Inertial Odometry (DLIO) and `nano_gicp`:
+Original Direct LiDAR-Inertial Odometry (DLIO):
 - **Kenny J. Chen**, **Ryan Nemiroff**, **Brett T. Lopez** — UCLA Verifiable & Control-Theoretic Robotics (VECTR) Lab.
 - Upstream repository: <https://github.com/vectr-ucla/direct_lidar_inertial_odometry>.
+
+`small_gicp`:
+- **Kenji Koide** — National Institute of Advanced Industrial Science and
+  Technology (AIST).
+- Source and license: <https://github.com/koide3/small_gicp>.
+- Koide, K. *small_gicp: Efficient and parallel algorithms for point cloud
+  registration.* Journal of Open Source Software, 9(100), 6948, 2024.
 
 VECTR copyright notices are retained on every source / header file that originated upstream as legal attribution. The fork-specific changes in this folder are licensed under the same terms as the original work.
 
@@ -351,4 +426,6 @@ If you publish work that uses this localizer, please also cite the original DLIO
 
 > Chen, K., Nemiroff, R., & Lopez, B. T. *"Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction."* IEEE International Conference on Robotics and Automation (ICRA), 2023.
 
-See [LICENSE](../LICENSE) at the repository root. The fork preserves upstream's MIT-style notices; nano_gicp and nanoflann carry their own permissive licenses inside the respective subdirectories.
+See [LICENSE](../LICENSE) at the repository root and
+[`thirdparty/small_gicp/LICENSE`](thirdparty/small_gicp/LICENSE). Upstream
+source notices remain intact.

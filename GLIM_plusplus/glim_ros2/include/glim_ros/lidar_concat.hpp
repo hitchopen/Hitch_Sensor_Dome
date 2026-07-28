@@ -28,6 +28,7 @@
 
 #include <glim/util/config.hpp>
 #include <glim/util/urdf_transforms.hpp>
+#include <glim_ros/lidar_fov_gate.hpp>
 
 namespace glim_ros {
 
@@ -36,6 +37,7 @@ struct PointTimeRangeNs {
   uint64_t min_ns = 0;
   uint64_t max_ns = 0;
   size_t count = 0;
+  size_t zero_count = 0;
 };
 
 struct BufferedAuxCloud {
@@ -78,6 +80,8 @@ struct AuxLidarSensor {
   double range_delta_max = -std::numeric_limits<double>::infinity();
   uint64_t range_delta_count = 0;   // candidate evaluations with a decodable range
   uint64_t range_gate_rejects = 0;  // of those, how many exceeded the gate
+  bool vertical_fov_validated = false;
+  uint64_t vertical_fov_reject_count = 0;
 };
 
 inline double stamp_to_sec(const builtin_interfaces::msg::Time& stamp) {
@@ -326,8 +330,17 @@ inline PointTimeRangeNs decode_point_time_range(
     return range;
   }
   const size_t point_count = static_cast<size_t>(msg.width) * msg.height;
+  if (point_count == 0 ||
+      point_count > std::numeric_limits<size_t>::max() / msg.point_step) {
+    return range;
+  }
+  const size_t expected_row_step =
+    static_cast<size_t>(msg.width) * static_cast<size_t>(msg.point_step);
   const size_t required_bytes = point_count * static_cast<size_t>(msg.point_step);
-  if (point_count == 0 || msg.data.size() < required_bytes) return range;
+  if (static_cast<size_t>(msg.row_step) != expected_row_step ||
+      msg.data.size() != required_bytes) {
+    return range;
+  }
 
   range.min_ns = std::numeric_limits<uint64_t>::max();
   enum class Float64Axis { UNKNOWN, EPOCH_SECONDS, EPOCH_NANOSECONDS };
@@ -337,7 +350,10 @@ inline PointTimeRangeNs decode_point_time_range(
     if (is_f64_numeric) {
       double value = 0.0;
       std::memcpy(&value, msg.data.data() + i * msg.point_step + time_off, sizeof(double));
-      if (value == 0.0) continue;
+      if (value == 0.0) {
+        ++range.zero_count;
+        continue;
+      }
       if (!std::isfinite(value) || value < kMinAbsoluteEpochSeconds) {
         return PointTimeRangeNs{};
       }
@@ -360,7 +376,10 @@ inline PointTimeRangeNs decode_point_time_range(
                   msg.data.data() + i * msg.point_step + time_off,
                   sizeof(timestamp_ns));
     }
-    if (timestamp_ns == 0) continue;
+    if (timestamp_ns == 0) {
+      ++range.zero_count;
+      continue;
+    }
     range.min_ns = std::min(range.min_ns, timestamp_ns);
     range.max_ns = std::max(range.max_ns, timestamp_ns);
     ++range.count;
@@ -806,6 +825,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary,
   std::vector<AuxLidarSensor>& aux_sensors,
   double time_threshold,
+  LidarQualityConfig& lidar_quality,
   bool require_all_aux = true,
   int max_consec_fail = 0,
   int* consec_fail = nullptr,
@@ -813,6 +833,34 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   bool frame_diag_log = false,
   double sweep_time_threshold = 0.010,
   bool float64_time_is_epoch_ns = false) {
+  VerticalFovMeasurement primary_fov;
+  if (!verticalFovAccepted(
+        *primary, lidar_quality.minimum_vertical_fov_deg,
+        lidar_quality.minimum_valid_points, &primary_fov)) {
+    ++lidar_quality.primary_reject_count;
+    if (lidar_quality.primary_reject_count <= 10 ||
+        lidar_quality.primary_reject_count % 100 == 0) {
+      spdlog::error(
+        "lidar_quality: rejecting primary cloud before merge/SLAM: robust "
+        "vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), required "
+        ">= {:.2f} deg; valid sampled returns={}/{}. Reason: {}. "
+        "A narrowed vertical FOV does not provide enough vertical structure "
+        "for stable GLIM.",
+        primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
+        lidar_quality.minimum_vertical_fov_deg, primary_fov.valid_points,
+        primary_fov.sampled_points, primary_fov.reason);
+    }
+    return nullptr;
+  }
+  if (!lidar_quality.primary_validated) {
+    lidar_quality.primary_validated = true;
+    spdlog::info(
+      "lidar_quality: primary vertical-FOV gate passed: robust span {:.2f} "
+      "deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+      primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
+      primary_fov.valid_points);
+  }
+
   const double t_primary = stamp_to_sec(primary->header.stamp);
   const auto primary_point_time_range = decode_point_time_range(*primary, float64_time_is_epoch_ns);
   const uint32_t point_step = primary->point_step;
@@ -988,6 +1036,33 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       }
       continue;
     }
+
+    VerticalFovMeasurement aux_fov;
+    if (!verticalFovAccepted(
+          *match, lidar_quality.minimum_vertical_fov_deg,
+          lidar_quality.minimum_valid_points, &aux_fov)) {
+      ++aux.vertical_fov_reject_count;
+      if (aux.vertical_fov_reject_count <= 10 ||
+          aux.vertical_fov_reject_count % 100 == 0) {
+        spdlog::error(
+          "lidar_quality: rejecting aux cloud on {} before transform/merge: "
+          "robust vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), "
+          "required >= {:.2f} deg; valid sampled returns={}/{}. Reason: {}.",
+          aux.topic, aux_fov.span_deg, aux_fov.lower_deg, aux_fov.upper_deg,
+          lidar_quality.minimum_vertical_fov_deg, aux_fov.valid_points,
+          aux_fov.sampled_points, aux_fov.reason);
+      }
+      continue;
+    }
+    if (!aux.vertical_fov_validated) {
+      aux.vertical_fov_validated = true;
+      spdlog::info(
+        "lidar_quality: aux vertical-FOV gate passed on {}: robust span "
+        "{:.2f} deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+        aux.topic, aux_fov.span_deg, aux_fov.lower_deg, aux_fov.upper_deg,
+        aux_fov.valid_points);
+    }
+
     // Validate the FULL field schema, not just point_step: the merged cloud
     // keeps the primary's `fields`, so an aux scan with the same point_step but
     // different field offsets/datatypes would be silently misread downstream.
@@ -1112,6 +1187,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 
 struct AuxConcatConfig {
   bool enabled = false;
+  LidarQualityConfig lidar_quality;
   double time_threshold = 0.05;
   double sweep_time_threshold = 0.010;
   // Bag-time bound on how long an offline reader may hold a queued primary
@@ -1178,45 +1254,44 @@ inline std::string resolve_urdf_path(const std::string& urdf_path) {
 
 inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_sensors) {
   AuxConcatConfig out;
+  out.lidar_quality.minimum_vertical_fov_deg =
+    config_sensors.param<double>(
+      "lidar_quality", "min_vertical_fov_deg",
+      kDefaultMinimumVerticalFovDeg);
+  const int minimum_valid_points =
+    config_sensors.param<int>(
+      "lidar_quality", "min_valid_points",
+      static_cast<int>(kDefaultMinimumFovPoints));
+  if (!std::isfinite(out.lidar_quality.minimum_vertical_fov_deg) ||
+      out.lidar_quality.minimum_vertical_fov_deg < 25.0 ||
+      out.lidar_quality.minimum_vertical_fov_deg >
+        kNominalRobinWVerticalFovDeg) {
+    throw std::runtime_error(
+      "lidar_quality.min_vertical_fov_deg must be finite and within "
+      "[25, 30] degrees for the Robin W profile");
+  }
+  if (minimum_valid_points < static_cast<int>(kDefaultMinimumFovPoints) ||
+      minimum_valid_points > static_cast<int>(kMaximumFovSamplePoints)) {
+    throw std::runtime_error(
+      "lidar_quality.min_valid_points must be within [100, 20000]");
+  }
+  out.lidar_quality.minimum_valid_points =
+    static_cast<size_t>(minimum_valid_points);
+  spdlog::info(
+    "lidar_quality: vertical-FOV gate active: nominal Robin W {:.1f} deg, "
+    "reject robust spans below {:.1f} deg or clouds with fewer than {} valid "
+    "sampled returns",
+    kNominalRobinWVerticalFovDeg,
+    out.lidar_quality.minimum_vertical_fov_deg,
+    out.lidar_quality.minimum_valid_points);
+
   out.enabled = config_sensors.param<bool>("lidar_concat", "enabled", false);
   out.time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
-  // [2026-07-27] Renamed from the upstream vendor-branded
-  // "luminar_time_threshold": this platform is Seyond Robin W, and the gate
-  // applies to ANY absolute point-time carrier. The old key is still honoured
-  // so an existing run config does not silently fall back to the default.
-  // [P2 FIX 2026-07-27] Key PRESENCE decides which source wins, never the
-  // value. The previous form read the key with a -1.0 default and treated any
-  // negative result as "absent", so an explicitly configured
-  // `sweep_time_threshold: -0.1` was silently replaced by the legacy key or by
-  // 0.010 and never reached the negative-value validation below. Presence and
-  // validity are now separate questions: has_param() answers the first, and
-  // every path falls through to the same fail-loud check.
-  const bool has_sweep_key =
-    config_sensors.has_param("lidar_concat", "sweep_time_threshold");
-  const bool has_legacy_key =
-    config_sensors.has_param("lidar_concat", "luminar_time_threshold");
-  if (has_sweep_key) {
-    out.sweep_time_threshold =
-      config_sensors.param<double>("lidar_concat", "sweep_time_threshold", 0.010);
-    if (has_legacy_key) {
-      spdlog::warn(
-        "lidar_concat: both 'sweep_time_threshold' and the deprecated "
-        "'luminar_time_threshold' are present — using 'sweep_time_threshold'="
-        "{:.4f}s and IGNORING the deprecated key. Please delete it from your "
-        "run config so the effective value is unambiguous.",
-        out.sweep_time_threshold);
-    }
-  } else if (has_legacy_key) {
-    out.sweep_time_threshold =
-      config_sensors.param<double>("lidar_concat", "luminar_time_threshold", 0.010);
-    spdlog::warn(
-      "lidar_concat: 'luminar_time_threshold' is deprecated (this platform is "
-      "Seyond Robin W; the gate is vendor-neutral) — using it as "
-      "'sweep_time_threshold'={:.4f}s. Please rename the key in your run config.",
-      out.sweep_time_threshold);
-  } else {
-    out.sweep_time_threshold = 0.010;
-  }
+  // Absolute point-time endpoint gate. This is a required, vendor-neutral
+  // configuration surface; unsupported historical aliases are intentionally
+  // not accepted by the Hitch profile.
+  out.sweep_time_threshold =
+    config_sensors.param<double>("lidar_concat", "sweep_time_threshold", 0.010);
   out.future_sweep_wait_timeout =
     config_sensors.param<double>("lidar_concat", "future_sweep_wait_timeout", 0.150);
   out.two_pass_point_time_join =

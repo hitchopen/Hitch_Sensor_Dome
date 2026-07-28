@@ -107,6 +107,9 @@
     "expected_time_field": "timestamp",
     "expected_time_datatype": 8,
     "expected_time_is_absolute": true,
+    // The official Robin W driver hydrates every published point as
+    // packet_start + ts_10us. Absolute zero is not a ROS-layer sentinel.
+    "reject_zero_point_times": true,
     // LiDAR per-point time settings.
     //
     // The canonical Robin W values below are absolute Unix seconds with scale
@@ -153,6 +156,17 @@
       0.0,
       0.0
     ]
+  },
+
+  /*** Raw LiDAR quality gate ***/
+  // Robin W's nominal vertical FOV is 30 degrees. GLIM measures the robust
+  // 0.5th-to-99.5th percentile elevation span in each raw sensor frame before
+  // crop, transform, concatenation, or deskew. A stream below 27 degrees is
+  // rejected so a narrow cloud cannot destabilize SLAM or be hidden by the
+  // other two LiDARs in the merged cloud.
+  "lidar_quality": {
+    "min_vertical_fov_deg": 27.0,
+    "min_valid_points": 100
   },
 
   /*** Multi-LiDAR concatenation config ***/

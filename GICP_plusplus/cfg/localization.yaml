@@ -15,11 +15,16 @@
 
     # --- Map ---
     # Path to the PCD map produced by GLIM_plusplus offline mapping.
-    # See GLIM_plusplus/scripts/ for the dump → PCD merge step.
+    # The canonical exporter writes <map>.manifest.yaml beside it.
     localization/map_path: "maps/session_latest/map.pcd"
-
-    # UTM output: path to GLIM's T_world_utm.txt for the map being used.
-    # Leave empty to disable UTM-frame publishing.
+    localization/map_manifest_path: ""  # empty = <map_path>.manifest.yaml
+    localization/require_map_manifest: true
+    # Optional launch assertion. The live adapter also publishes its resolved
+    # datum on /gps_p1/local_enu_origin for an independent runtime check.
+    localization/expected_enu_origin: ""
+    localization/require_live_enu_origin: true
+    localization/enu_origin_tolerance_m: 0.25
+    # Canonical maps are already ENU. Never reapply T_world_utm here.
     localization/utm_transform_path: ""
     localization/utm_frame: "utm"
 
@@ -45,10 +50,8 @@
     # localization/map_voxel_size below; live-scan downsampling by
     # dlio/odom/preprocessing/voxelFilter/*.
 
-    # Optional map rotation (degrees) to correct sideways/up-axis issues
-    # from source map files. The GLIM_plusplus map is already in REP-103
-    # (X-forward / Y-left / Z-up), so leave at zero unless you imported
-    # a map from a different SLAM stack.
+    # Legacy unmanifested-map rotation. A canonical manifested ENU map rejects
+    # nonzero overrides because they would invalidate its frame contract.
     localization/map_rotation/roll_deg: 0.0
     localization/map_rotation/pitch_deg: 0.0
     localization/map_rotation/yaw_deg: 0.0
@@ -60,6 +63,18 @@
     # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
     # below, 0.5 m). Set to 0.0 to disable and register against the full-res map.
     localization/map_voxel_size: 0.3
+
+    # Bound each small_gicp registration target around the predicted pose.
+    # The full GLIM map is downsampled and assigned covariances once at startup;
+    # local crops reuse those covariances and build only a small KD-tree.
+    # radius must exceed sqrt(2)*cropBoxFilter/size + max correspondence range.
+    localization/local_map/enabled: true
+    localization/local_map/radius: 150.0
+    localization/local_map/min_points: 1000
+    # Background KD-tree builds intentionally use one thread so live GICP keeps
+    # the remaining CPU budget. A missed deadline falls back to a synchronous
+    # local rebuild, never to a non-RTK GNSS reset.
+    localization/local_map/build_threads: 1
 
     # Map visualization (separate, coarser downsample used only for RViz publishing)
     localization/visualize_map: true
@@ -81,8 +96,8 @@
 
     # --- Atlas Duo INS cross-check + recovery ---
     # When enabled, the node subscribes to the `gt_odom` remap (default
-    # /odom_rtk_only — the RTK-gated Atlas Duo INS odometry; see the
-    # nav_sat_gated_odom helper) and reports gt_err=[trans, rot, dt] in
+    # /gps_p1/filtered_odom_rtk_fixed from the adapter) and reports
+    # gt_err=[trans, rot, dt] in
     # every SCAN DEBUG line and publishes the deltas on
     # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg.
     # Diagnostic only — never feeds back into accept/reject.
@@ -90,36 +105,20 @@
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
-    # RTK quality gate on gt_odom samples. NOTE (matches the code, see
-    # callbackGtOdom + gtSampleIsRtkFixed): the gate is applied PER-CONSUMER,
-    # not at ingest — every sample is buffered regardless of quality, and each
-    # consumer then decides: RTK-driven bias calibration / seeding requires a
-    # passing sample; the gt_err diagnostic cross-check requires a passing
-    # sample; the GT-snap recovery deliberately accepts ANY buffered sample.
-    # This is the P1-native replacement for the NovAtel BESTGNSSPOS enum gate
-    # (RAWIMUSX/INSPVAX/CORRIMUSX path is gone -- everything now comes from
-    # the Atlas Duo driver, which populates Odometry's covariance directly
-    # from its solution quality).
+    # RTK quality gate on gt_odom samples. All consumers, including initial
+    # pose and recovery, require a finite positive covariance inside these
+    # limits. The production source is the adapter's solution-type-gated
+    # fixed-only stream; covariance is a second fail-closed check.
     #
     # The gate inspects msg->pose.covariance[0,7,14] (xx, yy, zz position
     # variances in m^2). A sample fails if any horizontal variance exceeds
     # max_pose_var_xy, OR vertical variance exceeds max_pose_var_z.
     #
-    # Reference values from a known-RTK-fixed Atlas bag (run_2, 17 min,
-    # earlier vehicle dataset): median cov_xx=2.8e-5, cov_yy=4.2e-5,
-    # cov_zz=1.0e-4. p95
-    # cov_xx=4.1e-5, cov_yy=5.7e-5, cov_zz=1.3e-4. Maxes never exceed
-    # 1.1e-4 horizontal / 2.5e-4 vertical. RTK-float typically lives in
-    # the 1e-2 -- 1e-1 m^2 band; GPS-only at 1 m^2 +. The default thresholds
-    # below admit anything down to RTK-float and reject only when Atlas
-    # has fully degraded to GPS-only.
-    #
-    # Disable (enable=false) only for replays of bags lacking covariance
-    # populating, or for diagnostic runs where you want all gt_odom samples
-    # accepted by every consumer.
+    # Thresholds match adapter/config/adapter.yaml. Disable only for explicit
+    # diagnostic replays; doing so permits degraded INS poses to alter state.
     localization/rtk_gate/enable: true
-    localization/rtk_gate/max_pose_var_xy: 0.25  # m^2; ~0.5 m horizontal std
-    localization/rtk_gate/max_pose_var_z: 1.0    # m^2; ~1.0 m vertical std (GPS Z is naturally worse)
+    localization/rtk_gate/max_pose_var_xy: 0.001
+    localization/rtk_gate/max_pose_var_z: 0.005
 
     # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
     # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
@@ -129,12 +128,9 @@
     # message). IMU biases are preserved. Setting enable=true forces
     # gt_odom/enable=true.
     #
-    # IMPORTANT — the source of `gt_odom` must already be RTK-gated.
-    # We do this by running nav_sat_gated_odom (see scripts/), which
-    # republishes /odom only when /gps/fix has STATUS_GBAS_FIX and
-    # cm-grade covariance. The localizer treats any message arriving on
-    # gt_odom as RTK-fixed, so any quality filtering must happen
-    # upstream of this topic.
+    # IMPORTANT: use the adapter's /gps_p1/filtered_odom_rtk_fixed stream.
+    # NavSatFix STATUS_GBAS_FIX is only RTK-class and cannot distinguish float
+    # from fixed; solution type is the authoritative discriminator.
     localization/gt_recovery/enable: true
     # P2#3: raised 1 -> 5. With min=1 the snap fired on EVERY rejected frame
     # (1,860 snaps in run 12), masking dead-reckoning quality in all replay
@@ -143,8 +139,13 @@
     # back to what it was meant to be: a last-resort recovery after a
     # sustained losing streak (~0.5 s at 10 Hz), not a per-frame crutch.
     # Validation runs should ALSO do one pass with enable=false to expose the
-    # true dead-reckoning behavior (production has no GT topic).
+    # true LiDAR+IMU behavior without RTK-fixed recovery.
     localization/gt_recovery/min_consecutive_failures: 5
+    # Reject an otherwise plausible GICP basin when a fresh, time-matched
+    # RTK_FIXED adapter pose proves it is farther away than this. Float/no-fix
+    # provides no sample to this gate and therefore remains LiDAR+IMU only.
+    # 0 disables the accepted-pose sanity check.
+    localization/gt_recovery/sanity_radius: 10.0
 
     # --- Initial pose ---
     # If `localization/initial_pose/use` is true, seed the node with the
@@ -186,6 +187,15 @@
     # this at false. When lidar_concat is enabled this runs AFTER merge.
     localization/flip_y: false
 
+    # --- Raw LiDAR vertical-FOV quality gate ---
+    # Robin W's nominal vertical FOV is 30 degrees. Measure each raw sensor
+    # independently before crop/deskew/concatenation, using the robust
+    # 0.5th-to-99.5th percentile elevation span. Rejecting below 27 degrees
+    # prevents a narrow or partially populated stream from destabilizing SLAM;
+    # one isolated outlier cannot make the cloud pass.
+    localization/lidar_quality/min_vertical_fov_deg: 27.0
+    localization/lidar_quality/min_valid_points: 100
+
     # --- Multi-LiDAR concatenation (DISABLED by default for race-mode latency) ---
     # When enabled, the node subscribes to each aux topic, buffers the latest
     # scans, and on every primary scan finds the nearest aux scan in time,
@@ -219,11 +229,27 @@
     localization/lidar_concat/enabled: false
     localization/lidar_concat/aux_topics: ["/robin_w_rear_left/points", "/robin_w_rear_right/points"]
     localization/lidar_concat/aux_frames: ["lidar_rear_left_link", "lidar_rear_right_link"]
-    localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans farther than this from primary are dropped
+    # Absolute point-time endpoint gate. Robin W sweeps are matched by
+    # max(|min-min|, |max-max|); header time is only a tie-break.
+    localization/lidar_concat/sweep_time_threshold: 0.01
+    # Wait briefly for an aux callback that follows the primary callback.
+    # One deadline is shared by all aux sensors, so this does not multiply by
+    # the number of rear LiDARs.
+    localization/lidar_concat/future_sweep_wait_timeout: 0.15
     localization/lidar_concat/buffer_size: 200      # per-aux ring depth (P4 parity: 20 = only ~2 s of aux history)
 
+    # Robin W frame period in seconds. Robin W is rated 10-20 FPS; 0.100 is the
+    # 10 FPS default and is deliberately the SAFE one (too large only loosens
+    # the wire-contract bounds, it never falsely rejects a frame). This
+    # component is documented to run at 20 Hz for race-mode latency -- see
+    # ../recording/sensor_config.yaml -- so a 20 FPS deployment MUST set 0.05.
+    # Leaving it at 0.100 there lets a fused double-frame pass the contract
+    # check and raises the sweep_time_threshold ceiling to a full frame period.
+    # The node warns if the observed frame period disagrees with this value.
+    localization/seyond_frame_duration_s: 0.100
+
     # LiDAR sensor type for per-point timestamp handling during deskewing.
-    # Options: ouster, velodyne, seyond, hesai, livox, luminar.
+    # Options: ouster, velodyne, seyond, hesai, livox.
     # The pinned Seyond ROS 2 driver publishes `timestamp` as numeric FLOAT64
     # Unix seconds. The explicit seyond path validates that wire contract and
     # deskews directly on the absolute point times.
@@ -252,13 +278,13 @@
     localization/calib/motion_sigma_max: 0.10
 
     # --- RTK-driven IMU calibration ---
-    # Uses the Atlas Duo INS topic (gt_odom remap → /odom_rtk_only) as the
+    # Uses the adapter fixed-only INS topic (gt_odom remap →
+    # /gps_p1/filtered_odom_rtk_fixed) as the
     # truth source for bias estimation. Lets the vehicle calibrate while
     # moving and seeds pose+velocity from the first RTK-fixed sample
-    # rather than assuming stationary. Presence of a message on the GT
-    # topic is taken to mean "RTK is fixed" — the nav_sat_gated_odom
-    # helper stops publishing when not RTK-fixed, so this assumption
-    # holds. If no GT message arrives within rtk_init/fallback_timeout
+    # rather than assuming stationary. The adapter checks FusionEngine
+    # solution type and covariance before publishing. If no fixed GT message
+    # arrives within rtk_init/fallback_timeout
     # seconds of the first IMU sample, the node falls back to the
     # stationary `dlio/imu/calibTime` path above.
 
@@ -273,10 +299,10 @@
 
     # --- Single-IMU hard guard (Hitch defaults).
     localization/imu/require_topic_allowlist: true
-    localization/imu/topic_allowlist: ["/imu/data"]
-    # frame match left OFF until the Atlas Duo driver's header.frame_id is
-    # verified against localization/imu_frame (imu_link).
-    localization/imu/require_frame_match: false
+    localization/imu/topic_allowlist: ["/gps_p1/imu", "/imu/data"]
+    # The adapter publishes imu_frame_id=imu_link; reject any accidental
+    # second IMU with a different body frame.
+    localization/imu/require_frame_match: true
     localization/rtk_init/enable: true
     localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
     localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback
@@ -352,7 +378,7 @@
     odom/geo/dr_cov_dist_frac: 0.05  # m of sigma per metre travelled
     localization/debug/enable_jump_log: false
     localization/debug/verbose_scan_log: true
-    localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
+    localization/debug/small_gicp_lm_debug: false  # Enable only for short controlled replays
     localization/debug/jump_trans_m: 30.0      # Base reject threshold if pose jumps > this (meters)
     localization/debug/jump_rot_deg: 30.0     # Base reject threshold if pose jumps > this (degrees)
     # Speed/scan_dt-aware jump-gate scaling (P2#2). The jump is GICP-vs-IMU-prior,
@@ -450,6 +476,14 @@
     gicp/yawGate/enable: true
     gicp/yawGate/maxCorrDeg: 1.5           # healthy GICP yaw corrections are <0.5 deg (IMU prior is good)
     gicp/yawGate/fitnessRatio: 1.2         # veto only on low-confidence matches
+
+    # small_gicp ground-vehicle constraints. The migration default is 6dof so
+    # the backend change preserves existing behavior. After a Robin W replay,
+    # 4dof can fix roll/pitch to the IMU prior inside LM; 3dof also fixes yaw.
+    gicp/dof/mode: "6dof"
+    gicp/dof/full6dofEveryN: 0             # periodic unconstrained refresh; 0 disables
+    gicp/prior/yawInfo: 0.0                # rad^-2; calibrate before enabling
+    gicp/prior/rollPitchInfo: 0.0          # rad^-2; calibrate before enabling
 
     # Degeneracy TRIGGER (condition proxy of the raw 6x6 hessian). With
     # partialUpdate=true this no longer rejects — it decides when the

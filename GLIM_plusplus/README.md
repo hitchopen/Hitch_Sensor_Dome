@@ -586,6 +586,16 @@ header-nearest matching. New `lidar_concat` keys in `config_sensors.json`:
 > [LiDAR per-point timestamp standard](../README.md#lidar-per-point-timestamp-standard)
 > for the complete five-vendor contract and the live-topic validation command.
 
+**LiDAR quality gate.** GLIM++ measures every raw stream before preprocessing
+and measures each primary/auxiliary separately before offline concatenation.
+The shipped Robin W profile requires a robust vertical elevation span of at
+least 27 degrees (30 degrees nominal) and at least 100 finite, nonzero sampled
+returns. The outer 0.5 percent of samples is trimmed at each end so one outlier
+cannot hide a narrow stream. Invalid clouds are logged and rejected before
+SLAM; the first passing cloud from each sensor is logged as startup evidence.
+The run-config generator always emits `lidar_quality.min_vertical_fov_deg` and
+`lidar_quality.min_valid_points`.
+
 **GNSS global module** (extends §7/§8/§13):
 
 - **RTK-dropout un-anchoring** (`max_interp_gap_sec: 1.0`): a submap whose

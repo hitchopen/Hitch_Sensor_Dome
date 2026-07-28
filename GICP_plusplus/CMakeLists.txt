@@ -10,7 +10,7 @@
 #                                                         #
 ###########################################################
 
-cmake_minimum_required(VERSION 3.12.4)
+cmake_minimum_required(VERSION 3.16)
 project(gicp_localization)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -28,6 +28,8 @@ find_package(PCL REQUIRED)
 find_package( Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
 find_package(LibXml2 REQUIRED)  # URDF parsing for offline aux-LiDAR extrinsics (lidar_concat)
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
 find_package(OpenMP REQUIRED)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -51,31 +53,36 @@ include_directories(${EIGEN3_INCLUDE_DIR})
 include_directories(include)
 include_directories(SYSTEM)
 
-# NanoFLANN
-add_library(nanoflann STATIC
-  src/nano_gicp/nanoflann.cc
+# small_gicp is vendored as a header-only dependency. Keeping the exact
+# reviewed headers in-tree gives Humble and Jazzy the same registration
+# implementation without relying on a distro-specific system package.
+add_library(gicp_localization_small_gicp INTERFACE)
+target_include_directories(gicp_localization_small_gicp INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/small_gicp/include>
 )
-target_link_libraries(nanoflann ${PCL_LIBRARIES})
-ament_target_dependencies(nanoflann)
-
-# NanoGICP
-add_library(nano_gicp STATIC
-  src/nano_gicp/lsq_registration.cc
-  src/nano_gicp/nano_gicp.cc
+target_link_libraries(gicp_localization_small_gicp INTERFACE
+  Eigen3::Eigen
+  OpenMP::OpenMP_CXX
 )
-target_link_libraries(nano_gicp ${PCL_LIBRARIES} OpenMP::OpenMP_CXX nanoflann)
-ament_target_dependencies(nano_gicp)
 
 # Localization Node
 add_executable(gicp_localization_node src/localization_node.cc src/localization.cc)
 target_include_directories(gicp_localization_node PRIVATE ${LIBXML2_INCLUDE_DIR})
-target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} OpenMP::OpenMP_CXX Threads::Threads nano_gicp ${LIBXML2_LIBRARIES})
-ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
+target_link_libraries(gicp_localization_node
+  ${PCL_LIBRARIES}
+  OpenMP::OpenMP_CXX
+  Threads::Threads
+  gicp_localization_small_gicp
+  ${LIBXML2_LIBRARIES}
+  yaml-cpp
+)
+ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "std_msgs" "sensor_msgs" "geometry_msgs" "visualization_msgs")
 
 # nav_sat_gated_odom — Hitch Sensor Dome RTK-gating republisher.
-# Sits between Atlas Duo's /odom + /gps/fix and the localization
+# Sits between a legacy INS odometry + NavSatFix pair and the localization
 # node's gt_odom input, forwarding Odometry only when NavSatFix
-# reports RTK-fixed status with cm-grade covariance.
+# reports RTK-class status with valid cm-grade covariance. Production uses
+# the adapter's native solution-type-gated fixed-only stream.
 add_executable(nav_sat_gated_odom src/nav_sat_gated_odom.cc)
 ament_target_dependencies(nav_sat_gated_odom rclcpp nav_msgs sensor_msgs)
 
@@ -109,5 +116,47 @@ endif()
 # nav_sat_gated_odom doesn't use OpenMP, but compile with the same
 # warning hygiene as the rest of the package.
 target_compile_options(nav_sat_gated_odom PRIVATE -Wall -Wextra)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(seyond_timestamp_test
+    test/seyond_timestamp_test.cpp
+  )
+  ament_target_dependencies(seyond_timestamp_test sensor_msgs)
+  target_include_directories(seyond_timestamp_test PRIVATE include)
+
+  ament_add_gtest(lidar_fov_gate_test
+    test/lidar_fov_gate_test.cpp
+  )
+  ament_target_dependencies(lidar_fov_gate_test sensor_msgs)
+  target_include_directories(lidar_fov_gate_test PRIVATE include)
+
+  ament_add_gtest(map_manifest_test
+    test/map_manifest_test.cpp
+  )
+  ament_target_dependencies(map_manifest_test yaml_cpp_vendor)
+  target_link_libraries(map_manifest_test yaml-cpp)
+  target_include_directories(map_manifest_test PRIVATE include)
+
+  ament_add_gtest(navsat_fix_gate_test
+    test/navsat_fix_gate_test.cpp
+  )
+  ament_target_dependencies(navsat_fix_gate_test sensor_msgs)
+  target_include_directories(navsat_fix_gate_test PRIVATE include)
+
+  ament_add_gtest(small_gicp_backend_test
+    test/small_gicp_backend_test.cpp
+  )
+  target_include_directories(small_gicp_backend_test PRIVATE
+    include
+    thirdparty/small_gicp/include
+  )
+  target_link_libraries(small_gicp_backend_test
+    ${PCL_LIBRARIES}
+    OpenMP::OpenMP_CXX
+    gicp_localization_small_gicp
+  )
+endif()
 
 ament_package()

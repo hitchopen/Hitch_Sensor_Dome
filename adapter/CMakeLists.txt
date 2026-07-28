@@ -12,6 +12,7 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(fusion_engine_msgs REQUIRED)
@@ -40,6 +41,7 @@ target_link_libraries(adapter adapter_utils ${GeographicLib_LIBRARIES})
 ament_target_dependencies(adapter
   rclcpp
   sensor_msgs
+  std_msgs
   nav_msgs
   geometry_msgs
   fusion_engine_msgs
@@ -72,5 +74,13 @@ install(FILES README.md
   DESTINATION share/${PROJECT_NAME}
   OPTIONAL
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(adapter_utils_test test/adapter_utils_test.cpp)
+  target_link_libraries(adapter_utils_test adapter_utils)
+  ament_target_dependencies(adapter_utils_test fusion_engine_msgs)
+endif()
 
 ament_package()

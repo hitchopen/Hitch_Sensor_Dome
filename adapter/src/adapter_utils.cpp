@@ -1,6 +1,7 @@
 #include "adapter/adapter_utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -13,6 +14,21 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDegToRad = kPi / 180.0;
 constexpr uint8_t kRtkFixed = 4;
+
+bool parseExactFiniteDouble(const std::string& text, double& value)
+{
+  size_t parsed = 0;
+  try {
+    value = std::stod(text, &parsed);
+  } catch (const std::exception&) {
+    return false;
+  }
+  while (parsed < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[parsed]))) {
+    ++parsed;
+  }
+  return parsed == text.size() && std::isfinite(value);
+}
 
 }  // namespace
 
@@ -66,7 +82,8 @@ bool parseLocalEnuOrigin(const std::string& text, double& lat_deg, double& lon_d
   std::string normalized = text;
   std::replace(normalized.begin(), normalized.end(), ',', ' ');
   std::istringstream in(normalized);
-  if (!(in >> lat_deg >> lon_deg >> alt_m)) {
+  std::string trailing;
+  if (!(in >> lat_deg >> lon_deg >> alt_m) || (in >> trailing)) {
     return false;
   }
   return std::isfinite(lat_deg) && std::isfinite(lon_deg) && std::isfinite(alt_m);
@@ -94,14 +111,12 @@ bool parseLocalEnuOriginTtl(const std::string& path, double& lat_deg, double& lo
     if (cells.size() < 3) {
       return false;
     }
-    try {
-      lat_deg = std::stod(cells[cells.size() - 3]);
-      lon_deg = std::stod(cells[cells.size() - 2]);
-      alt_m = std::stod(cells[cells.size() - 1]);
-    } catch (const std::exception&) {
+    if (!parseExactFiniteDouble(cells[cells.size() - 3], lat_deg) ||
+        !parseExactFiniteDouble(cells[cells.size() - 2], lon_deg) ||
+        !parseExactFiniteDouble(cells[cells.size() - 1], alt_m)) {
       return false;
     }
-    return std::isfinite(lat_deg) && std::isfinite(lon_deg) && std::isfinite(alt_m);
+    return true;
   }
   return false;
 }
@@ -125,10 +140,12 @@ bool posePassesRtkGate(const fusion_engine_msgs::msg::Pose& msg,
                        double max_var_xy,
                        double max_var_z)
 {
-  // [P3 FIX 2026-07-10] Require finite NONNEGATIVE covariance: `<= max`
-  // alone let a negative sentinel (-1 = "unknown" in some publishers) pass
-  // the accuracy gate whenever solution_type said RTK_FIXED.
-  const auto ok = [](double v, double mx) { return std::isfinite(v) && v >= 0.0 && v <= mx; };
+  // Require finite, strictly positive covariance. Zero is not a physically
+  // meaningful uncertainty here and is commonly an "unknown/unpopulated"
+  // sentinel; accepting it would make missing quality data look perfect.
+  const auto ok = [](double v, double mx) {
+    return std::isfinite(v) && v > 0.0 && v <= mx;
+  };
   return msg.solution_type == kRtkFixed &&
          ok(msg.position_covariance[0], max_var_xy) &&
          ok(msg.position_covariance[4], max_var_xy) &&

@@ -47,14 +47,16 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 // PCL
 #define PCL_NO_PRECOMPILE
 
-// DLIO
-#include <nano_gicp/nano_gicp.h>
+// PCL point declaration used by the small_gicp adapter.
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/register_point_struct.h>
 
 namespace dlio {
   // Seyond Robin W publishes numeric FLOAT64 Unix seconds in `timestamp`.
   // Keep an explicit enum value even though its deskew math is the same as
   // Hesai's, so configuration and wire-contract errors name the real sensor.
-  enum class SensorType { OUSTER, VELODYNE, SEYOND, HESAI, LIVOX, LUMINAR, UNKNOWN };
+  enum class SensorType { OUSTER, VELODYNE, SEYOND, HESAI, LIVOX, UNKNOWN };
 
   class OdomNode;
   class MapNode;
@@ -66,8 +68,8 @@ namespace dlio {
     float intensity; // intensity
     union {
     std::uint32_t t;   // (Ouster) time since beginning of scan in nanoseconds
-    float time;        // (Velodyne / Seyond Robin W) time since beginning of scan in seconds
-    double timestamp;  // (Hesai) absolute timestamp in seconds
+    float time;        // (Velodyne) time since beginning of scan in seconds
+    double timestamp;  // (Seyond Robin W / Hesai) absolute timestamp in seconds
                        // (Livox) numeric Unix-epoch nanoseconds; scale by 1e-9
     };
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW

@@ -37,6 +37,8 @@
     # alignment cost. The tradeoff is worth it when feature-poor front
     # stretches benefit from rear-quadrant returns.
     localization/lidar_concat/enabled: true
+    localization/lidar_concat/require_all_aux: true
+    localization/lidar_concat/future_sweep_wait_timeout: 0.15
 
     # --- Preprocessing (full Robin W sensing range) ---
     # 100 m crop matches Robin W's effective range at moderate reflectivity.
@@ -81,11 +83,12 @@
     localization/calib/motion_sigma_max: 0.05
 
     # --- GT-snap recovery (more aggressive — single failure triggers) ---
-    # Race mode sets min_consecutive_failures=3 to avoid snapping on
+    # Race mode sets min_consecutive_failures=5 to avoid snapping on
     # transient corner rejections at high yaw rate. Safe mode reverts to
     # the upstream default of 1: snap immediately on the first GICP
     # rejection so the localizer never lingers in dead-reckoning.
     localization/gt_recovery/min_consecutive_failures: 1
+    localization/gt_recovery/sanity_radius: 10.0
 
     # --- Debug / diagnostics ON ---
     # Safe mode is also "debugging-friendly mode" — every per-scan
@@ -102,3 +105,11 @@
     # voxel filter. Cost is in the noise even in race mode; mentioning
     # here just for completeness — set to false if RViz is never connected.
     localization/visualize_map: true
+
+    # Keep the bounded target algorithm active in safe mode as well. Its
+    # synchronous fallback preserves LiDAR localization if a background crop
+    # is late; RTK-fixed recovery remains governed by the existing GT gate.
+    localization/local_map/enabled: true
+    localization/local_map/radius: 150.0
+    localization/local_map/min_points: 1000
+    localization/local_map/build_threads: 1

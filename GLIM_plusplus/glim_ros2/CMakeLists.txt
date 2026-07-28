@@ -127,6 +127,12 @@ if(BUILD_TESTING)
     glim_ros
     ${LIBXML2_LIBRARIES}
   )
+
+  ament_add_gtest(lidar_fov_gate_test
+    test/lidar_fov_gate_test.cpp
+  )
+  ament_target_dependencies(lidar_fov_gate_test sensor_msgs)
+  target_include_directories(lidar_fov_gate_test PRIVATE include)
 endif()
 
 ament_auto_package()

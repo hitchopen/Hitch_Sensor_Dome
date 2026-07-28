@@ -125,7 +125,8 @@ GICP_plusplus/                LiDAR-only 定位 (vectr-ucla/DLIO 的 fork)
   cfg/                    localization.yaml (race) + localization_safe.yaml
   launch/                 localization_with_tf.launch.py + systemd 单元
   scripts/                merge_glim_submaps.py + 诊断工具
-  include/, src/          nano_gicp + 定位器 + nav_sat_gated_odom
+  include/, src/          small_gicp 适配层 + 定位器 + nav_sat_gated_odom
+  thirdparty/small_gicp/  内置的纯头文件配准后端
   README.md               Fork 声明、双模式设计、race vs safe
 ```
 
@@ -248,7 +249,7 @@ cd GLIM_plusplus/config && python3 generate_sensor_dome_urdf.py
 ros2 launch GLIM_plusplus/launch/hitch_sensor_dome.launch.py
 
 # 或对已采集的 MCAP 包做离线建图（bag 中必须包含 adapter 的
-# /gps_p1/filtered_odom_rtk_fixed 与 /gps/fix）：
+# /gps_p1/filtered_odom_rtk_fixed 与 /gps_p1/fix）：
 ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
     --ros-args -p config_path:=GLIM_plusplus/glim/config \
                 -p dump_path:=glim_maps/session_<ts>
@@ -263,10 +264,10 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 
 相对上游 VECTR DLIO 的项目改进：
 
-1. **针对 Robin W + Atlas Duo** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶（`/imu/data`、`/odom_rtk_only`、`/robin_w_*/points`；frame 来自 `config/sensor_dome_tf.yaml` 的 `base_link`/`imu_link`/`lidar_front_link`）。
-2. **RTK 门控的 INS 里程计转发器**（[`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc)）—— 仅在 `/gps/fix` 处于 STATUS_GBAS_FIX 且协方差为厘米级时才把 `/odom` 转发到 `/odom_rtk_only`，弥补上游"无条件信任 gt_odom"的安全缺口。
+1. **针对 Robin W + Atlas Duo** —— topic / frame / URDF 默认值开箱适配 Hitch 穹顶（低延迟实时 IMU `/imu/data`、adapter 的 RTK-fixed-only `/gps_p1/filtered_odom_rtk_fixed`、`/robin_w_*/points`；frame 来自 `config/sensor_dome_tf.yaml` 的 `base_link`/`imu_link`/`lidar_front_link`）。
+2. **固定解门控与失效回退** —— 生产路径直接使用 adapter 按 FusionEngine `solution_type == RTK_FIXED` 发布的固定解里程计。协方差必须为有限、正值且不超过阈值；RTK float、过期/未知质量或无解时不允许初始化或恢复跳变，而是继续使用 LiDAR + IMU。`nav_sat_gated_odom` 仅用于旧 bag 的 REP-145 兼容路径，因为 `STATUS_GBAS_FIX` 本身无法可靠区分 float 与 fixed。
 3. **双模式设计** —— `cfg/localization.yaml`（race 基线）+ `cfg/localization_safe.yaml`（覆盖）通过 launch 文件的 `mode:=race|safe|custom` 参数分层，配套两个互斥的 systemd 单元用于生产部署。
-4. **GLIM++ 地图桥接** —— `scripts/merge_glim_submaps.py` 遍历 `<dump_path>/NNNNNN/` 子地图目录，应用每个 `T_world_origin`，拼接成一个 PCD 并应用赛车模式滤波（Z-clip、中心线遮罩、离群点剔除、voxel 降采样）。消除 offline_viewer GUI 步骤。
+4. **GLIM++ ENU 地图桥接** —— 规范导出器 `GLIM_plusplus/scripts/export_glim_dump_to_pcd.py` 精确读取 compact 点格式，依次应用 `T_world_origin` 与 `inverse(T_world_utm)`，输出 surveyed local-ENU PCD 及 `<map>.manifest.yaml`。GICP++ 默认要求 manifest，并在处理点云前把其 datum 与 adapter 的 transient-local `/gps_p1/local_enu_origin` 比对；旧脚本仅保留为该导出器的兼容包装。
 5. **GICP 预热** —— 启动时即急切构建 kd-tree + 一次 dummy align，把 OpenMP 线程池启动、Eigen JIT、source 端 kd-tree 分配等首次接触开销在第一次真实扫描之前烧掉。
 6. **Yaw-rate 自适应观测器** —— 几何观测器中的 `Kp` 与 `Kq` 在车体系 yaw rate 较高时自动衰减，让 IMU 预测在转弯入弯（此时 GICP 最易滑动）瞬间占主导。
 7. **IMU 标定运动方差门** —— 若车辆运动（σ‖a‖ > 0.10 m/s²），拒绝静止偏置标定窗口；回退到 gt_odom 路径的 RTK 驱动标定。
@@ -274,20 +275,23 @@ ros2 run glim_ros glim_rosbag recording/data/session_<ts>/rosbag2 \
 9. **base_link / imu_link 拆分** —— 即使 GLIM++ 把地图锚定在 `imu_link`，定位器仍把位姿报告在 `base_link`（可通过 [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml) 按车辆配置）。同一份地图可跨多个车辆框架使用。
 
 ```bash
-# 1. 先用 GLIM++ 离线建图（见上面"建图"一节），再把 submap 合并成单一 PCD：
-python3 GICP_plusplus/scripts/merge_glim_submaps.py \
-    /tmp/dump  /tmp/race_map.pcd \
-    --voxel-res 0.4 --outlier-k 12 --outlier-std 2.0 \
-    --z-min -2.0 --z-max 5.0 --copy-utm
+# 1. 使用与 adapter 完全相同的 surveyed local-ENU 原点导出地图。
+#    命令同时生成 /tmp/race_map.pcd.manifest.yaml。
+ENU_ORIGIN="37.87150000,-122.27300000,52.125"
+python3 GLIM_plusplus/scripts/export_glim_dump_to_pcd.py \
+    /tmp/dump /tmp/race_map.pcd \
+    --frame enu --enu-origin "${ENU_ORIGIN}" --voxel-size 0.4
 
 # 2. 在赛车模式（默认）下启动定位器：
 ros2 launch gicp_localization localization_with_tf.launch.py \
-    map_path:=/tmp/race_map.pcd
+    map_path:=/tmp/race_map.pcd \
+    local_enu_origin:="${ENU_ORIGIN}"
 
 # 或安全模式（3× LiDAR、全覆盖、全 debug）：
 ros2 launch gicp_localization localization_with_tf.launch.py \
     mode:=safe \
-    map_path:=/tmp/race_map.pcd
+    map_path:=/tmp/race_map.pcd \
+    local_enu_origin:="${ENU_ORIGIN}"
 ```
 
 完整的逐文件变更日志、race vs safe 双模式参数对比表、systemd 单元安装、延迟预算分解参见 [`GICP_plusplus/README.md`](GICP_plusplus/README.md)。

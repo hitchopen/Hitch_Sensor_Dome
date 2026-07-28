@@ -422,7 +422,7 @@ int main(int argc, char** argv) {
           if (primary_no_plan <= 10) {
             spdlog::warn(
               "lidar_concat: primary (stamp={:.6f}) missing from the pass-1 index; "
-              "mapping front-only",
+              "releasing it to the configured strict/degraded merge policy",
               glim_ros::stamp_to_sec(primary->header.stamp));
           }
         }
@@ -473,6 +473,7 @@ int main(int argc, char** argv) {
       try {
         final_points = glim_ros::merge_clouds(
           primary, aux_sensors, concat_time_threshold,
+          concat_config.lidar_quality,
           concat_config.require_all_aux,
           concat_config.max_consecutive_aux_merge_failures,
           &concat_config.consecutive_merge_failures,
@@ -493,7 +494,8 @@ int main(int argc, char** argv) {
       size_t workload = 0;
       if (final_points) {
         bool ingested = false;
-        workload = glim->points_callback(final_points, epoch_anchor_count, &ingested);
+        workload = glim->points_callback(
+          final_points, epoch_anchor_count, &ingested, true);
         if (ingested) {
           ++primary_forwarded;
         } else {

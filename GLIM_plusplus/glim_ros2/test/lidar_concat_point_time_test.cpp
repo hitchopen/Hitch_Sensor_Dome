@@ -196,7 +196,14 @@ TEST(LidarConcatPointTime, RobinWContractIsFloat64AbsoluteTime) {
   const auto range = glim_ros::decode_point_time_range(*msg, false);
   ASSERT_TRUE(range.valid);
   EXPECT_EQ(range.count, 2U);
+  EXPECT_EQ(range.zero_count, 0U);
   EXPECT_EQ(range.min_ns, static_cast<uint64_t>(t0 * 1e9));
+
+  const auto with_zero = glim_ros::decode_point_time_range(
+    *robin_w_cloud({0.0, t0, t0 + 0.049}, t0), false);
+  ASSERT_TRUE(with_zero.valid);
+  EXPECT_EQ(with_zero.count, 2U);
+  EXPECT_EQ(with_zero.zero_count, 1U);
 
   auto bytes = msg->data;
   glim_ros::shift_cloud_timestamps(
@@ -209,6 +216,14 @@ TEST(LidarConcatPointTime, RobinWContractIsFloat64AbsoluteTime) {
   EXPECT_DOUBLE_EQ(first, t0);
   EXPECT_DOUBLE_EQ(last, t0 + 0.049);
   EXPECT_NEAR(glim_ros::cloud_time_span_seconds(*msg), 0.049, 1e-6);
+}
+
+TEST(LidarConcatPointTime, RejectsPaddedAbsoluteTimeLayout) {
+  const double t0 = 1'700'000'000.0;
+  auto msg = robin_w_cloud({t0, t0 + 0.049}, t0);
+  msg->row_step += 8;
+  msg->data.resize(msg->row_step);
+  EXPECT_FALSE(glim_ros::decode_point_time_range(*msg, false).valid);
 }
 
 TEST(LidarConcatPointTime, CanonicalVendorUnitsDecodeCorrectly) {

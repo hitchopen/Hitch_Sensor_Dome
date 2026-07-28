@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/slam/BetweenFactor.h>
@@ -176,10 +177,18 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
       std::vector<Eigen::Isometry3d> tail_poses;
       imu_integration->integrate_imu(next_frame->stamp, trajectory_end_time, tail_state, tail_bias, tail_stamps, tail_poses);
 
-      // integrate_imu includes its initial state, which is already the last
-      // sample in the smoothed trajectory.
-      imu_stamps.insert(imu_stamps.end(), tail_stamps.begin() + 1, tail_stamps.end());
-      imu_poses.insert(imu_poses.end(), tail_poses.begin() + 1, tail_poses.end());
+      if (tail_stamps.size() != tail_poses.size() || tail_stamps.size() < 2) {
+        logger->warn(
+          "insufficient IMU data to extend sub-mapping deskew trajectory "
+          "from {:.6f} to scan end {:.6f}; trailing points will clamp",
+          next_frame->stamp,
+          trajectory_end_time);
+      } else {
+        // integrate_imu includes its initial state, which is already the last
+        // sample in the smoothed trajectory.
+        imu_stamps.insert(imu_stamps.end(), std::next(tail_stamps.begin()), tail_stamps.end());
+        imu_poses.insert(imu_poses.end(), std::next(tail_poses.begin()), tail_poses.end());
+      }
     }
 
     odom_frame->imu_rate_trajectory.resize(8, imu_stamps.size());

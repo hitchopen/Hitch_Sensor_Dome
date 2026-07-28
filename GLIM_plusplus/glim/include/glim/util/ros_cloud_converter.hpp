@@ -231,8 +231,8 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
     // This generalizes scripts/prep_bag.py's offline repair to the live pipeline.
     // It is a no-op for already-aligned / prepped data (|diff| < 1 s) and for
     // scan-relative encodings (max_time < 1.0, e.g. Ouster/Velodyne ns- or
-    // s-since-scan-start). GICP needs no equivalent: it anchors deskew at
-    // header.stamp and uses only relative (ts - min_ts) offsets.
+    // s-since-scan-start). GICP's Robin W path instead validates the same
+    // absolute Unix-second contract and deskews directly on that axis.
     if (!raw_points->times.empty()) {
       const double max_time = *std::max_element(raw_points->times.begin(), raw_points->times.end());
       // Anchor the rebase on the PRIMARY scan's earliest time, NOT the global
@@ -249,10 +249,11 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         (epoch_anchor_count > 0 && static_cast<size_t>(epoch_anchor_count) <= raw_points->times.size())
           ? static_cast<size_t>(epoch_anchor_count)
           : raw_points->times.size();
-      // [P3 FIX 2026-07-14] Skip the ts==0 "no valid time" sentinel when finding
-      // the anchor minimum (GICP's decoder skips it too): one zero-stamped point
-      // would otherwise pin min_time to 0 and rebase the entire sweep against
-      // epoch 0. Fall back to 0 only if EVERY anchor point was zero.
+      // Skip a generic driver's ts==0 "no valid time" sentinel when finding
+      // the anchor minimum: one zero-stamped point would otherwise pin
+      // min_time to epoch 0. The Hitch Robin W profile rejects such a cloud
+      // before extraction because its official ROS contract has no zero
+      // sentinel. Fall back to 0 only if every anchor point was zero.
       double min_time = 0.0;
       bool have_min = false;
       for (size_t i = 0; i < anchor_n; ++i) {

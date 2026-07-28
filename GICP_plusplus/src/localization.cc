@@ -11,6 +11,9 @@
  ***********************************************************/
 
 #include "gicp_localization/localization.h"
+#include "gicp_localization/lidar_fov_gate.hpp"
+#include "gicp_localization/map_manifest.hpp"
+#include "gicp_localization/seyond_timestamp.hpp"
 #include "gicp_localization/urdf_transforms.hpp"
 #include "dlio/utils.h"
 
@@ -33,6 +36,11 @@
 namespace {
 
 constexpr double kRadToDeg = 57.29577951308232;
+using gicp_localization::SeyondPointTimeRange;
+using gicp_localization::decodeSeyondPointTimeRange;
+using gicp_localization::kSeyondFrameDurationSecondsDefault;
+using gicp_localization::pointTimeEndpointDelta;
+using gicp_localization::seyondCloudTimeContractValid;
 
 bool matrixFinite(const Eigen::Matrix4f& pose) {
   return pose.array().isFinite().all();
@@ -118,20 +126,17 @@ double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
 
   const auto abs_eigenvalues = solver.eigenvalues().cwiseAbs();
   const double max_eigenvalue = abs_eigenvalues.maxCoeff();
+  const double min_eigenvalue = abs_eigenvalues.minCoeff();
 
-  double min_nonzero_eigenvalue = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < abs_eigenvalues.size(); ++i) {
-    const double value = abs_eigenvalues[i];
-    if (value > 1e-12 && value < min_nonzero_eigenvalue) {
-      min_nonzero_eigenvalue = value;
-    }
-  }
-
-  if (!std::isfinite(max_eigenvalue) || !std::isfinite(min_nonzero_eigenvalue)) {
+  // A structural zero is the strongest possible degeneracy signal. Excluding
+  // zero eigenvalues from the denominator would turn a rank-five Hessian into
+  // an apparently well-conditioned one and disable the partial-update guard.
+  if (!std::isfinite(max_eigenvalue) || max_eigenvalue <= 0.0 ||
+      min_eigenvalue <= 1e-12) {
     return std::numeric_limits<double>::infinity();
   }
 
-  return max_eigenvalue / min_nonzero_eigenvalue;
+  return max_eigenvalue / min_eigenvalue;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +145,7 @@ double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
 // ill-conditioned, project the GICP correction onto the well-constrained
 // eigen-subspace and keep the IMU prior along the degenerate directions.
 //
-// Frame handling: nano_gicp's final hessian is parameterized as [omega; t]
+// Frame handling: small_gicp's final hessian is parameterized as [omega; t]
 // with the rotation taken about the WORLD ORIGIN (jacobian block is
 // skew(transformed_point)). With the vehicle ~hundreds of metres from the map
 // origin, a yaw about the origin is numerically indistinguishable from a
@@ -323,13 +328,55 @@ DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& h
   return out;
 }
 
-// Find x/y/z field offsets in a PointCloud2 message. Returns false if any are missing.
+size_t pointFieldElementSize(uint8_t datatype) {
+  switch (datatype) {
+    case sensor_msgs::msg::PointField::INT8:
+    case sensor_msgs::msg::PointField::UINT8:
+      return 1;
+    case sensor_msgs::msg::PointField::INT16:
+    case sensor_msgs::msg::PointField::UINT16:
+      return 2;
+    case sensor_msgs::msg::PointField::INT32:
+    case sensor_msgs::msg::PointField::UINT32:
+    case sensor_msgs::msg::PointField::FLOAT32:
+      return 4;
+    case sensor_msgs::msg::PointField::FLOAT64:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+bool pointFieldFitsStep(
+    const sensor_msgs::msg::PointField& field, uint32_t point_step) {
+  const size_t element_size = pointFieldElementSize(field.datatype);
+  if (element_size == 0 || field.count == 0 ||
+      static_cast<size_t>(field.count) >
+          std::numeric_limits<size_t>::max() / element_size) {
+    return false;
+  }
+  const size_t field_size = element_size * static_cast<size_t>(field.count);
+  return static_cast<size_t>(field.offset) <= point_step &&
+         field_size <=
+             static_cast<size_t>(point_step) -
+                 static_cast<size_t>(field.offset);
+}
+
+// Find float32 x/y/z field offsets in a PointCloud2 message. Returns false if
+// any field is missing, malformed, or extends beyond point_step.
 bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
   x_off = y_off = z_off = -1;
   for (const auto& f : msg.fields) {
-    if (f.name == "x") x_off = static_cast<int>(f.offset);
-    else if (f.name == "y") y_off = static_cast<int>(f.offset);
-    else if (f.name == "z") z_off = static_cast<int>(f.offset);
+    const bool valid_coordinate =
+        f.datatype == sensor_msgs::msg::PointField::FLOAT32 &&
+        f.count == 1 && pointFieldFitsStep(f, msg.point_step);
+    if (f.name == "x" && valid_coordinate) {
+      x_off = static_cast<int>(f.offset);
+    } else if (f.name == "y" && valid_coordinate) {
+      y_off = static_cast<int>(f.offset);
+    } else if (f.name == "z" && valid_coordinate) {
+      z_off = static_cast<int>(f.offset);
+    }
   }
   return x_off >= 0 && y_off >= 0 && z_off >= 0;
 }
@@ -342,7 +389,7 @@ bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y
 // layout is byte-identical to the primary: same point_step, same endianness, and
 // the same ordered set of field {name, offset, datatype, count}. A same-point_step
 // cloud with different offsets/datatypes would otherwise be silently misread.
-// This is O(#fields) (~10-20 per Luminar scan) — negligible next to GICP / voxel
+// This is O(#fields) — negligible next to GICP / voxel
 // filtering / deskew, which run in ms. Returns true on match; on mismatch returns
 // false and sets `reason` to a short human-readable description for logging.
 bool auxSchemaMatchesPrimary(const sensor_msgs::msg::PointCloud2& aux,
@@ -398,201 +445,6 @@ void transformCloudData(uint8_t* data, size_t num_points, uint32_t point_step,
   }
 }
 
-const char* pointFieldDatatypeName(uint8_t datatype) {
-  switch (datatype) {
-    case sensor_msgs::msg::PointField::INT8:    return "INT8";
-    case sensor_msgs::msg::PointField::UINT8:   return "UINT8";
-    case sensor_msgs::msg::PointField::INT16:   return "INT16";
-    case sensor_msgs::msg::PointField::UINT16:  return "UINT16";
-    case sensor_msgs::msg::PointField::INT32:   return "INT32";
-    case sensor_msgs::msg::PointField::UINT32:  return "UINT32";
-    case sensor_msgs::msg::PointField::FLOAT32: return "FLOAT32";
-    case sensor_msgs::msg::PointField::FLOAT64: return "FLOAT64";
-    default:                                    return "UNKNOWN";
-  }
-}
-
-// One-shot diagnostic: print everything we can extract about the incoming
-// PointCloud2's timestamp field so a developer can decide which bit-level
-// interpretation the live driver actually uses. See
-// docs/luminar_timestamp_diagnostic_guide.pdf for how to read this output.
-//
-// Fires only on the first cloud (guarded by std::call_once at the caller),
-// always emits the lines regardless of localization/verbose so a single
-// test run produces the answer.
-//
-// Output format (per line):
-//   [LUMINAR_TS_DIAG] <key>: <value>
-// The block is bracketed by [LUMINAR_TS_DIAG] BEGIN / END markers so it's
-// easy to grep out of a noisy log.
-void logTimestampDiagnostic(const sensor_msgs::msg::PointCloud2& pc,
-                            int ts_off, uint8_t ts_datatype, int ts_count,
-                            const char* sensor_name) {
-  std::fprintf(stderr, "[LUMINAR_TS_DIAG] BEGIN\n");
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG] sensor_type=%s  point_step=%u  "
-               "num_points=%u  width=%u  height=%u  is_bigendian=%d  "
-               "header.stamp=%u.%09u  frame_id='%s'\n",
-               sensor_name, pc.point_step,
-               static_cast<unsigned>(pc.data.size() / std::max<uint32_t>(pc.point_step, 1u)),
-               pc.width, pc.height, pc.is_bigendian ? 1 : 0,
-               pc.header.stamp.sec, pc.header.stamp.nanosec,
-               pc.header.frame_id.c_str());
-  std::fprintf(stderr, "[LUMINAR_TS_DIAG] fields (offset, datatype, count, name):\n");
-  for (const auto& f : pc.fields) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]   off=%-4u  type=%-7s  count=%-3u  name='%s'\n",
-                 f.offset, pointFieldDatatypeName(f.datatype), f.count,
-                 f.name.c_str());
-  }
-  if (ts_off < 0) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG] no timestamp field detected (no field named "
-                 "t/time/time_stamp/timestamp). Deskew cannot use per-point times.\n");
-    std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
-    std::fflush(stderr);
-    return;
-  }
-  // Implied byte size per datatype, times count.
-  // (count is normally 1 except for UINT8 where count carries the length of
-  // the byte run, e.g. UINT8 count=8 = 8 raw bytes.)
-  int bytes_per_elem = 1;
-  switch (ts_datatype) {
-    case sensor_msgs::msg::PointField::INT8:
-    case sensor_msgs::msg::PointField::UINT8:    bytes_per_elem = 1; break;
-    case sensor_msgs::msg::PointField::INT16:
-    case sensor_msgs::msg::PointField::UINT16:   bytes_per_elem = 2; break;
-    case sensor_msgs::msg::PointField::INT32:
-    case sensor_msgs::msg::PointField::UINT32:
-    case sensor_msgs::msg::PointField::FLOAT32:  bytes_per_elem = 4; break;
-    case sensor_msgs::msg::PointField::FLOAT64:  bytes_per_elem = 8; break;
-    default:                                      bytes_per_elem = 0; break;
-  }
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG] timestamp_field: off=%d  type=%s  count=%d  "
-               "implied_byte_size=%d\n",
-               ts_off, pointFieldDatatypeName(ts_datatype), ts_count,
-               bytes_per_elem * ts_count);
-
-  // Walk up to 3 sample points (first, midpoint, last) and dump their 8
-  // timestamp bytes interpreted four different ways.  This lets the developer
-  // pattern-match what the driver actually emits without instrumenting the
-  // driver itself.
-  const uint32_t step = pc.point_step;
-  const size_t num_points = pc.data.size() / std::max<uint32_t>(step, 1u);
-  if (num_points == 0 || ts_off + 8 > static_cast<int>(step)) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG] (no samples to dump -- empty cloud or "
-                 "field extends past point_step)\n");
-    std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
-    std::fflush(stderr);
-    return;
-  }
-  const size_t sample_indices[3] = {
-      0u, num_points / 2u,
-      num_points > 0u ? num_points - 1u : 0u};
-  const char* sample_labels[3] = {"point[0]    ", "point[mid]  ", "point[N-1]  "};
-
-  uint64_t ts_uint64[3] = {0, 0, 0};
-  double   ts_double[3] = {0.0, 0.0, 0.0};
-
-  for (int s = 0; s < 3; ++s) {
-    const size_t idx = sample_indices[s];
-    const uint8_t* ptr = pc.data.data() + idx * step + ts_off;
-
-    // Raw 8 bytes (little-endian dump as hex).
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG] %s idx=%zu  raw=%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x\n",
-                 sample_labels[s], idx, ptr[0], ptr[1], ptr[2], ptr[3],
-                 ptr[4], ptr[5], ptr[6], ptr[7]);
-
-    // Interpretation A: bytes are a uint64 (e.g. PTP ns since epoch, or ns
-    // since boot, or ns since scan start).
-    uint64_t u64 = 0;
-    std::memcpy(&u64, ptr, sizeof(uint64_t));
-    ts_uint64[s] = u64;
-
-    // Interpretation B: bytes are an IEEE-754 double encoded as seconds.
-    double d_sec = 0.0;
-    std::memcpy(&d_sec, ptr, sizeof(double));
-    ts_double[s] = d_sec;
-
-    // Interpretation C: bytes are an IEEE-754 double encoded as nanoseconds
-    // (i.e. d_sec interpreted as ns directly).
-    const double d_ns = d_sec;  // same memory, just rename for clarity.
-
-    // Interpretation D: two uint32s (PTP layout: secs in low half, ns offset
-    // in high half, or vice versa).
-    uint32_t u32_lo = 0, u32_hi = 0;
-    std::memcpy(&u32_lo, ptr, sizeof(uint32_t));
-    std::memcpy(&u32_hi, ptr + 4, sizeof(uint32_t));
-
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]              as_uint64=%-20lu  "
-                 "as_double_sec=%.9f  as_double_ns=%.3e  "
-                 "as_uint32_pair=(lo=%-10u hi=%-10u)\n",
-                 static_cast<unsigned long>(u64), d_sec, d_ns,
-                 u32_lo, u32_hi);
-  }
-
-  // Deltas between adjacent samples in each interpretation, to make collapse
-  // obvious at a glance.
-  const int64_t d_u64_01 =
-      static_cast<int64_t>(ts_uint64[1]) - static_cast<int64_t>(ts_uint64[0]);
-  const int64_t d_u64_0N =
-      static_cast<int64_t>(ts_uint64[2]) - static_cast<int64_t>(ts_uint64[0]);
-  const double  d_dbl_01 = ts_double[1] - ts_double[0];
-  const double  d_dbl_0N = ts_double[2] - ts_double[0];
-
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG] deltas (mid - first / last - first):\n");
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG]   as_uint64_ns:    mid-first=%-15ld  "
-               "last-first=%-15ld\n",
-               static_cast<long>(d_u64_01), static_cast<long>(d_u64_0N));
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG]   as_double_sec:   mid-first=%.9f  "
-               "last-first=%.9f\n",
-               d_dbl_01, d_dbl_0N);
-
-  // Heuristic verdict: order-of-magnitude check on each interpretation,
-  // with the assumption that a healthy 10 Hz LiDAR scan should span ~0.1 s.
-  // This is just a hint; the developer reads the raw lines above to confirm.
-  auto plausible_seconds = [](double x) {
-    return x > 1e-4 && x < 1.0;  // within 0.1 ms to 1 s
-  };
-  auto plausible_ns_as_uint64 = [](int64_t x) {
-    return x > 100000 && x < 1000000000;  // 0.1 ms to 1 s, in ns
-  };
-  std::fprintf(stderr,
-               "[LUMINAR_TS_DIAG] verdict (heuristic; check raw lines to confirm):\n");
-  if (plausible_ns_as_uint64(d_u64_0N) && !plausible_seconds(d_dbl_0N)) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]   uint64 ns interpretation looks plausible "
-                 "(span %ld ns ~= %.3f ms)\n",
-                 static_cast<long>(d_u64_0N), d_u64_0N * 1e-6);
-  } else if (plausible_seconds(d_dbl_0N) && !plausible_ns_as_uint64(d_u64_0N)) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]   FLOAT64 seconds interpretation looks "
-                 "plausible (span %.6f s ~= %.3f ms). Current code memcpys as "
-                 "uint64, which scrambles this.  Read as double instead.\n",
-                 d_dbl_0N, d_dbl_0N * 1000.0);
-  } else if (d_u64_0N == 0 && d_dbl_0N == 0.0) {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]   timestamps appear COLLAPSED (zero span "
-                 "in both interpretations). Driver likely fills every point "
-                 "with the same scan-level stamp.\n");
-  } else {
-    std::fprintf(stderr,
-                 "[LUMINAR_TS_DIAG]   verdict unclear -- see raw lines above. "
-                 "Possible: per-scan timestamps with random jitter, or a "
-                 "format we don't recognise.\n");
-  }
-  std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
-  std::fflush(stderr);
-}
-
 bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
                    uint8_t& time_datatype, int& time_count) {
   time_off = -1;
@@ -609,77 +461,9 @@ bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
   return false;
 }
 
-bool hasSeyondAbsoluteTimeAxis(const sensor_msgs::msg::PointCloud2& msg,
-                               int time_off) {
-  const size_t num_points = static_cast<size_t>(msg.width) * msg.height;
-  if (msg.is_bigendian || num_points == 0 || msg.point_step == 0 ||
-      time_off < 0 ||
-      static_cast<size_t>(time_off) + sizeof(double) > msg.point_step ||
-      num_points > std::numeric_limits<size_t>::max() / msg.point_step ||
-      msg.data.size() < num_points * static_cast<size_t>(msg.point_step)) {
-    return false;
-  }
-
-  constexpr double kMinEpochSeconds = 1.0e6;
-  constexpr double kMaxEpochSeconds = 3.0e9;
-  double first_point_s = std::numeric_limits<double>::infinity();
-  for (size_t i = 0; i < num_points; ++i) {
-    double point_s = 0.0;
-    std::memcpy(
-        &point_s,
-        msg.data.data() + i * static_cast<size_t>(msg.point_step) + time_off,
-        sizeof(double));
-    if (!std::isfinite(point_s) || point_s < kMinEpochSeconds ||
-        point_s > kMaxEpochSeconds) {
-      return false;
-    }
-    first_point_s = std::min(first_point_s, point_s);
-  }
-  if (!std::isfinite(first_point_s)) return false;
-
-  const double header_s =
-      static_cast<double>(msg.header.stamp.sec) +
-      static_cast<double>(msg.header.stamp.nanosec) * 1.0e-9;
-  return std::isfinite(header_s) && std::abs(first_point_s - header_s) <= 1.0;
-}
-
-// Luminar stores hardware-clock ns in the timestamp union slot (8 raw bytes, not IEEE double).
-inline uint64_t luminarPointTimestampNs(const PointType& pt) {
-  uint64_t ts = 0;
-  std::memcpy(&ts, &pt.timestamp, sizeof(uint64_t));
-  return ts;
-}
-
 inline void clearPointTimeUnion(PointType& pt) {
   const uint64_t zero = 0;
   std::memcpy(&pt.timestamp, &zero, sizeof(uint64_t));
-}
-
-// Decode a Luminar per-point ABSOLUTE epoch timestamp (uint64 ns) directly from
-// PointCloud2 bytes. Single source of truth for which Luminar time encodings are
-// accepted, shared by copyPointTimeFromCloud() (the per-point reader) and the
-// multi-LiDAR deskew anchor capture in mergeAuxClouds(), so the two can never
-// diverge on accepted formats. Returns false for an unsupported datatype.
-//   * UINT8[8] / FLOAT64 -> raw uint64 epoch ns (8 bytes, little-endian)
-//
-// Only 8-byte carriers are accepted because the whole Luminar path treats these
-// times as ABSOLUTE epoch ns: mergeAuxClouds() leaves them unshifted and
-// deskewPointcloud() anchors on (ts - primary_min). A 32-bit field (UINT32)
-// cannot hold an absolute epoch (it wraps every ~4.29 s) -- it would be a
-// scan-relative counter, which this absolute path would silently misinterpret
-// (dropping the inter-scan offset between aux and primary). So UINT32 is
-// intentionally REJECTED here: a Luminar driver emitting UINT32 is unsupported
-// and degrades to "no per-point time" (rigid transform) rather than corrupting
-// deskew. `bytes_avail` (the field's room within point_step) guards the 8-byte
-// read against a malformed/short time field.
-inline bool luminarRawTimestampNsFromBytes(const uint8_t* tp, uint8_t datatype, int count, size_t bytes_avail, uint64_t& out) {
-  if ((datatype == sensor_msgs::msg::PointField::FLOAT64 ||
-       (datatype == sensor_msgs::msg::PointField::UINT8 && count == 8)) &&
-      bytes_avail >= sizeof(uint64_t)) {
-    std::memcpy(&out, tp, sizeof(uint64_t));
-    return true;
-  }
-  return false;
 }
 
 // Copy per-point time from PointCloud2 into the dlio::Point union for the configured sensor.
@@ -693,14 +477,6 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
   const size_t bytes_avail = point_step - static_cast<uint32_t>(time_off);
 
   switch (sensor) {
-    case dlio::SensorType::LUMINAR: {
-      uint64_t ts_raw = 0;
-      if (!luminarRawTimestampNsFromBytes(tp, time_datatype, time_count, bytes_avail, ts_raw)) {
-        return;
-      }
-      std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
-      return;
-    }
     case dlio::SensorType::OUSTER: {
       uint32_t t_ns = 0;
       switch (time_datatype) {
@@ -745,25 +521,10 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
     }
     case dlio::SensorType::SEYOND:
     case dlio::SensorType::HESAI: {
-      double t_s = 0.;
-      switch (time_datatype) {
-        case sensor_msgs::msg::PointField::FLOAT64:
-          if (bytes_avail >= sizeof(double)) {
-            std::memcpy(&t_s, tp, sizeof(double));
-          }
-          break;
-        case sensor_msgs::msg::PointField::FLOAT32: {
-          float t_f = 0.f;
-          if (bytes_avail >= sizeof(float)) {
-            std::memcpy(&t_f, tp, sizeof(float));
-            t_s = static_cast<double>(t_f);
-          }
-          break;
-        }
-        default:
-          break;
+      if (time_datatype == sensor_msgs::msg::PointField::FLOAT64 &&
+          time_count == 1 && bytes_avail >= sizeof(double)) {
+        std::memcpy(&dst.timestamp, tp, sizeof(double));
       }
-      dst.timestamp = t_s;
       return;
     }
     case dlio::SensorType::LIVOX: {
@@ -789,32 +550,6 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
   }
 }
 
-void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType>& cloud,
-                              size_t unique_ros_times) {
-  if (cloud.points.empty()) {
-    return;
-  }
-  uint64_t tmin = std::numeric_limits<uint64_t>::max();
-  uint64_t tmax = 0;
-  for (const auto& pt : cloud.points) {
-    const uint64_t ts = luminarPointTimestampNs(pt);
-    tmin = std::min(tmin, ts);
-    tmax = std::max(tmax, ts);
-  }
-  const size_t mid = cloud.points.size() / 2;
-  const uint64_t ts0 = luminarPointTimestampNs(cloud.points.front());
-  const uint64_t ts_mid = luminarPointTimestampNs(cloud.points[mid]);
-  const uint64_t tsN = luminarPointTimestampNs(cloud.points.back());
-  std::fprintf(stderr,
-               "[LUMINAR_DBG] %zu pts, %zu unique_ros_times, ts0=%lu tsMid=%lu tsN=%lu "
-               "span_ns=%ld (minmax_span=%ld)\n",
-               num_points, unique_ros_times, static_cast<unsigned long>(ts0),
-               static_cast<unsigned long>(ts_mid), static_cast<unsigned long>(tsN),
-               static_cast<long>(static_cast<int64_t>(tsN) - static_cast<int64_t>(ts0)),
-               static_cast<long>(static_cast<int64_t>(tmax) - static_cast<int64_t>(tmin)));
-  std::fflush(stderr);
-}
-
 // Shift per-point timestamps by `dt` seconds to rebase an aux scan's per-point
 // times from its own header.stamp onto the merged cloud's primary header.stamp.
 //
@@ -822,45 +557,16 @@ void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType
 //   * SCAN-RELATIVE encodings (FLOAT32/FLOAT64 seconds-since-scan-start,
 //     UINT32 nanoseconds-since-scan-start) -> ADD dt so the value reads as
 //     "seconds since primary scan start".
-//   * ABSOLUTE-EPOCH encodings (Luminar Iris uint64 PTP epoch ns) -> DO NOT
-//     shift. The downstream deskewer subtracts the merged cloud's
-//     header.stamp to get a scan-relative offset, which already gives the
-//     right (T_aux - T_primary + intra-aux-offset) when the value is left
-//     at its absolute capture time. Shifting an absolute time by dt would
-//     double-count the inter-scan offset and corrupt deskew.
-//
-// Luminar timestamp format (Luminar Iris Data Output Specification v1.3.0):
-//   - The sensor does NOT emit a single uint64 epoch-ns field. It carries
-//     48-bit integer epoch SECONDS once per packet header (§2.1, "PTP
-//     Timestamp - seconds", UQ48.0) and a 32-bit SUB-SECOND NANOSECOND
-//     count per ray (§2.2 / §2.6.3, "PTP Timestamp - nanoseconds", UQ32.0)
-//     that wraps every 1 s. All fields are little-endian (§2).
-//   - The uint64 epoch-ns this code reads is the upstream ROS driver's
-//     reconstruction = header_seconds*1e9 + ray_nanoseconds. Correctness
-//     depends on the driver performing that combination; a driver that
-//     forwarded the bare 32-bit ns (sub-second sawtooth) would break deskew
-//     across each 1 s rollover. Verify against the actual Luminar driver,
-//     not the datasheet. (The "epoch time" guidance lives in the PTP
-//     sections of the Product Information Guide, not the data layout.)
-//
-// `luminar_uint64=true` forces the 8 bytes at the time field to be read as
-// uint64 regardless of declared datatype, because Luminar publishes the raw
-// uint64 bits even when the field is mislabelled FLOAT64; generic FP
-// arithmetic on those bits would scramble them.
-// Hitch Sensor Dome note: Seyond Robin W emits numeric FLOAT64 Unix seconds.
-// The decoded-magnitude gate below therefore leaves its absolute point times
-// unchanged during concatenation.
+//   * ABSOLUTE-EPOCH encodings (including Robin W FLOAT64 Unix seconds) ->
+//     DO NOT shift. Each value already identifies the point's capture time on
+//     the shared PTP axis; adding the header delta would double-count it.
 void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
-                          double dt, bool luminar_uint64) {
+                          double dt, bool absolute_time) {
   if (time_off < 0) return;
+  (void)time_count;
 
-  // Absolute-epoch path (Luminar Iris UINT8[8]): leave the per-point values
-  // untouched. Each point already carries its absolute capture time; the
-  // deskewer's t_i - merged_header.stamp computation in preprocessPointCloud
-  // produces the correct intra-scan offset for both primary and aux points
-  // without any rebasing here.
-  if (luminar_uint64) {
+  if (absolute_time) {
     (void)dt;
     return;
   }
@@ -924,12 +630,7 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds
-        // (driver reconstruction of header seconds + per-ray nanoseconds;
-        // see this function's header comment block for the format and the
-        // deskew-correctness argument). Values are absolute capture times --
-        // leave them untouched. For any other UINT8 count (e.g. raw byte
-        // runs that are not timestamps), there is nothing sensible to shift.
+        // Byte-array timestamp carriers are unsupported in this repository.
         break;
       }
       default:
@@ -1012,6 +713,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
+  this->t_prior_stamp_ = 0.0;
   this->observer_dt_ = 0.0;
   this->last_scan_input_frame_.clear();
   this->last_raw_point_count_ = 0;
@@ -1080,14 +782,11 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->gicp.setRotationEpsilon(this->gicp_rotation_epsilon_);
   this->gicp.setDebugPrint(this->debug_lm_print_);
 
-  // Set target (map). setInputTarget() builds the nanoflann kd-tree
-  // synchronously; calculateTargetCovariances() then iterates it once
-  // to pre-compute per-target covariances. By the time the first scan
-  // arrives, the heavyweight target-side work is already done.
-  this->gicp.setInputTarget(this->map_cloud);
-  if (!this->gicp.calculateTargetCovariances()) {
-    RCLCPP_ERROR(this->get_logger(), "Failed to calculate map covariances! GICP will not work correctly.");
-    throw std::runtime_error("Failed to calculate target covariances");
+  // Prepare either the legacy full-map target or the bounded local-map index.
+  // In both modes target covariances are computed once at startup.
+  if (!this->prepareMapTarget()) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to prepare the GICP map target");
+    throw std::runtime_error("Failed to prepare GICP map target");
   }
 
   // ---- Hitch Sensor Dome — GICP warm-start ----
@@ -1125,6 +824,14 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   }
 
   // Setup subscribers
+  auto origin_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+  origin_qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
+  origin_qos.durability(rclcpp::DurabilityPolicy::TransientLocal);
+  this->enu_origin_sub = this->create_subscription<std_msgs::msg::String>(
+      "enu_origin", origin_qos,
+      std::bind(&gicp_localization::LocalizationNode::callbackEnuOrigin,
+                this, std::placeholders::_1));
+
   this->pointcloud_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto pointcloud_sub_opt = rclcpp::SubscriptionOptions();
   pointcloud_sub_opt.callback_group = this->pointcloud_cb_group;
@@ -1226,7 +933,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
           RCLCPP_WARN(this->get_logger(),
                       "No IMU received on '%s' (0 publishers). Check the "
                       "imu_topic launch arg. The Hitch Sensor Dome default is "
-                      "'/imu/data' (Atlas Duo). Run `ros2 topic list | grep -i imu` "
+                      "'/imu/data' (low-latency Atlas driver). Run "
+                      "`ros2 topic list | grep -i imu` "
                       "to see available IMU topics.",
                       imu_topic.c_str());
         } else {
@@ -1239,8 +947,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   // Optional ground-truth odom subscriber for divergence cross-check.
   // Topic is remappable as "gt_odom"; the dome launch defaults it to
-  // /odom_rtk_only (nav_sat_gated_odom's RTK-gated republish of the Atlas Duo
-  // INS odometry). The GT body frame is taken from msg->child_frame_id and
+  // /gps_p1/filtered_odom_rtk_fixed (the adapter's fixed-only output). The GT
+  // body frame is taken from msg->child_frame_id and
   // composed into base_frame via the cached TF (see composeGtPoseInBase).
   if (this->gt_odom_enabled_) {
     // MutuallyExclusive: serializes GT callbacks against each other so the
@@ -1264,8 +972,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
     // Hitch Sensor Dome — one-shot warning when gt_odom never arrives.
     // The localizer's RTK-driven init and GT-snap recovery paths both
     // require messages on this topic. On the Hitch dome, the message
-    // source is nav_sat_gated_odom, which silently drops everything if
-    // /gps/fix isn't RTK-fixed. After 10 s with zero arrivals, emit a
+    // source is the adapter fixed-only stream, which stops when the solution is
+    // float or invalid. After 10 s with zero arrivals, emit a
     // bold-yellow one-shot warning to surface a likely misconfiguration.
     this->gt_odom_health_timer_ = this->create_wall_timer(
         std::chrono::seconds(10),
@@ -1295,18 +1003,16 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
             "%s  publishers on that topic: %zu%s", YELLOW, pub_count, RESET);
           if (pub_count == 0) {
             RCLCPP_WARN(this->get_logger(),
-              "%s  Likely cause: nav_sat_gated_odom is not running, OR the "
-              "gt_odom_topic launch arg points at a topic no node publishes."
-              " Verify with `ros2 topic list | grep odom` and confirm the "
-              "gating helper is up.%s",
+              "%s  Likely cause: the adapter is not running, OR the "
+              "gt_odom_topic launch arg points at a topic no node publishes. "
+              "Verify `/gps_p1/filtered_odom_rtk_fixed` and the adapter.%s",
               YELLOW, RESET);
           } else {
             RCLCPP_WARN(this->get_logger(),
-              "%s  Publishers exist but no messages have arrived — typical "
-              "cause is that /gps/fix has never reported STATUS_GBAS_FIX "
-              "since startup (cold-boot RTK convergence, no NTRIP, blocked "
-              "sky view). Check `ros2 topic echo /gps/fix --field status` "
-              "and resolve before relying on rtk_init or gt_recovery.%s",
+              "%s  Publishers exist but no messages have arrived. The adapter "
+              "has not observed a genuine RTK_FIXED solution (convergence, "
+              "corrections, or sky view). Inspect the adapter summary before "
+              "relying on rtk_init or gt_recovery.%s",
               YELLOW, RESET);
           }
           RCLCPP_WARN(this->get_logger(),
@@ -1446,7 +1152,12 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->applyInitialPoseFromParams();
 }
 
-gicp_localization::LocalizationNode::~LocalizationNode() {}
+gicp_localization::LocalizationNode::~LocalizationNode() {
+  ++this->local_map_generation_;
+  if (this->local_map_rebuild_thread_.joinable()) {
+    this->local_map_rebuild_thread_.join();
+  }
+}
 
 bool gicp_localization::LocalizationNode::loadUTMTransform(const std::string& path) {
   std::ifstream f(path);
@@ -1496,6 +1207,11 @@ void gicp_localization::LocalizationNode::getParams() {
 
   // Map parameters
   this->declare_parameter<std::string>("localization/map_path", "");
+  this->declare_parameter<std::string>("localization/map_manifest_path", "");
+  this->declare_parameter<std::string>("localization/expected_enu_origin", "");
+  this->declare_parameter<bool>("localization/require_map_manifest", true);
+  this->declare_parameter<bool>("localization/require_live_enu_origin", true);
+  this->declare_parameter<double>("localization/enu_origin_tolerance_m", 0.25);
   this->declare_parameter<std::string>("localization/utm_transform_path", "");
   this->declare_parameter<std::string>("localization/utm_frame", "utm");
   this->declare_parameter<bool>("localization/visualize_map", true);
@@ -1506,11 +1222,27 @@ void gicp_localization::LocalizationNode::getParams() {
   // per-scan search cost with negligible accuracy loss at 0.5 m scan voxels.
   // 0.0 disables (use the full-resolution map).
   this->declare_parameter<double>("localization/map_voxel_size", 0.3);
+  this->declare_parameter<bool>("localization/local_map/enabled", true);
+  this->declare_parameter<double>("localization/local_map/radius", 150.0);
+  this->declare_parameter<int>("localization/local_map/min_points", 1000);
+  this->declare_parameter<int>("localization/local_map/build_threads", 1);
   this->declare_parameter<double>("localization/map_rotation/roll_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/pitch_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/yaw_deg", 0.0);
 
   this->get_parameter("localization/map_path", this->map_path_);
+  this->get_parameter("localization/map_manifest_path", this->map_manifest_path_);
+  this->get_parameter("localization/expected_enu_origin", this->expected_enu_origin_);
+  this->get_parameter("localization/require_map_manifest", this->require_map_manifest_);
+  this->get_parameter("localization/require_live_enu_origin",
+                      this->require_live_enu_origin_);
+  this->get_parameter("localization/enu_origin_tolerance_m",
+                      this->enu_origin_tolerance_m_);
+  if (!std::isfinite(this->enu_origin_tolerance_m_) ||
+      this->enu_origin_tolerance_m_ <= 0.0) {
+    throw std::invalid_argument(
+        "localization/enu_origin_tolerance_m must be finite and positive");
+  }
 
   std::string utm_transform_path;
   this->get_parameter("localization/utm_transform_path", utm_transform_path);
@@ -1518,11 +1250,23 @@ void gicp_localization::LocalizationNode::getParams() {
   this->utm_enabled_ = false;
   this->T_utm_map_ = Eigen::Matrix4f::Identity();
   if (!utm_transform_path.empty()) {
-    this->utm_enabled_ = loadUTMTransform(utm_transform_path);
+    throw std::invalid_argument(
+        "localization/utm_transform_path is incompatible with the canonical "
+        "ENU map export; leave it empty because inverse(T_world_utm) was "
+        "already applied by export_glim_dump_to_pcd.py");
   }
   this->get_parameter("localization/visualize_map", this->visualize_map_);
   this->get_parameter("localization/map_voxel_size_vis", this->map_voxel_size_vis_);
   this->get_parameter("localization/map_voxel_size", this->map_voxel_size_);
+  this->get_parameter("localization/local_map/enabled", this->local_map_enable_);
+  this->get_parameter("localization/local_map/radius", this->local_map_radius_);
+  int local_map_min_points = 1000;
+  this->get_parameter("localization/local_map/min_points", local_map_min_points);
+  this->get_parameter(
+      "localization/local_map/build_threads", this->local_map_build_threads_);
+  this->local_map_min_points_ =
+      static_cast<size_t>(std::max(1, local_map_min_points));
+  this->local_map_build_threads_ = std::max(1, this->local_map_build_threads_);
   this->get_parameter("localization/map_rotation/roll_deg", this->map_roll_deg_);
   this->get_parameter("localization/map_rotation/pitch_deg", this->map_pitch_deg_);
   this->get_parameter("localization/map_rotation/yaw_deg", this->map_yaw_deg_);
@@ -1552,20 +1296,24 @@ void gicp_localization::LocalizationNode::getParams() {
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
 
-  // RTK quality gate (P1-native): drop gt_odom samples whose Atlas-reported
-  // position covariance exceeds the configured thresholds. Conservative
-  // defaults: gate ON; xy threshold 0.25 m^2 (~0.5 m std, comfortably above
-  // RTK-fixed and float-mode covariances measured on AV-24 ~ 5e-5 m^2);
-  // z threshold 1.0 m^2 (~1 m std, since GPS Z is naturally worse).
+  // Defense-in-depth covariance gate for the adapter's fixed-only odometry.
+  // These defaults match adapter/config/adapter.yaml.
   this->declare_parameter<bool>("localization/rtk_gate/enable", true);
-  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_xy", 0.25);
-  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_z", 1.0);
+  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_xy", 0.001);
+  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_z", 0.005);
   this->get_parameter("localization/rtk_gate/enable",
                       this->rtk_gate_enabled_);
   this->get_parameter("localization/rtk_gate/max_pose_var_xy",
                       this->rtk_gate_max_pose_var_xy_);
   this->get_parameter("localization/rtk_gate/max_pose_var_z",
                       this->rtk_gate_max_pose_var_z_);
+  if (!std::isfinite(this->rtk_gate_max_pose_var_xy_) ||
+      !std::isfinite(this->rtk_gate_max_pose_var_z_) ||
+      this->rtk_gate_max_pose_var_xy_ <= 0.0 ||
+      this->rtk_gate_max_pose_var_z_ <= 0.0) {
+    throw std::invalid_argument(
+        "localization/rtk_gate covariance limits must be finite and positive");
+  }
 
   // GT-driven pose recovery (optional). Independent of gt_odom/enable; recovery
   // requires the same subscriber to be active, so it implies gt_odom/enable.
@@ -1573,9 +1321,14 @@ void gicp_localization::LocalizationNode::getParams() {
   // Default matches cfg/localization.yaml (P2#3: raised from 1; per-frame
   // snapping masked dead-reckoning quality). Keep the two in sync.
   this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 5);
+  this->declare_parameter<double>(
+      "localization/gt_recovery/sanity_radius", 10.0);
   this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
   this->get_parameter("localization/gt_recovery/min_consecutive_failures",
                       this->gt_recovery_min_consecutive_failures_);
+  this->get_parameter(
+      "localization/gt_recovery/sanity_radius",
+      this->gt_recovery_sanity_radius_);
   if (this->gt_recovery_enabled_ && !this->gt_odom_enabled_) {
     RCLCPP_WARN(this->get_logger(),
                 "localization/gt_recovery/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
@@ -1583,6 +1336,12 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   if (this->gt_recovery_min_consecutive_failures_ < 1) {
     this->gt_recovery_min_consecutive_failures_ = 1;
+  }
+  if (!std::isfinite(this->gt_recovery_sanity_radius_) ||
+      this->gt_recovery_sanity_radius_ < 0.0) {
+    throw std::invalid_argument(
+        "localization/gt_recovery/sanity_radius must be finite and "
+        "non-negative");
   }
 
   this->get_parameter("localization/publish_tf", this->publish_tf_);
@@ -1654,6 +1413,14 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("gicp/yawGate/enable", true);
   this->declare_parameter<double>("gicp/yawGate/maxCorrDeg", 1.5);
   this->declare_parameter<double>("gicp/yawGate/fitnessRatio", 1.2);
+  // small_gicp can constrain attitude increments inside LM. Keep 6-DoF as the
+  // migration default so changing the backend does not also change vehicle
+  // dynamics without a Hitch replay. 4-DoF fixes roll/pitch; 3-DoF also fixes
+  // yaw. Soft prior information is disabled at zero.
+  this->declare_parameter<std::string>("gicp/dof/mode", "6dof");
+  this->declare_parameter<int>("gicp/dof/full6dofEveryN", 0);
+  this->declare_parameter<double>("gicp/prior/yawInfo", 0.0);
+  this->declare_parameter<double>("gicp/prior/rollPitchInfo", 0.0);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
@@ -1680,6 +1447,31 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/yawGate/enable", this->yaw_gate_enable_);
   this->get_parameter("gicp/yawGate/maxCorrDeg", this->yaw_gate_max_corr_deg_);
   this->get_parameter("gicp/yawGate/fitnessRatio", this->yaw_gate_fitness_ratio_);
+  this->get_parameter("gicp/dof/mode", this->gicp_dof_mode_);
+  this->get_parameter("gicp/dof/full6dofEveryN", this->gicp_full6dof_every_n_);
+  this->get_parameter("gicp/prior/yawInfo", this->gicp_prior_yaw_info_);
+  this->get_parameter("gicp/prior/rollPitchInfo", this->gicp_prior_rollpitch_info_);
+  if (this->gicp_dof_mode_ != "6dof" &&
+      this->gicp_dof_mode_ != "4dof" &&
+      this->gicp_dof_mode_ != "3dof") {
+    RCLCPP_WARN(this->get_logger(),
+                "Unknown gicp/dof/mode '%s'; using 6dof",
+                this->gicp_dof_mode_.c_str());
+    this->gicp_dof_mode_ = "6dof";
+  }
+  if (this->gicp_full6dof_every_n_ < 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "gicp/dof/full6dofEveryN cannot be negative; disabling it");
+    this->gicp_full6dof_every_n_ = 0;
+  }
+  if (!std::isfinite(this->gicp_prior_yaw_info_) ||
+      this->gicp_prior_yaw_info_ < 0.0) {
+    this->gicp_prior_yaw_info_ = 0.0;
+  }
+  if (!std::isfinite(this->gicp_prior_rollpitch_info_) ||
+      this->gicp_prior_rollpitch_info_ < 0.0) {
+    this->gicp_prior_rollpitch_info_ = 0.0;
+  }
   if (this->fitness_baseline_window_ < 3) this->fitness_baseline_window_ = 3;
   if (this->fitness_baseline_min_samples_ < 3) this->fitness_baseline_min_samples_ = 3;
   RCLCPP_INFO(this->get_logger(),
@@ -1695,6 +1487,12 @@ void gicp_localization::LocalizationNode::getParams() {
               this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
               this->yaw_gate_enable_ ? "ON" : "OFF",
               this->yaw_gate_max_corr_deg_, this->yaw_gate_fitness_ratio_);
+  RCLCPP_INFO(
+      this->get_logger(),
+      "small_gicp constraints: mode=%s, full_6dof_every_n=%d, "
+      "prior_info=[roll/pitch=%.1f,yaw=%.1f] rad^-2",
+      this->gicp_dof_mode_.c_str(), this->gicp_full6dof_every_n_,
+      this->gicp_prior_rollpitch_info_, this->gicp_prior_yaw_info_);
 
   // Preprocessing parameters
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
@@ -1704,6 +1502,41 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("dlio/preprocessing/cropBoxFilter/size", this->crop_size_);
   this->get_parameter("dlio/preprocessing/voxelFilter/use", this->vf_use_);
   this->get_parameter("dlio/preprocessing/voxelFilter/res", this->vf_res_);
+
+  if (!std::isfinite(this->map_voxel_size_) || this->map_voxel_size_ < 0.0) {
+    throw std::invalid_argument(
+        "localization/map_voxel_size must be finite and non-negative");
+  }
+  if (this->local_map_enable_) {
+    if (!std::isfinite(this->local_map_radius_) ||
+        this->local_map_radius_ <= 0.0) {
+      throw std::invalid_argument(
+          "localization/local_map/radius must be finite and positive");
+    }
+    if (!std::isfinite(this->crop_size_) || this->crop_size_ <= 0.0 ||
+        this->crop_size_ >= 1000.0) {
+      throw std::invalid_argument(
+          "bounded local-map registration requires a finite, enabled "
+          "dlio/preprocessing/cropBoxFilter/size");
+    }
+    if (!std::isfinite(this->gicp_max_corr_dist_) ||
+        this->gicp_max_corr_dist_ < 0.0) {
+      throw std::invalid_argument(
+          "gicp/maxCorrespondenceDistance must be finite and non-negative");
+    }
+    const double scan_xy_extent = std::sqrt(2.0) * this->crop_size_;
+    this->local_map_valid_center_offset_ =
+        this->local_map_radius_ - scan_xy_extent - this->gicp_max_corr_dist_;
+    if (this->local_map_valid_center_offset_ <= 0.0) {
+      throw std::invalid_argument(
+          "localization/local_map/radius must exceed sqrt(2) * "
+          "cropBoxFilter/size + gicp/maxCorrespondenceDistance");
+    }
+    this->local_map_grid_size_ = this->local_map_radius_;
+    this->local_map_rebuild_distance_ = std::min(
+        0.2 * this->local_map_radius_,
+        0.5 * this->local_map_valid_center_offset_);
+  }
 
   // IMU and deskewing parameters
   this->declare_parameter<bool>("dlio/deskew", true);
@@ -1717,14 +1550,67 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/flip_y", false);
   this->get_parameter("localization/flip_y", this->flip_y_);
 
-  // Multi-LiDAR concatenation: merge nearest-in-time aux scans into the primary
-  // PointCloud2 before the existing pipeline runs. Aux XYZ are transformed into
-  // the primary sensor frame via TF (URDF), and per-point timestamps are rebased
-  // by the inter-header dt so the merged sweep shares one clock.
+  // Raw-cloud quality gate. Robin W's nominal vertical FOV is 30 degrees; a
+  // substantially narrower point distribution removes the vertical structure
+  // that stabilizes scan registration. The gate runs before crop, deskew, or
+  // multi-LiDAR transforms and rejects each sensor stream independently.
+  this->declare_parameter<double>(
+      "localization/lidar_quality/min_vertical_fov_deg",
+      kDefaultMinimumVerticalFovDeg);
+  this->declare_parameter<int>(
+      "localization/lidar_quality/min_valid_points",
+      static_cast<int>(kDefaultMinimumFovPoints));
+  int lidar_fov_min_valid_points =
+      static_cast<int>(kDefaultMinimumFovPoints);
+  this->get_parameter(
+      "localization/lidar_quality/min_vertical_fov_deg",
+      this->lidar_min_vertical_fov_deg_);
+  this->get_parameter(
+      "localization/lidar_quality/min_valid_points",
+      lidar_fov_min_valid_points);
+  if (!std::isfinite(this->lidar_min_vertical_fov_deg_) ||
+      this->lidar_min_vertical_fov_deg_ < 25.0 ||
+      this->lidar_min_vertical_fov_deg_ >
+          kNominalRobinWVerticalFovDeg) {
+    throw std::invalid_argument(
+        "localization/lidar_quality/min_vertical_fov_deg must be finite "
+        "and within [25, 30] degrees for the Robin W profile");
+  }
+  if (lidar_fov_min_valid_points <
+          static_cast<int>(kDefaultMinimumFovPoints) ||
+      lidar_fov_min_valid_points >
+          static_cast<int>(kMaximumFovSamplePoints)) {
+    throw std::invalid_argument(
+        "localization/lidar_quality/min_valid_points must be within "
+        "[100, 20000]");
+  }
+  this->lidar_fov_min_valid_points_ =
+      static_cast<size_t>(lidar_fov_min_valid_points);
+  RCLCPP_INFO(
+      this->get_logger(),
+      "LiDAR vertical-FOV gate active: nominal Robin W %.1f deg, reject "
+      "robust spans below %.1f deg or clouds with fewer than %zu valid "
+      "sampled returns",
+      kNominalRobinWVerticalFovDeg, this->lidar_min_vertical_fov_deg_,
+      this->lidar_fov_min_valid_points_);
+
+  // Multi-LiDAR concatenation: match auxiliary sweeps by absolute point-time
+  // endpoints, then transform their XYZ into the primary sensor frame. Robin W
+  // timestamps remain unchanged on the shared PTP axis.
   this->declare_parameter<bool>("localization/lidar_concat/enabled", false);
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
-  this->declare_parameter<double>("localization/lidar_concat/time_threshold", 0.05);
+  this->declare_parameter<double>("localization/lidar_concat/sweep_time_threshold", 0.01);
+  this->declare_parameter<double>(
+      "localization/lidar_concat/future_sweep_wait_timeout", 0.15);
+  // Robin W frame period in seconds. 10 FPS (0.100) is the slowest supported
+  // rate and therefore the safe default: too LARGE only loosens the wire
+  // contract, it never falsely rejects. Deployments running 20 FPS -- which is
+  // what recording/sensor_config.yaml specifies for this component -- must set
+  // 0.05, otherwise the contract gate accepts a 99 ms span (two fused frames)
+  // and the sweep_time_threshold ceiling below permits a full frame period.
+  this->declare_parameter<double>("localization/seyond_frame_duration_s",
+                                  kSeyondFrameDurationSecondsDefault);
   // P4#3: 200 for parity with GLIM's lidar_concat. At 10 Hz a depth of 20 is
   // only 2 s of aux history — a brief aux-stream stall or replay burst drops
   // the matching scan and the frame silently degrades to fewer LiDARs (run-12
@@ -1748,7 +1634,39 @@ void gicp_localization::LocalizationNode::getParams() {
   std::vector<std::string> aux_topics_param, aux_frames_param;
   this->get_parameter("localization/lidar_concat/aux_topics", aux_topics_param);
   this->get_parameter("localization/lidar_concat/aux_frames", aux_frames_param);
-  this->get_parameter("localization/lidar_concat/time_threshold", this->concat_time_threshold_);
+  this->get_parameter("localization/seyond_frame_duration_s",
+                      this->seyond_frame_duration_s_);
+  if (!std::isfinite(this->seyond_frame_duration_s_) ||
+      this->seyond_frame_duration_s_ < 0.010 ||
+      this->seyond_frame_duration_s_ > 0.500) {
+    throw std::invalid_argument(
+        "localization/seyond_frame_duration_s must be finite and within "
+        "[0.010, 0.500] s (Robin W is rated 10-20 FPS => 0.100 / 0.050)");
+  }
+  this->get_parameter(
+      "localization/lidar_concat/sweep_time_threshold",
+      this->concat_sweep_time_threshold_);
+  this->get_parameter(
+      "localization/lidar_concat/future_sweep_wait_timeout",
+      this->concat_future_sweep_wait_timeout_);
+  // Half the frame period is the ambiguity bound: at a larger gate two
+  // different sweeps can both satisfy it. Derived from the CONFIGURED period,
+  // not a 10 Hz constant, so a 20 FPS deployment gets a 0.025 s ceiling.
+  if (!std::isfinite(this->concat_sweep_time_threshold_) ||
+      this->concat_sweep_time_threshold_ < 0.0 ||
+      this->concat_sweep_time_threshold_ >=
+          0.5 * this->seyond_frame_duration_s_) {
+    throw std::invalid_argument(
+        "localization/lidar_concat/sweep_time_threshold must be finite, "
+        "non-negative, and below half of localization/seyond_frame_duration_s");
+  }
+  if (!std::isfinite(this->concat_future_sweep_wait_timeout_) ||
+      this->concat_future_sweep_wait_timeout_ < 0.0 ||
+      this->concat_future_sweep_wait_timeout_ > 1.0) {
+    throw std::invalid_argument(
+        "localization/lidar_concat/future_sweep_wait_timeout must be finite "
+        "and within [0, 1] seconds");
+  }
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
@@ -1797,8 +1715,14 @@ void gicp_localization::LocalizationNode::getParams() {
         this->aux_lidars_.push_back(std::move(aux));
       }
       RCLCPP_INFO(this->get_logger(),
-                  "lidar_concat enabled: %zu aux lidars, time_threshold=%.3fs, buffer_size=%zu",
-                  this->aux_lidars_.size(), this->concat_time_threshold_, this->concat_buffer_size_);
+                  "lidar_concat enabled: %zu aux lidars, sweep_time_threshold=%.3fs "
+                  "(ceiling %.3fs = half the %.0f ms frame), buffer_size=%zu, "
+                  "future_wait=%.3fs",
+                  this->aux_lidars_.size(), this->concat_sweep_time_threshold_,
+                  0.5 * this->seyond_frame_duration_s_,
+                  this->seyond_frame_duration_s_ * 1.0e3,
+                  this->concat_buffer_size_,
+                  this->concat_future_sweep_wait_timeout_);
       for (const auto& a : this->aux_lidars_) {
         RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
                     a->topic.c_str(), a->frame.c_str());
@@ -1850,12 +1774,13 @@ void gicp_localization::LocalizationNode::getParams() {
   // topic triggers a calibration window in which IMU residuals are computed
   // against the GT pose/twist (no stationary assumption). Falls back to
   // stationary calibration if no GT arrives within fallback_timeout seconds.
-  // Hard guard for single-IMU deployments (ported from art-jazzy): by default
-  // the localizer only accepts an IMU subscription resolved to /imu/data
-  // (Atlas Duo on the Hitch Sensor Dome).
+  // Hard guard for single-IMU deployments. The raw driver is the low-latency
+  // live default; the adapter's retimed stream is allowed for normalized
+  // replay, where its configured lookahead is intentional.
   this->declare_parameter<bool>("localization/imu/require_topic_allowlist", true);
   this->declare_parameter<std::vector<std::string>>(
-      "localization/imu/topic_allowlist", std::vector<std::string>{"/imu/data"});
+      "localization/imu/topic_allowlist",
+      std::vector<std::string>{"/gps_p1/imu", "/imu/data"});
   this->get_parameter("localization/imu/require_topic_allowlist", this->imu_require_topic_allowlist_);
   this->get_parameter("localization/imu/topic_allowlist", this->imu_topic_allowlist_);
   if (this->imu_topic_allowlist_.empty()) {
@@ -1863,7 +1788,7 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   // Safety guard: reject IMU samples whose header.frame_id does not match
   // localization/imu_frame. Keep enabled by default for P1-only operation.
-  this->declare_parameter<bool>("localization/imu/require_frame_match", false);  // Hitch: driver frame_id not yet validated — enable after checking /imu/data header.frame_id == localization/imu_frame
+  this->declare_parameter<bool>("localization/imu/require_frame_match", true);
   this->get_parameter("localization/imu/require_frame_match", this->imu_require_frame_match_);
 
   // RTK-driven IMU calibration. When enabled, the first accepted GT odom
@@ -1900,13 +1825,11 @@ void gicp_localization::LocalizationNode::getParams() {
     this->sensor = dlio::SensorType::LIVOX;
   } else if (sensor_type_str == "ouster") {
     this->sensor = dlio::SensorType::OUSTER;
-  } else if (sensor_type_str == "luminar") {
-    this->sensor = dlio::SensorType::LUMINAR;
   } else {
     this->sensor = dlio::SensorType::UNKNOWN;
     RCLCPP_WARN(this->get_logger(),
                 "Unknown localization/sensor_type '%s'; per-point deskew needs ouster, velodyne, "
-                "seyond, hesai, livox, or luminar",
+                "seyond, hesai, or livox",
                 sensor_type_str.c_str());
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
@@ -1989,6 +1912,10 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/debug/enable_pub", true);
   this->declare_parameter<bool>("localization/debug/enable_jump_log", true);
   this->declare_parameter<bool>("localization/debug/verbose_scan_log", false);
+  this->declare_parameter<bool>("localization/debug/small_gicp_lm_debug", false);
+  // Migration alias for existing deployments. New configuration must use
+  // small_gicp_lm_debug; declaring the old key prevents an older Humble
+  // parameter file from aborting node startup during rollout.
   this->declare_parameter<bool>("localization/debug/nano_gicp_lm_debug", false);
   this->declare_parameter<double>("localization/debug/jump_trans_m", 1.0);
   this->declare_parameter<double>("localization/debug/jump_rot_deg", 10.0);
@@ -1997,7 +1924,18 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/debug/enable_pub", this->debug_pub_enabled_);
   this->get_parameter("localization/debug/enable_jump_log", this->debug_jump_log_enabled_);
   this->get_parameter("localization/debug/verbose_scan_log", this->debug_verbose_scan_log_);
-  this->get_parameter("localization/debug/nano_gicp_lm_debug", this->debug_lm_print_);
+  this->get_parameter("localization/debug/small_gicp_lm_debug", this->debug_lm_print_);
+  bool legacy_nano_lm_debug = false;
+  this->get_parameter("localization/debug/nano_gicp_lm_debug", legacy_nano_lm_debug);
+  if (legacy_nano_lm_debug) {
+    if (!this->debug_lm_print_) {
+      this->debug_lm_print_ = true;
+    }
+    RCLCPP_WARN(
+        this->get_logger(),
+        "localization/debug/nano_gicp_lm_debug is deprecated; use "
+        "localization/debug/small_gicp_lm_debug");
+  }
   this->get_parameter("localization/debug/jump_trans_m", this->debug_jump_trans_m_);
   this->get_parameter("localization/debug/jump_rot_deg", this->debug_jump_rot_deg_);
 
@@ -2044,22 +1982,413 @@ void gicp_localization::LocalizationNode::getParams() {
               this->gicp_hessian_rot_warn_deg_,
               this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: %s (min consecutive failures=%d)",
+              "GT recovery: %s (min consecutive failures=%d, "
+              "RTK-fixed sanity radius=%.1fm)",
               this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
-              this->gt_recovery_min_consecutive_failures_);
+              this->gt_recovery_min_consecutive_failures_,
+              this->gt_recovery_sanity_radius_);
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_trans_m_, this->debug_jump_rot_deg_);
-  RCLCPP_INFO(this->get_logger(), "Debug detail: verbose_scan_log=%s nano_gicp_lm_debug=%s",
+  RCLCPP_INFO(this->get_logger(), "Debug detail: verbose_scan_log=%s small_gicp_lm_debug=%s",
               this->debug_verbose_scan_log_ ? "ENABLED" : "DISABLED",
               this->debug_lm_print_ ? "ENABLED" : "DISABLED");
+}
+
+int64_t gicp_localization::LocalizationNode::localMapGridKey(
+    int32_t ix, int32_t iy) {
+  const uint64_t ux = static_cast<uint32_t>(ix);
+  const uint64_t uy = static_cast<uint32_t>(iy);
+  return static_cast<int64_t>((ux << 32) | uy);
+}
+
+void gicp_localization::LocalizationNode::buildLocalMapGrid() {
+  this->local_map_grid_.clear();
+  if (!this->map_cloud || this->map_cloud->empty()) {
+    return;
+  }
+  if (this->map_cloud->size() >
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "Prepared map has too many points for the local-map index");
+    return;
+  }
+
+  this->local_map_grid_.reserve(std::min<size_t>(
+      this->map_cloud->size() / 1000 + 16, 1U << 20));
+  for (uint32_t i = 0; i < this->map_cloud->size(); ++i) {
+    const auto& point = this->map_cloud->points[i];
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+        !std::isfinite(point.z)) {
+      continue;
+    }
+    const double grid_x =
+        std::floor(static_cast<double>(point.x) / this->local_map_grid_size_);
+    const double grid_y =
+        std::floor(static_cast<double>(point.y) / this->local_map_grid_size_);
+    if (grid_x < std::numeric_limits<int32_t>::min() ||
+        grid_x > std::numeric_limits<int32_t>::max() ||
+        grid_y < std::numeric_limits<int32_t>::min() ||
+        grid_y > std::numeric_limits<int32_t>::max()) {
+      continue;
+    }
+    this->local_map_grid_[localMapGridKey(
+        static_cast<int32_t>(grid_x), static_cast<int32_t>(grid_y))]
+        .push_back(i);
+  }
+}
+
+gicp_localization::LocalizationNode::PreparedGicpTargetPtr
+gicp_localization::LocalizationNode::createLocalMapTarget(
+    const Eigen::Vector3f& center, double radius, int build_threads,
+    size_t* candidate_count_out) const {
+  if (!this->full_map_target_ || !this->map_cloud ||
+      this->map_cloud->empty() || !center.allFinite() ||
+      !std::isfinite(radius) || radius <= 0.0) {
+    return nullptr;
+  }
+
+  const auto grid_index = [this](double coordinate, int32_t* index) {
+    const double value =
+        std::floor(coordinate / this->local_map_grid_size_);
+    if (value < std::numeric_limits<int32_t>::min() ||
+        value > std::numeric_limits<int32_t>::max()) {
+      return false;
+    }
+    *index = static_cast<int32_t>(value);
+    return true;
+  };
+
+  int32_t ix0;
+  int32_t ix1;
+  int32_t iy0;
+  int32_t iy1;
+  if (!grid_index(static_cast<double>(center.x()) - radius, &ix0) ||
+      !grid_index(static_cast<double>(center.x()) + radius, &ix1) ||
+      !grid_index(static_cast<double>(center.y()) - radius, &iy0) ||
+      !grid_index(static_cast<double>(center.y()) + radius, &iy1)) {
+    return nullptr;
+  }
+
+  size_t candidate_count = 0;
+  for (int64_t ix = ix0; ix <= static_cast<int64_t>(ix1); ++ix) {
+    for (int64_t iy = iy0; iy <= static_cast<int64_t>(iy1); ++iy) {
+      const auto bucket = this->local_map_grid_.find(localMapGridKey(
+          static_cast<int32_t>(ix), static_cast<int32_t>(iy)));
+      if (bucket != this->local_map_grid_.end()) {
+        candidate_count += bucket->second.size();
+      }
+    }
+  }
+  if (candidate_count_out) {
+    *candidate_count_out = candidate_count;
+  }
+
+  auto local = std::make_shared<pcl::PointCloud<PointType>>();
+  gicp_plusplus::SmallGicpBackend<
+      PointType, PointType>::CovarianceVector local_covariances;
+  local->points.reserve(candidate_count);
+  local_covariances.reserve(candidate_count);
+
+  const auto& full_covariances = *this->full_map_target_->covariances;
+  if (full_covariances.size() != this->map_cloud->size()) {
+    return nullptr;
+  }
+  const double radius_squared = radius * radius;
+  for (int64_t ix = ix0; ix <= static_cast<int64_t>(ix1); ++ix) {
+    for (int64_t iy = iy0; iy <= static_cast<int64_t>(iy1); ++iy) {
+      const auto bucket = this->local_map_grid_.find(localMapGridKey(
+          static_cast<int32_t>(ix), static_cast<int32_t>(iy)));
+      if (bucket == this->local_map_grid_.end()) {
+        continue;
+      }
+      for (const uint32_t index : bucket->second) {
+        const auto& point = this->map_cloud->points[index];
+        const double dx = static_cast<double>(point.x) - center.x();
+        const double dy = static_cast<double>(point.y) - center.y();
+        if (dx * dx + dy * dy <= radius_squared) {
+          local->points.push_back(point);
+          local_covariances.push_back(full_covariances[index]);
+        }
+      }
+    }
+  }
+
+  local->width = static_cast<uint32_t>(local->size());
+  local->height = 1;
+  local->is_dense = true;
+  if (local->size() < this->local_map_min_points_) {
+    return nullptr;
+  }
+
+  return this->gicp.prepareInputTarget(
+      local, std::move(local_covariances), this->gicp_corr_randomness_,
+      std::max(1, build_threads));
+}
+
+bool gicp_localization::LocalizationNode::rebuildLocalMapTargetSync(
+    const Eigen::Vector3f& center) {
+  const uint64_t generation = ++this->local_map_generation_;
+  {
+    std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+    this->pending_local_map_target_.reset();
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  size_t candidate_count = 0;
+  PreparedGicpTargetPtr prepared;
+  try {
+    prepared = this->createLocalMapTarget(
+        center, this->local_map_radius_, omp_get_max_threads(),
+        &candidate_count);
+  } catch (const std::exception& error) {
+    RCLCPP_ERROR(
+        this->get_logger(), "Synchronous local-map build failed: %s",
+        error.what());
+    return false;
+  }
+  if (!prepared || generation != this->local_map_generation_.load()) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "Local-map crop unavailable at [%.2f, %.2f] within %.1fm "
+        "(candidates=%zu, minimum=%zu)",
+        center.x(), center.y(), this->local_map_radius_, candidate_count,
+        this->local_map_min_points_);
+    return false;
+  }
+
+  this->active_local_map_target_ = prepared;
+  this->gicp.setInputTarget(prepared);
+  this->local_map_center_ = center;
+  this->local_map_target_ready_ = true;
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+  RCLCPP_INFO(
+      this->get_logger(),
+      "Synchronous local-map target: center=[%.2f,%.2f] "
+      "candidates=%zu target=%zu radius=%.1fm time=%.1fms",
+      center.x(), center.y(), candidate_count, prepared->cloud->size(),
+      this->local_map_radius_, elapsed_ms);
+  return true;
+}
+
+void gicp_localization::LocalizationNode::buildLocalMapTargetAsync(
+    Eigen::Vector3f center, uint64_t generation) {
+  const auto start = std::chrono::steady_clock::now();
+  size_t candidate_count = 0;
+  PreparedGicpTargetPtr prepared;
+  try {
+    prepared = this->createLocalMapTarget(
+        center, this->local_map_radius_, this->local_map_build_threads_,
+        &candidate_count);
+  } catch (const std::exception& error) {
+    RCLCPP_ERROR(
+        this->get_logger(), "Asynchronous local-map build failed: %s",
+        error.what());
+  }
+
+  if (prepared && generation == this->local_map_generation_.load()) {
+    std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+    if (generation == this->local_map_generation_.load()) {
+      this->pending_local_map_target_ = prepared;
+      this->pending_local_map_center_ = center;
+    }
+  } else if (!prepared) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Asynchronous local-map crop unavailable at [%.2f, %.2f] "
+        "(candidates=%zu, minimum=%zu)",
+        center.x(), center.y(), candidate_count,
+        this->local_map_min_points_);
+  }
+
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+  RCLCPP_DEBUG(
+      this->get_logger(),
+      "Asynchronous local-map build: center=[%.2f,%.2f] "
+      "candidates=%zu target=%zu time=%.1fms",
+      center.x(), center.y(), candidate_count,
+      prepared ? prepared->cloud->size() : 0U, elapsed_ms);
+  this->local_map_rebuild_busy_ = false;
+}
+
+void gicp_localization::LocalizationNode::launchLocalMapTargetBuild(
+    const Eigen::Vector3f& center) {
+  if (this->local_map_rebuild_busy_.exchange(true)) {
+    return;
+  }
+  if (this->local_map_rebuild_thread_.joinable()) {
+    this->local_map_rebuild_thread_.join();
+  }
+
+  const uint64_t generation = this->local_map_generation_.load();
+  try {
+    this->local_map_rebuild_thread_ = std::thread(
+        &gicp_localization::LocalizationNode::buildLocalMapTargetAsync,
+        this, center, generation);
+  } catch (const std::exception& error) {
+    this->local_map_rebuild_busy_ = false;
+    RCLCPP_ERROR(
+        this->get_logger(), "Failed to start local-map builder: %s",
+        error.what());
+  }
+}
+
+void gicp_localization::LocalizationNode::adoptPendingLocalMapTarget(
+    const Eigen::Vector3f& current_center) {
+  std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+  if (!this->pending_local_map_target_) {
+    return;
+  }
+
+  const double pending_distance =
+      (current_center.head<2>() -
+       this->pending_local_map_center_.head<2>()).norm();
+  const double active_distance =
+      this->local_map_target_ready_
+          ? (current_center.head<2>() -
+             this->local_map_center_.head<2>()).norm()
+          : std::numeric_limits<double>::infinity();
+  if (pending_distance >= active_distance) {
+    this->pending_local_map_target_.reset();
+    return;
+  }
+
+  this->active_local_map_target_ = this->pending_local_map_target_;
+  this->gicp.setInputTarget(this->active_local_map_target_);
+  this->local_map_center_ = this->pending_local_map_center_;
+  this->pending_local_map_target_.reset();
+  this->local_map_target_ready_ = true;
+  RCLCPP_INFO(
+      this->get_logger(),
+      "Adopted local-map target: %zu points center=[%.2f,%.2f]",
+      this->active_local_map_target_->cloud->size(),
+      this->local_map_center_.x(), this->local_map_center_.y());
+}
+
+bool gicp_localization::LocalizationNode::ensureLocalMapTarget(
+    const Eigen::Vector3f& center) {
+  if (!this->local_map_enable_) {
+    return true;
+  }
+  if (!center.allFinite()) {
+    return false;
+  }
+
+  this->adoptPendingLocalMapTarget(center);
+  if (!this->local_map_target_ready_) {
+    return this->rebuildLocalMapTargetSync(center);
+  }
+
+  const double center_offset =
+      (center.head<2>() - this->local_map_center_.head<2>()).norm();
+  if (center_offset > this->local_map_valid_center_offset_) {
+    // The async target did not arrive before the active crop could no longer
+    // cover the bounded scan. Rebuild synchronously and continue LiDAR+IMU;
+    // this path does not authorize a non-RTK pose reset.
+    return this->rebuildLocalMapTargetSync(center);
+  }
+  if (center_offset > this->local_map_rebuild_distance_) {
+    this->launchLocalMapTargetBuild(center);
+  }
+  return true;
 }
 
 bool gicp_localization::LocalizationNode::loadMap() {
 
   if (this->map_path_.empty()) {
     RCLCPP_ERROR(this->get_logger(), "Map path is empty! Please set localization/map_path parameter.");
+    return false;
+  }
+
+  const std::string manifest_path =
+      this->map_manifest_path_.empty()
+          ? this->map_path_ + ".manifest.yaml"
+          : this->map_manifest_path_;
+  std::ifstream manifest_stream(manifest_path);
+  const bool manifest_exists = manifest_stream.good();
+  manifest_stream.close();
+
+  if (!manifest_exists) {
+    if (this->require_map_manifest_ || this->require_live_enu_origin_) {
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "Required ENU map manifest is missing: %s. Export the GLIM dump with "
+          "GLIM_plusplus/scripts/export_glim_dump_to_pcd.py.",
+          manifest_path.c_str());
+      return false;
+    }
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Map manifest not found at %s; frame and datum compatibility are not "
+        "being verified because localization/require_map_manifest=false.",
+        manifest_path.c_str());
+  } else {
+    try {
+      const MapManifest manifest = loadMapManifest(manifest_path);
+      this->map_enu_origin_lat_ = manifest.enu_origin.latitude_deg;
+      this->map_enu_origin_lon_ = manifest.enu_origin.longitude_deg;
+      this->map_enu_origin_alt_ = manifest.enu_origin.altitude_m;
+      this->map_enu_origin_loaded_ = true;
+      if (!this->expected_enu_origin_.empty()) {
+        const EnuOrigin expected = parseEnuOrigin(this->expected_enu_origin_);
+        const double datum_error_m =
+            enuOriginDistanceMeters(manifest.enu_origin, expected);
+        if (datum_error_m > this->enu_origin_tolerance_m_) {
+          RCLCPP_ERROR(
+              this->get_logger(),
+              "ENU datum mismatch: map manifest and expected_enu_origin differ "
+              "by %.3f m (limit %.3f m). Refusing to localize.",
+              datum_error_m, this->enu_origin_tolerance_m_);
+          return false;
+        }
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Validated ENU map manifest %s against expected_enu_origin "
+            "(difference %.3f m)",
+            manifest_path.c_str(), datum_error_m);
+      }
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Invalid ENU map manifest %s: %s",
+                   manifest_path.c_str(), e.what());
+      return false;
+    }
+  }
+
+  if (!this->require_live_enu_origin_) {
+    if (this->expected_enu_origin_.empty()) {
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "require_live_enu_origin=false requires expected_enu_origin as an "
+          "explicit offline datum assertion");
+      return false;
+    }
+    this->enu_origin_validated_ = true;
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Live adapter ENU-origin validation is disabled; relying on the "
+        "explicit expected_enu_origin assertion");
+  }
+
+  if (this->utm_enabled_) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "localization/utm_transform_path cannot be used with the canonical "
+        "ENU map export. The exporter has already applied inverse(T_world_utm); "
+        "applying it again would corrupt the map frame.");
+    return false;
+  }
+  if (this->map_enu_origin_loaded_ &&
+      (std::abs(this->map_roll_deg_) > 1.0e-6 ||
+       std::abs(this->map_pitch_deg_) > 1.0e-6 ||
+       std::abs(this->map_yaw_deg_) > 1.0e-6)) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "Map rotation overrides are incompatible with a manifested ENU map; "
+        "re-export the map in the correct frame instead");
     return false;
   }
 
@@ -2098,40 +2427,94 @@ bool gicp_localization::LocalizationNode::loadMap() {
 
   RCLCPP_INFO(this->get_logger(), "Map loaded successfully with %lu points", this->map_cloud->points.size());
 
-  // Downsample the GICP TARGET map (in place) before it becomes the kd-tree.
-  // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
-  // kd-tree that exhausts RAM/swap and stalls registration for seconds. Voxel
-  // downsampling to ~0.3 m cuts the point count (and kd-tree memory) by ~10x
-  // with negligible accuracy impact at the 0.5 m scan voxel. The dense cloud is
-  // released as soon as the filter swaps in the downsampled result.
-  if (this->map_voxel_size_ > 0.0) {
-    const size_t before = this->map_cloud->points.size();
-    auto map_ds = std::make_shared<pcl::PointCloud<PointType>>();
-    pcl::VoxelGrid<PointType> vg;
-    vg.setLeafSize(static_cast<float>(this->map_voxel_size_),
-                   static_cast<float>(this->map_voxel_size_),
-                   static_cast<float>(this->map_voxel_size_));
-    vg.setInputCloud(this->map_cloud);
-    vg.filter(*map_ds);
-    if (map_ds->points.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "map_voxel_size=%.3f produced an empty map; keeping the full-resolution map",
-                  this->map_voxel_size_);
-    } else {
-      this->map_cloud = map_ds;  // releases the dense cloud
-      RCLCPP_INFO(this->get_logger(),
-                  "Downsampled GICP target map: %lu -> %lu points (voxel=%.3f m)",
-                  before, this->map_cloud->points.size(), this->map_voxel_size_);
+  return true;
+}
+
+bool gicp_localization::LocalizationNode::prepareMapTarget() {
+  if (!this->map_cloud || this->map_cloud->empty()) {
+    return false;
+  }
+
+  const size_t raw_count = this->map_cloud->size();
+  if (this->local_map_enable_) {
+    const auto start = std::chrono::steady_clock::now();
+    this->full_map_target_ = this->gicp.preprocessInputTarget(
+        *this->map_cloud, this->map_voxel_size_,
+        this->gicp_corr_randomness_, omp_get_max_threads());
+    if (!this->full_map_target_) {
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "Failed to downsample and estimate covariances for the full map");
+      return false;
+    }
+
+    // Release the raw map. The prepared cloud, its KD-tree, and its
+    // covariances remain immutable for the node lifetime; local targets copy
+    // point/covariance pairs and only build a bounded KD-tree.
+    this->map_cloud = this->full_map_target_->cloud;
+    this->buildLocalMapGrid();
+    if (this->local_map_grid_.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "Prepared map contains no finite points");
+      return false;
+    }
+    this->gicp.setInputTarget(this->full_map_target_);
+
+    const double elapsed_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Prepared bounded local-map registration: raw=%lu prepared=%lu "
+        "voxel=%.3fm covariances=%lu cells=%lu radius=%.1fm "
+        "rebuild=%.1fm valid_offset=%.1fm time=%.2fs",
+        raw_count, this->map_cloud->size(), this->map_voxel_size_,
+        this->full_map_target_->covariances->size(),
+        this->local_map_grid_.size(), this->local_map_radius_,
+        this->local_map_rebuild_distance_,
+        this->local_map_valid_center_offset_, elapsed_s);
+  } else {
+    if (this->map_voxel_size_ > 0.0) {
+      auto map_ds = std::make_shared<pcl::PointCloud<PointType>>();
+      pcl::VoxelGrid<PointType> vg;
+      vg.setLeafSize(
+          static_cast<float>(this->map_voxel_size_),
+          static_cast<float>(this->map_voxel_size_),
+          static_cast<float>(this->map_voxel_size_));
+      vg.setInputCloud(this->map_cloud);
+      vg.filter(*map_ds);
+      if (map_ds->empty()) {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "map_voxel_size=%.3f produced an empty GICP target",
+            this->map_voxel_size_);
+        return false;
+      }
+      this->map_cloud = map_ds;
+      RCLCPP_INFO(
+          this->get_logger(),
+          "Downsampled full-map GICP target: %lu -> %lu points "
+          "(voxel=%.3fm)",
+          raw_count, this->map_cloud->size(), this->map_voxel_size_);
+    }
+
+    this->gicp.setInputTarget(this->map_cloud);
+    if (!this->gicp.calculateTargetCovariances()) {
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "Failed to calculate full-map target covariances");
+      return false;
     }
   }
 
-  // Downsample map for visualization if needed
   if (this->visualize_map_) {
     pcl::VoxelGrid<PointType> vg;
-    vg.setLeafSize(this->map_voxel_size_vis_, this->map_voxel_size_vis_, this->map_voxel_size_vis_);
+    vg.setLeafSize(
+        this->map_voxel_size_vis_, this->map_voxel_size_vis_,
+        this->map_voxel_size_vis_);
     vg.setInputCloud(this->map_cloud);
     vg.filter(*this->map_cloud_ds);
-    RCLCPP_INFO(this->get_logger(), "Downsampled map for visualization: %lu points", this->map_cloud_ds->points.size());
+    RCLCPP_INFO(
+        this->get_logger(), "Downsampled map for visualization: %lu points",
+        this->map_cloud_ds->size());
   }
 
   return true;
@@ -2182,6 +2565,14 @@ void gicp_localization::LocalizationNode::start() {
 void gicp_localization::LocalizationNode::applyInitialPoseFromParams() {
 
   if (!this->use_param_initial_pose_) {
+    return;
+  }
+  if (!this->enu_origin_validated_.load()) {
+    this->pending_initial_pose_ = true;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Deferring configured initial pose until the live adapter ENU origin "
+        "matches the map manifest");
     return;
   }
 
@@ -2322,6 +2713,21 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
 void gicp_localization::LocalizationNode::callbackInitialPose(
     const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose) {
 
+  if (!this->enu_origin_validated_.load()) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Ignoring initial pose until the live adapter ENU origin matches the map");
+    return;
+  }
+  if (!pose->header.frame_id.empty() &&
+      pose->header.frame_id != this->map_frame) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "Ignoring initial pose in frame '%s'; expected '%s'",
+        pose->header.frame_id.c_str(), this->map_frame.c_str());
+    return;
+  }
+
   Eigen::Quaternionf q(
       pose->pose.pose.orientation.w,
       pose->pose.pose.orientation.x,
@@ -2339,13 +2745,92 @@ void gicp_localization::LocalizationNode::callbackInitialPose(
 void gicp_localization::LocalizationNode::callbackPointCloud(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
 
+  VerticalFovMeasurement fov;
+  if (!verticalFovAccepted(
+          *pc_in, this->lidar_min_vertical_fov_deg_,
+          this->lidar_fov_min_valid_points_, &fov)) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Rejecting primary LiDAR cloud before SLAM: robust vertical FOV "
+        "%.2f deg (elevation %.2f..%.2f deg), required >= %.2f deg; "
+        "valid sampled returns=%zu/%zu. Reason: %s. A narrowed vertical FOV "
+        "does not provide enough vertical structure for stable GICP.",
+        fov.span_deg, fov.lower_deg, fov.upper_deg,
+        this->lidar_min_vertical_fov_deg_, fov.valid_points,
+        fov.sampled_points, fov.reason);
+    return;
+  }
+  if (!this->primary_lidar_fov_validated_) {
+    this->primary_lidar_fov_validated_ = true;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Primary LiDAR vertical-FOV gate passed: robust span %.2f deg "
+        "(elevation %.2f..%.2f deg, %zu valid sampled returns)",
+        fov.span_deg, fov.lower_deg, fov.upper_deg, fov.valid_points);
+  }
+
+  if (!this->enu_origin_validated_.load()) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Waiting for /gps_p1/local_enu_origin to match the map manifest; "
+        "point clouds are not being localized");
+    return;
+  }
+
   if (this->imu_only_mode_) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "IMU-only mode enabled: skipping pointcloud/GICP updates.");
     return;
   }
 
-  // Multi-LiDAR concatenation: merge nearest aux scans into the primary cloud
+  // Enforce the Robin W wire contract on the unmerged primary. The official
+  // driver publishes timestamp/FLOAT64 absolute Unix seconds, with a 10 us
+  // point-time quantum inside one frame period.
+  if (this->sensor == dlio::SensorType::SEYOND) {
+    SeyondPointTimeRange primary_range;
+    if (!seyondCloudTimeContractValid(
+            *pc_in, this->seyond_frame_duration_s_, &primary_range)) {
+      RCLCPP_ERROR_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "Rejecting Robin W primary cloud: expected timestamp/FLOAT64 "
+          "absolute Unix seconds within the %.0f ms frame beginning at "
+          "header.stamp (%zu points timed, %zu invalid zero timestamps). Install the "
+          "pinned driver with PTP_sync/4_setup_lidar_ptp.sh.",
+          this->seyond_frame_duration_s_ * 1.0e3, primary_range.count,
+          primary_range.zero_timestamp_count);
+      return;
+    }
+    // Track the real frame period. A configured value larger than the truth
+    // loosens every bound above, and nothing else would ever notice.
+    const double stamp_s = rclcpp::Time(pc_in->header.stamp).seconds();
+    if (this->seyond_last_primary_stamp_s_ > 0.0) {
+      const double dt = stamp_s - this->seyond_last_primary_stamp_s_;
+      if (dt > 0.0 && dt < 1.0) {
+        this->seyond_observed_frame_interval_s_ =
+            this->seyond_observed_frame_interval_s_ < 0.0
+                ? dt
+                : 0.9 * this->seyond_observed_frame_interval_s_ + 0.1 * dt;
+        ++this->seyond_frame_interval_samples_;
+        // Warn only once the estimate has settled, and only in the direction
+        // that matters: sensor faster than configured => gate too loose.
+        if (this->seyond_frame_interval_samples_ > 50 &&
+            this->seyond_observed_frame_interval_s_ <
+                0.75 * this->seyond_frame_duration_s_) {
+          RCLCPP_WARN_THROTTLE(
+              this->get_logger(), *this->get_clock(), 10000,
+              "Robin W frame period looks like %.0f ms but "
+              "localization/seyond_frame_duration_s is %.0f ms. Every "
+              "wire-contract bound is correspondingly loose (a fused "
+              "double-frame would pass). Set it to the real period.",
+              this->seyond_observed_frame_interval_s_ * 1.0e3,
+              this->seyond_frame_duration_s_ * 1.0e3);
+        }
+      }
+    }
+    this->seyond_last_primary_stamp_s_ = stamp_s;
+  }
+
+  // Multi-LiDAR concatenation: merge point-time-aligned aux scans into the primary cloud
   // before any other processing. Downstream steps (TF cache, manual field
   // extraction, per-point timestamp read, Y-flip, deskew, GICP) all run on the
   // merged cloud unchanged — primary frame_id, point_step, and field layout
@@ -2412,34 +2897,80 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   }
 
   this->scan_stamp = pc->header.stamp;
+  this->t_prior_stamp_ = this->scan_stamp.seconds();
   this->last_scan_input_frame_ = pc->header.frame_id;
 
   // Convert to PCL format using manual field extraction for robustness
   pcl::PointCloud<PointType>::Ptr raw_scan = std::make_shared<pcl::PointCloud<PointType>>();
 
-  // Calculate number of points
-  size_t num_points = static_cast<size_t>(pc->width) * pc->height;
+  if (pc->width == 0 || pc->height == 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "Received empty point cloud (width=%u, height=%u)",
+                pc->width, pc->height);
+    return;
+  }
+  if (pc->point_step == 0 ||
+      static_cast<size_t>(pc->width) >
+          std::numeric_limits<size_t>::max() /
+              static_cast<size_t>(pc->height)) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Rejecting malformed PointCloud2 dimensions");
+    return;
+  }
+
+  // Calculate number of points and require the tight layout used by the
+  // single-pass byte decoder below. Row-padded organized clouds need a
+  // row-aware decoder and are intentionally rejected here.
+  const size_t num_points =
+      static_cast<size_t>(pc->width) * static_cast<size_t>(pc->height);
+  if (num_points >
+      std::numeric_limits<size_t>::max() /
+          static_cast<size_t>(pc->point_step)) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Rejecting PointCloud2 whose byte size overflows size_t");
+    return;
+  }
+  const size_t expected_data_size =
+      num_points * static_cast<size_t>(pc->point_step);
+  const size_t expected_row_step =
+      static_cast<size_t>(pc->width) *
+      static_cast<size_t>(pc->point_step);
+  if (static_cast<size_t>(pc->row_step) != expected_row_step ||
+      pc->data.size() != expected_data_size) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Rejecting non-tight PointCloud2 layout "
+        "(row_step=%u expected=%zu data=%zu expected=%zu)",
+        pc->row_step, expected_row_step, pc->data.size(),
+        expected_data_size);
+    return;
+  }
 
   RCLCPP_DEBUG(this->get_logger(), "Received PointCloud2: width=%d, height=%d, num_points=%lu, data_size=%lu",
                pc->width, pc->height, num_points, pc->data.size());
-
-  if (num_points == 0) {
-    RCLCPP_WARN(this->get_logger(), "Received empty point cloud (width=%d, height=%d)", pc->width, pc->height);
-    return;
-  }
 
   // Single-pass conversion: resolve field offsets once, then walk pc->data
   // exactly once doing xyz + intensity + per-point time + flip_y in the same
   // iteration.
   int x_off = -1, y_off = -1, z_off = -1, i_off = -1;
   uint8_t i_type = 0;
+  if (!findXYZOffsets(*pc, x_off, y_off, z_off)) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "Point cloud requires x/y/z FLOAT32/count=1 fields inside point_step");
+    return;
+  }
   for (const auto& field : pc->fields) {
-    if (field.name == "x") x_off = static_cast<int>(field.offset);
-    else if (field.name == "y") y_off = static_cast<int>(field.offset);
-    else if (field.name == "z") z_off = static_cast<int>(field.offset);
-    else if (field.name == "intensity") {
-      i_off = static_cast<int>(field.offset);
-      i_type = field.datatype;
+    if (field.name == "intensity") {
+      if (field.count == 1 && pointFieldFitsStep(field, pc->point_step)) {
+        i_off = static_cast<int>(field.offset);
+        i_type = field.datatype;
+      } else {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000,
+            "Ignoring malformed intensity field outside point_step");
+      }
+      break;
     }
   }
 
@@ -2481,9 +3012,6 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
     time_contract_ok = matches_time_contract(
         "timestamp", sensor_msgs::msg::PointField::FLOAT64);
   }
-  if (time_contract_ok && this->sensor == dlio::SensorType::SEYOND) {
-    time_contract_ok = hasSeyondAbsoluteTimeAxis(*pc, time_off);
-  }
   if (!time_contract_ok) {
     RCLCPP_ERROR_THROTTLE(
         this->get_logger(), *this->get_clock(), 5000,
@@ -2491,32 +3019,6 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
         "For Robin W, install the pinned driver with "
         "PTP_sync/4_setup_lidar_ptp.sh.",
         expected_time_contract);
-    return;
-  }
-
-  // One-shot timestamp-field diagnostic. Fires exactly once across the whole
-  // node lifetime (std::call_once) and dumps every PointField + the first few
-  // points' timestamp bytes interpreted four ways. The developer reads the
-  // [LUMINAR_TS_DIAG] block in stderr to decide which bit-level interpretation
-  // the live driver actually uses. See
-  // docs/luminar_timestamp_diagnostic_guide.pdf for how to interpret the
-  // output and the corresponding fix in copyPointTimeFromCloud.
-  static std::once_flag ts_diag_once;
-  std::call_once(ts_diag_once, [&]() {
-    const char* sensor_name =
-        this->sensor == dlio::SensorType::LUMINAR  ? "luminar"
-        : this->sensor == dlio::SensorType::OUSTER ? "ouster"
-        : this->sensor == dlio::SensorType::VELODYNE ? "velodyne"
-        : this->sensor == dlio::SensorType::SEYOND ? "seyond"
-        : this->sensor == dlio::SensorType::HESAI   ? "hesai"
-        : this->sensor == dlio::SensorType::LIVOX   ? "livox"
-                                                    : "unknown";
-    logTimestampDiagnostic(*pc, time_off, time_datatype, time_count,
-                           sensor_name);
-  });
-
-  if (x_off < 0 || y_off < 0 || z_off < 0) {
-    RCLCPP_ERROR(this->get_logger(), "Point cloud missing x/y/z fields");
     return;
   }
 
@@ -2607,11 +3109,6 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
 
   this->last_raw_point_count_ = raw_scan->points.size();
 
-  if (this->sensor == dlio::SensorType::LUMINAR && has_time_field && this->verbose_ &&
-      !raw_scan->points.empty()) {
-    logLuminarTimestampStats(raw_scan->points.size(), *raw_scan, 0);
-  }
-
   // Store as original scan for deskewing
   this->original_scan = raw_scan;
 
@@ -2677,11 +3174,62 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
   if (aux_index < 0 || static_cast<size_t>(aux_index) >= this->aux_lidars_.size()) {
     return;
   }
+
   auto& aux = *this->aux_lidars_[aux_index];
-  std::lock_guard<std::mutex> lk(aux.mtx);
-  aux.buffer.push_back(std::move(msg));
-  while (aux.buffer.size() > this->concat_buffer_size_) {
-    aux.buffer.pop_front();
+  VerticalFovMeasurement fov;
+  if (!verticalFovAccepted(
+          *msg, this->lidar_min_vertical_fov_deg_,
+          this->lidar_fov_min_valid_points_, &fov)) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "lidar_concat: rejecting aux LiDAR cloud on '%s' before buffering: "
+        "robust vertical FOV %.2f deg (elevation %.2f..%.2f deg), required "
+        ">= %.2f deg; valid sampled returns=%zu/%zu. Reason: %s.",
+        aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
+        this->lidar_min_vertical_fov_deg_, fov.valid_points,
+        fov.sampled_points, fov.reason);
+    return;
+  }
+  SeyondPointTimeRange point_time_range;
+  if (this->sensor == dlio::SensorType::SEYOND &&
+      !seyondCloudTimeContractValid(
+          *msg, this->seyond_frame_duration_s_, &point_time_range)) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "lidar_concat: rejecting Robin W aux cloud on '%s': expected "
+        "timestamp/FLOAT64 absolute Unix seconds within its %.0f ms frame "
+        "(%zu points timed, %zu invalid zero timestamps)",
+        this->aux_lidars_[aux_index]->topic.c_str(),
+        this->seyond_frame_duration_s_ * 1.0e3, point_time_range.count,
+        point_time_range.zero_timestamp_count);
+    return;
+  }
+
+  bool first_fov_pass = false;
+  {
+    std::lock_guard<std::mutex> lk(aux.mtx);
+    if (!aux.vertical_fov_validated) {
+      aux.vertical_fov_validated = true;
+      first_fov_pass = true;
+    }
+    AuxLidar::BufferedCloud buffered;
+    buffered.msg = std::move(msg);
+    buffered.point_time_valid = point_time_range.valid;
+    buffered.point_time_min_s = point_time_range.min_s;
+    buffered.point_time_max_s = point_time_range.max_s;
+    aux.buffer.push_back(std::move(buffered));
+    while (aux.buffer.size() > this->concat_buffer_size_) {
+      aux.buffer.pop_front();
+    }
+  }
+  aux.cv.notify_all();
+  if (first_fov_pass) {
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Aux LiDAR vertical-FOV gate passed on '%s': robust span %.2f deg "
+        "(elevation %.2f..%.2f deg, %zu valid sampled returns)",
+        aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
+        fov.valid_points);
   }
 }
 
@@ -2798,8 +3346,6 @@ sensor_msgs::msg::PointCloud2::ConstSharedPtr
 gicp_localization::LocalizationNode::mergeAuxClouds(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
 
-  this->luminar_primary_min_ts_valid_ = false;
-
   // P4#3: reset the per-frame concat diagnostics. Any early return below
   // leaves them at "nothing merged", which is exactly what happened.
   this->concat_last_merged_aux_ = 0;
@@ -2840,46 +3386,11 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     return true;  // skip this scan
   };
 
-  // Capture the PRIMARY scan's earliest per-point timestamp BEFORE appending any
-  // aux cloud. deskewPointcloud() anchors Luminar merged-cloud timing on this --
-  // NOT on the global merged minimum. An aux scan that began before the primary
-  // carries smaller absolute epoch timestamps; anchoring at the global min would
-  // map that aux point to the primary header stamp and deskew the entire merged
-  // sweep late (a real motion-prior/deskew bias at AV speeds).
-  if (this->sensor == dlio::SensorType::LUMINAR) {
-    int p_t_off;
-    uint8_t p_t_dt;
-    int p_t_cnt;
-    const size_t n_primary = static_cast<size_t>(primary->width) * primary->height;
-    // Guard the raw 8-byte reads below: the time field must fit within point_step,
-    // AND the byte buffer must actually hold all n_primary points. This capture runs
-    // BEFORE the tight-cloud guard further down, so a truncated/malformed primary
-    // (data.size() < n_primary*point_step) would otherwise read past data.end().
-    if (findTimeField(*primary, p_t_off, p_t_dt, p_t_cnt) && p_t_off >= 0 &&
-        primary->point_step > 0 && static_cast<uint32_t>(p_t_off) < primary->point_step &&
-        primary->data.size() >= n_primary * static_cast<size_t>(primary->point_step)) {
-      const size_t bytes_avail = primary->point_step - static_cast<uint32_t>(p_t_off);
-      uint64_t pmin = std::numeric_limits<uint64_t>::max();
-      bool any = false;
-      for (size_t i = 0; i < n_primary; i++) {
-        // Decode via the shared helper so the anchor matches the per-point reader
-        // (copyPointTimeFromCloud) on the accepted absolute encodings (UINT8[8] /
-        // FLOAT64). bytes_avail guards the 8-byte read against a short field.
-        uint64_t ts = 0;
-        if (luminarRawTimestampNsFromBytes(primary->data.data() + i * primary->point_step + p_t_off, p_t_dt, p_t_cnt,
-                                           bytes_avail, ts)) {
-          pmin = std::min(pmin, ts);
-          any = true;
-        }
-      }
-      if (any) {
-        this->luminar_primary_min_ts_ns_ = pmin;
-        this->luminar_primary_min_ts_valid_ = true;
-      }
-    }
-  }
-
   const double t_primary = rclcpp::Time(primary->header.stamp).seconds();
+  const SeyondPointTimeRange primary_time_range =
+      this->sensor == dlio::SensorType::SEYOND
+          ? decodeSeyondPointTimeRange(*primary)
+          : SeyondPointTimeRange{};
   const uint32_t point_step = primary->point_step;
   const std::string& primary_frame = primary->header.frame_id;
 
@@ -2897,8 +3408,7 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   // (row_step > width*point_step, i.e. data.size() != width*height*point_step)
   // would make the byte-count include padding. Organized-but-tight (height>1, no
   // padding) is fine to flatten; only padding is rejected. Reject the primary
-  // loudly rather than silently miscounting -- Luminar clouds are unorganized and
-  // tight (PCAP reader emits height=1, row_step=point_step*width).
+  // loudly rather than silently miscounting.
   if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "lidar_concat: primary cloud is organized/padded (data=%zu, width=%u, height=%u, step=%u); "
@@ -2918,6 +3428,13 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   // Reserve once for primary + all aux clouds (assuming roughly equal sizes).
   // Avoids per-aux reallocations as we grow merged->data.
   merged->data.reserve(primary->data.size() * (1 + this->aux_lidars_.size()));
+  // A single deadline bounds the whole merge. Waiting independently for each
+  // aux until "now + timeout" would multiply latency by the number of sensors.
+  const auto future_wait_deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(
+              this->concat_future_sweep_wait_timeout_));
 
   for (size_t aux_i = 0; aux_i < this->aux_lidars_.size(); ++aux_i) {
     auto& aux = *this->aux_lidars_[aux_i];
@@ -2948,25 +3465,118 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       }
     }
 
-    // Pick the aux scan whose header is closest in time to the primary header,
-    // within the configured threshold.
+    // Pick the aux sweep whose absolute point-time endpoints best agree with
+    // the primary. Header time is only a tie-break for the Robin W path.
     sensor_msgs::msg::PointCloud2::ConstSharedPtr match;
-    double best_dt = std::numeric_limits<double>::max();
+    double best_range_delta = std::numeric_limits<double>::infinity();
+    double best_header_delta = std::numeric_limits<double>::infinity();
     {
-      std::lock_guard<std::mutex> lk(aux.mtx);
-      for (const auto& msg : aux.buffer) {
-        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() - t_primary);
-        if (dt < best_dt) {
-          best_dt = dt;
-          match = msg;
+      std::unique_lock<std::mutex> lk(aux.mtx);
+      if (this->concat_future_sweep_wait_timeout_ > 0.0) {
+        aux.cv.wait_until(lk, future_wait_deadline, [&]() {
+          bool has_match = false;
+          double newest_time = -std::numeric_limits<double>::infinity();
+          for (const auto& buffered : aux.buffer) {
+            const double header_time =
+                rclcpp::Time(buffered.msg->header.stamp).seconds();
+            newest_time = std::max(
+                newest_time,
+                primary_time_range.valid && buffered.point_time_valid
+                    ? buffered.point_time_min_s
+                    : header_time);
+            SeyondPointTimeRange buffered_range;
+            buffered_range.valid = buffered.point_time_valid;
+            buffered_range.min_s = buffered.point_time_min_s;
+            buffered_range.max_s = buffered.point_time_max_s;
+            const double delta =
+                primary_time_range.valid && buffered.point_time_valid
+                    ? pointTimeEndpointDelta(
+                          primary_time_range, buffered_range)
+                    : std::abs(header_time - t_primary);
+            has_match = has_match ||
+                        delta <= this->concat_sweep_time_threshold_;
+          }
+          const double target_time =
+              primary_time_range.valid ? primary_time_range.min_s : t_primary;
+          return has_match ||
+                 newest_time >
+                     target_time + this->concat_sweep_time_threshold_;
+        });
+      }
+      for (const auto& buffered : aux.buffer) {
+        const double header_delta = std::abs(
+            rclcpp::Time(buffered.msg->header.stamp).seconds() - t_primary);
+        SeyondPointTimeRange buffered_time_range;
+        buffered_time_range.valid = buffered.point_time_valid;
+        buffered_time_range.min_s = buffered.point_time_min_s;
+        buffered_time_range.max_s = buffered.point_time_max_s;
+        const double range_delta =
+            primary_time_range.valid && buffered.point_time_valid
+                ? pointTimeEndpointDelta(
+                      primary_time_range, buffered_time_range)
+                : header_delta;
+        if (range_delta < best_range_delta ||
+            (range_delta == best_range_delta &&
+             header_delta < best_header_delta)) {
+          best_range_delta = range_delta;
+          best_header_delta = header_delta;
+          match = buffered.msg;
         }
       }
     }
-    if (!match || best_dt > this->concat_time_threshold_) {
+    if (std::isfinite(best_range_delta)) {
+      aux.endpoint_delta_sum += best_range_delta;
+      aux.endpoint_delta_min =
+          std::min(aux.endpoint_delta_min, best_range_delta);
+      aux.endpoint_delta_max =
+          std::max(aux.endpoint_delta_max, best_range_delta);
+      ++aux.endpoint_delta_count;
+      if (best_range_delta > this->concat_sweep_time_threshold_) {
+        ++aux.endpoint_delta_reject_count;
+      }
+      if (aux.endpoint_delta_count % 512 == 0) {
+        const double reject_fraction =
+            static_cast<double>(aux.endpoint_delta_reject_count) /
+            static_cast<double>(aux.endpoint_delta_count);
+        const double mean_delta =
+            aux.endpoint_delta_sum /
+            static_cast<double>(aux.endpoint_delta_count);
+        if (reject_fraction > 0.10) {
+          RCLCPP_WARN(
+              this->get_logger(),
+              "lidar_concat: '%s' best sweep endpoint delta over %lu "
+              "evaluations: mean=%.1fms min=%.1fms max=%.1fms gate=%.1fms "
+              "rejected=%.1f%%. Tune from this evidence while staying below "
+              "the %.1fms half-period ceiling.",
+              aux.topic.c_str(),
+              static_cast<unsigned long>(aux.endpoint_delta_count),
+              mean_delta * 1.0e3, aux.endpoint_delta_min * 1.0e3,
+              aux.endpoint_delta_max * 1.0e3,
+              this->concat_sweep_time_threshold_ * 1.0e3,
+              reject_fraction * 100.0,
+              this->seyond_frame_duration_s_ * 0.5e3);
+        } else {
+          RCLCPP_INFO(
+              this->get_logger(),
+              "lidar_concat: '%s' best sweep endpoint delta over %lu "
+              "evaluations: mean=%.1fms min=%.1fms max=%.1fms gate=%.1fms "
+              "rejected=%.1f%%",
+              aux.topic.c_str(),
+              static_cast<unsigned long>(aux.endpoint_delta_count),
+              mean_delta * 1.0e3, aux.endpoint_delta_min * 1.0e3,
+              aux.endpoint_delta_max * 1.0e3,
+              this->concat_sweep_time_threshold_ * 1.0e3,
+              reject_fraction * 100.0);
+        }
+      }
+    }
+    if (!match ||
+        best_range_delta > this->concat_sweep_time_threshold_) {
       RCLCPP_DEBUG(this->get_logger(),
-                   "lidar_concat: no match for '%s' within %.3fs of primary t=%.3f (best_dt=%.3fs)",
-                   aux.topic.c_str(), this->concat_time_threshold_, t_primary,
-                   match ? best_dt : -1.0);
+                   "lidar_concat: no point-time match for '%s' within %.3fs "
+                   "of primary t=%.3f (best_endpoint_delta=%.3fs)",
+                   aux.topic.c_str(), this->concat_sweep_time_threshold_,
+                   t_primary, match ? best_range_delta : -1.0);
       continue;
     }
     // Validate the FULL field schema, not just point_step: the merged cloud
@@ -3020,10 +3630,15 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
       const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
-      // Robin W's numeric FLOAT64 Unix seconds are detected as absolute and
-      // remain unchanged; relative timestamp layouts are rebased by dt.
-      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt,
-                           this->sensor == dlio::SensorType::LUMINAR);
+      const bool absolute_time =
+          this->sensor == dlio::SensorType::SEYOND ||
+          this->sensor == dlio::SensorType::HESAI ||
+          this->sensor == dlio::SensorType::LIVOX;
+      // Robin W already carries absolute capture time; relative layouts alone
+      // receive the inter-header rebase.
+      shiftCloudTimestamps(
+          appended, aux_pts, point_step, time_off, time_dt_type, time_count,
+          dt, absolute_time);
     } else if (this->deskew_) {
       // Without per-point timestamps the aux rays would deskew against the
       // primary scan's IMU integration with a stale (aux-header) reference,
@@ -3101,7 +3716,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   // -1 instead of the previous frame's stale span.
   this->last_scan_time_span_s_ = -1.0;
 
-  if (!this->deskew_ || !this->first_imu_received) {
+  if (!this->deskew_) {
     this->current_scan = this->original_scan;
 
     // Even without per-point deskewing, integrate IMU to get a motion-predicted
@@ -3128,6 +3743,21 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
       this->T_prior = this->current_pose;
     }
 
+    this->prev_scan_stamp = this->scan_stamp.seconds();
+    return;
+  }
+
+  if (!this->first_imu_received) {
+    // The registration path treats every deskew-enabled scan as world-frame
+    // input. Preserve that invariant even before the first IMU sample: this is
+    // a rigid prior transform (no per-point compensation), not raw
+    // sensor-frame data passed to an identity-seeded optimizer.
+    this->T_prior = this->current_pose;
+    auto world_scan = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::transformPointCloud(
+        *this->original_scan, *world_scan,
+        this->T_prior * this->extrinsics.baselink2lidar_T);
+    this->current_scan = world_scan;
     this->prev_scan_stamp = this->scan_stamp.seconds();
     return;
   }
@@ -3164,48 +3794,6 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
     extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp * 1e-9; };
     deskew_time_ready = true;
-  } else if (this->sensor == dlio::SensorType::LUMINAR) {
-    // Per-point value is absolute PTP epoch ns (driver reconstruction of the
-    // packet-header 48-bit seconds + per-ray 32-bit sub-second nanoseconds;
-    // see Luminar Iris Data Output Specification v1.3.0 §2.1 and §2.2/§2.6.3).
-    // We deskew on the relative offset (ts - anchor) anchored at the header
-    // stamp, so the absolute epoch reference cancels. NOTE: this relies on the
-    // driver supplying full epoch ns; a bare 32-bit ns field (sub-second, wraps
-    // every 1 s) would make (ts - anchor) jump across a second boundary and
-    // corrupt deskew for scans that straddle the rollover.
-    //
-    // ANCHOR: for a multi-LiDAR merged sweep, anchor on the PRIMARY scan's first
-    // timestamp (captured in mergeAuxClouds() BEFORE aux append), NOT the global
-    // merged minimum. An aux scan that began before the primary carries smaller
-    // epoch timestamps; anchoring at the global min would map that aux point to
-    // the header stamp (sweep_ref_time) and shift the entire merged sweep late.
-    // Aux points earlier than the primary anchor therefore get correctly NEGATIVE
-    // offsets -- which requires SIGNED subtraction below (uint64 underflow
-    // otherwise). For the single-primary path we fall back to the global min,
-    // which equals the primary min, so behavior is unchanged.
-    uint64_t anchor_ts;
-    if (this->luminar_primary_min_ts_valid_) {
-      anchor_ts = this->luminar_primary_min_ts_ns_;
-    } else {
-      anchor_ts = std::numeric_limits<uint64_t>::max();
-      for (const auto& pt : this->original_scan->points) {
-        anchor_ts = std::min(anchor_ts, luminarPointTimestampNs(pt));
-      }
-    }
-    const uint64_t min_ts_captured = anchor_ts;
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "Luminar scan: anchor_ts=%lu ns (%s), sweep_ref=%.3f s", min_ts_captured,
-                         this->luminar_primary_min_ts_valid_ ? "primary" : "global", sweep_ref_time);
-    point_time_cmp = [](const PointType& p1, const PointType& p2) {
-      return luminarPointTimestampNs(p1) < luminarPointTimestampNs(p2);
-    };
-    extract_point_time_from_point = [&sweep_ref_time, min_ts_captured](const PointType& pt) {
-      const uint64_t ts = luminarPointTimestampNs(pt);
-      // Signed difference: aux points earlier than the primary anchor are valid
-      // and must produce negative offsets (epoch ns fits in int64_t).
-      return sweep_ref_time + static_cast<double>(static_cast<int64_t>(ts) - static_cast<int64_t>(min_ts_captured)) * 1e-9;
-    };
-    deskew_time_ready = true;
   }
 
   if (!deskew_time_ready) {
@@ -3241,10 +3829,6 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   }
   unique_time_indices.push_back(deskewed_scan_->points.size());
 
-  if (this->sensor == dlio::SensorType::LUMINAR && this->verbose_ && !deskewed_scan_->points.empty()) {
-    logLuminarTimestampStats(deskewed_scan_->points.size(), *deskewed_scan_, timestamps.size());
-  }
-
   if (timestamps.empty()) {
     RCLCPP_WARN(this->get_logger(), "No timestamps extracted from point cloud, skipping deskewing");
     this->last_scan_time_span_s_ = -1.0;
@@ -3264,13 +3848,13 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   // got rebased far from the primary and is being deskewed across a long arc.
   this->last_scan_time_span_s_ = timestamps.back() - timestamps.front();
 
-  // A Luminar sweep that collapses to a single unique timestamp means every point
+  // A Robin W sweep that collapses to a single unique timestamp means every point
   // shares one time, so deskew degenerates to a rigid transform (no motion
   // compensation). This is the symptom of a wrong per-point time encoding (e.g.
   // global_shutter/collapsed times) -- warn so the operator can fix the source.
-  if (this->sensor == dlio::SensorType::LUMINAR && this->deskew_ && timestamps.size() == 1) {
+  if (this->sensor == dlio::SensorType::SEYOND && this->deskew_ && timestamps.size() == 1) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "Luminar deskew collapsed to a single timestamp (%zu points share one time); "
+                         "Robin W deskew collapsed to a single timestamp (%zu points share one time); "
                          "deskew reduced to a rigid transform. Check the per-point time encoding.",
                          deskewed_scan_->points.size());
   }
@@ -3367,6 +3951,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
 
   // Update prior to be the estimated pose at the median time of the scan
   this->T_prior = frames[median_pt_index];
+  this->t_prior_stamp_ = timestamps[median_pt_index];
 
   // Deskew each point using its timestamp
   #pragma omp parallel for
@@ -3449,6 +4034,20 @@ void gicp_localization::LocalizationNode::performLocalization() {
   std::lock_guard<std::mutex> lock(this->pose_mutex);
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Mutex acquired");
 
+  const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
+  const Eigen::Vector3f target_center =
+      (this->T_prior * T_base_lidar).block<3, 1>(0, 3);
+  if (!this->ensureLocalMapTarget(target_center)) {
+    ++this->consecutive_failures_;
+    this->maybeSnapPoseToGT("local-map target unavailable");
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Skipping GICP: no sufficiently populated local target at "
+        "[%.2f, %.2f] (failure streak=%d)",
+        target_center.x(), target_center.y(), this->consecutive_failures_);
+    return;
+  }
+
   // Set source cloud
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Setting input source (%lu points)...",
                this->current_scan->points.size());
@@ -3456,15 +4055,14 @@ void gicp_localization::LocalizationNode::performLocalization() {
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Input source set");
 
   // Align using IMU-based prior as initial guess (if deskewing is enabled)
-  // align() requires an output cloud parameter (PCL API), but we never use the
-  // transformed cloud — LsqRegistration skips the fill, so this stays empty.
+  // The adapter retains a PCL-shaped output argument for migration
+  // compatibility. GICP_plusplus consumes only the estimated transform.
   pcl::PointCloud<PointType> aligned_scratch;
 
   // When deskewing is enabled, points are already in world frame at T_prior,
   // so GICP initial guess is Identity and final pose = T_corr * T_prior.
   // When deskewing is disabled, points are still in lidar frame, so seed/solve
   // in map<-lidar, then convert the optimizer output back to map<-base.
-  const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
   Eigen::Matrix4f initial_guess = this->deskew_
       ? Eigen::Matrix4f::Identity()
@@ -3476,6 +4074,32 @@ void gicp_localization::LocalizationNode::performLocalization() {
   if (this->last_gicp_valid_) {
     guess_from_last_trans = deltaTranslationNorm(this->last_gicp_pose_, guess_pose_map);
     guess_from_last_rot_deg = rotationDistanceDeg(this->last_gicp_pose_, guess_pose_map);
+  }
+
+  bool full_6dof_this_scan = this->gicp_dof_mode_ == "6dof";
+  if (!full_6dof_this_scan && this->gicp_full6dof_every_n_ > 0 &&
+      (++this->gicp_dof_scan_counter_ %
+       static_cast<uint64_t>(this->gicp_full6dof_every_n_)) == 0) {
+    full_6dof_this_scan = true;
+  }
+  const bool fix_roll_pitch =
+      !full_6dof_this_scan &&
+      (this->gicp_dof_mode_ == "4dof" ||
+       this->gicp_dof_mode_ == "3dof");
+  const bool fix_yaw =
+      !full_6dof_this_scan && this->gicp_dof_mode_ == "3dof";
+  this->gicp.setDoFMask(fix_roll_pitch, fix_roll_pitch, fix_yaw);
+
+  if (this->gicp_prior_yaw_info_ > 0.0 ||
+      this->gicp_prior_rollpitch_info_ > 0.0) {
+    this->gicp.setRotationPrior(
+        initial_guess.block<3, 3>(0, 0).cast<double>(),
+        Eigen::Vector3d(
+            this->gicp_prior_rollpitch_info_,
+            this->gicp_prior_rollpitch_info_,
+            this->gicp_prior_yaw_info_));
+  } else {
+    this->gicp.clearRotationPrior();
   }
 
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Starting GICP alignment...");
@@ -3490,15 +4114,40 @@ void gicp_localization::LocalizationNode::performLocalization() {
   this->last_fitness_score_ = fitness_score;
   double final_error = this->gicp.getFinalError();
   bool converged = this->gicp.hasConverged();
-  const int num_correspondences = this->gicp.num_correspondences;
-  const double correspondence_ratio =
+  int num_correspondences = this->gicp.num_correspondences;
+  double correspondence_ratio =
       this->current_scan->points.empty()
           ? 0.0
           : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
-  const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
-  const double hessian_condition = hessianConditionProxy(final_hessian);
-
   const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
+  const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
+
+  // small_gicp reports H in the optimizer's right-multiplicative tangent.
+  // Deskewed points already live in the map frame and the solved correction is
+  // near identity, matching the world-frame convention used by the existing
+  // degeneracy projector. For sensor-frame registration, convert H to the
+  // left/world tangent before any condition or eigen-axis analysis:
+  // delta_left = Ad_T * delta_right, H_left = Ad_T^-T H Ad_T^-1.
+  Eigen::Matrix<double, 6, 6> analysis_hessian = final_hessian;
+  if (!this->deskew_ && final_hessian.allFinite() &&
+      matrixFinite(optimizer_solution)) {
+    const Eigen::Matrix3d R =
+        optimizer_solution.block<3, 3>(0, 0).cast<double>();
+    const Eigen::Vector3d t =
+        optimizer_solution.block<3, 1>(0, 3).cast<double>();
+    Eigen::Matrix3d t_hat;
+    t_hat << 0.0, -t.z(), t.y(),
+             t.z(), 0.0, -t.x(),
+             -t.y(), t.x(), 0.0;
+    Eigen::Matrix<double, 6, 6> Ad_inv =
+        Eigen::Matrix<double, 6, 6>::Zero();
+    Ad_inv.block<3, 3>(0, 0) = R.transpose();
+    Ad_inv.block<3, 3>(3, 0) = -R.transpose() * t_hat;
+    Ad_inv.block<3, 3>(3, 3) = R.transpose();
+    analysis_hessian = Ad_inv.transpose() * final_hessian * Ad_inv;
+  }
+  const double hessian_condition = hessianConditionProxy(analysis_hessian);
+
   const Eigen::Matrix4f candidate_pose = this->deskew_
       ? (optimizer_solution * this->T_prior)
       : (optimizer_solution * T_lidar_base);
@@ -3538,7 +4187,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // along untrusted directions.
   const bool eigen_projection_wanted =
       this->degen_partial_update_enable_ && candidate_pose_valid &&
-      this->gicp_hessian_cond_max_ > 0.0 && std::isfinite(hessian_condition) &&
+      this->gicp_hessian_cond_max_ > 0.0 && analysis_hessian.allFinite() &&
       hessian_condition > this->gicp_hessian_cond_max_;
   // NOTE: yawGate is deliberately INDEPENDENT of degeneracy/partialUpdate —
   // disabling partial updates (legacy binary hessian gate) must not silently
@@ -3550,7 +4199,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   DegeneracyProjection degen;
   degen.projected_pose = candidate_pose;
   if (eigen_projection_wanted || yaw_veto_wanted) {
-    degen = projectDegenerateDelta(final_hessian, this->T_prior, candidate_pose,
+    degen = projectDegenerateDelta(analysis_hessian, this->T_prior, candidate_pose,
                                    eigen_projection_wanted,
                                    this->degen_full6d_, this->degen_coupling_length_m_,
                                    this->degen_rel_floor_6d_,
@@ -3564,6 +4213,40 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const Eigen::Matrix4f final_candidate =
       (degen.valid && degen.modified && matrixFinite(degen.projected_pose))
           ? degen.projected_pose : candidate_pose;
+
+  // The projected pose can differ from the optimizer result. Re-score the pose
+  // that will actually be applied so a yaw veto or degeneracy projection
+  // cannot retain a translation that was only plausible at the discarded
+  // optimizer attitude. Failure to evaluate is fail-closed.
+  if (candidate_pose_valid && degen.valid && degen.modified &&
+      matrixFinite(final_candidate)) {
+    const Eigen::Matrix4f T_eval = this->deskew_
+        ? Eigen::Matrix4f(final_candidate * this->T_prior.inverse())
+        : Eigen::Matrix4f(final_candidate * T_base_lidar);
+    double applied_fitness = std::numeric_limits<double>::infinity();
+    int applied_correspondences = 0;
+    if (this->gicp.evaluateFitnessAt(
+            T_eval, &applied_fitness, &applied_correspondences)) {
+      fitness_score = applied_fitness;
+      num_correspondences = applied_correspondences;
+      correspondence_ratio = this->current_scan->points.empty()
+          ? 0.0
+          : static_cast<double>(applied_correspondences) /
+                static_cast<double>(this->current_scan->points.size());
+      final_error =
+          fitness_score * static_cast<double>(num_correspondences);
+      fitness_ratio = fitness_baseline > 1e-9
+          ? fitness_score / fitness_baseline
+          : -1.0;
+    } else {
+      fitness_score = std::numeric_limits<double>::infinity();
+      final_error = std::numeric_limits<double>::infinity();
+      num_correspondences = 0;
+      correspondence_ratio = 0.0;
+      fitness_ratio = -1.0;
+    }
+    this->last_fitness_score_ = fitness_score;
+  }
 
   double guess_to_solution_trans = -1.0;
   double guess_to_solution_rot_deg = -1.0;
@@ -3630,36 +4313,43 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const bool large_jump_final = candidate_pose_valid &&
       (final_jump_trans > eff_jump_trans_m || final_jump_rot_deg > eff_jump_rot_deg);
 
-  // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
-  // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
-  // accept/reject decisions — purely a diagnostic.
+  // RTK-fixed divergence cross-check. The errors remain diagnostics, and a
+  // successfully composed, fresh fixed-only sample can additionally reject a
+  // candidate outside gt_recovery/sanity_radius. Float/no-fix never enters the
+  // buffer and therefore cannot influence registration.
   double gt_pos_err = -1.0;
   double gt_rot_err_deg = -1.0;
   double gt_dt = 0.0;
+  bool gt_pose_composed_in_base = false;
+  const double registration_stamp =
+      this->t_prior_stamp_ > 0.0
+          ? this->t_prior_stamp_
+          : this->scan_stamp.seconds();
   if (this->gt_odom_enabled_ && this->gt_odom_received_.load() && candidate_pose_valid) {
     GtSample gt;
     // Cross-check is a CM-LEVEL DIAGNOSTIC -- only meaningful against
-    // RTK-FIXED-quality Atlas samples. Snap-recovery and IMU dead-reckoning
-    // do NOT participate in this gate; they accept Atlas dead-reckoning
-    // quality as the next-best truth.
-    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt) && this->gtSampleIsRtkFixed(gt)) {
+    // RTK-FIXED-quality Atlas samples. Recovery uses the same fixed-only gate.
+    if (this->getGtPoseAt(registration_stamp, gt) &&
+        this->gtSampleIsRtkFixed(gt)) {
       // Evaluate the pose that would actually be APPLIED (post degeneracy
       // projection), so run-report gt_err statistics describe the output.
       const Eigen::Vector3f cand_p = final_candidate.block<3, 1>(0, 3);
       const Eigen::Quaternionf cand_q(Eigen::Matrix3f(final_candidate.block<3, 3>(0, 0)));
       // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
       // using the same TF composition the snap helper uses. On the dome the
-      // gt_odom source is /odom_rtk_only (Atlas Duo INS), whose body frame
+      // gt_odom source is the adapter's fixed-only INS odometry, whose body frame
       // differs from base_link by the static imu_link -> base_link TF, so
       // the composition is a real lever-arm correction here — not a no-op.
       // Without this composition, the cross-check carries a constant baseline
       // bias equal to the gt_body -> base_frame lever arm.
       Eigen::Vector3f gt_p_in_base;
       Eigen::Quaternionf gt_q_in_base;
-      if (!this->composeGtPoseInBase(gt, gt_p_in_base, gt_q_in_base)) {
+      gt_pose_composed_in_base =
+          this->composeGtPoseInBase(gt, gt_p_in_base, gt_q_in_base);
+      if (!gt_pose_composed_in_base) {
         // Extrinsic not cached yet -- fall back to gt.p/gt.q directly.
-        // Acceptable for early-startup diagnostic noise; the cache fills on
-        // the first successfully-received GT message.
+        // This remains diagnostic-only; the RTK sanity gate below requires a
+        // successfully composed base-frame pose.
         gt_p_in_base = gt.p;
         gt_q_in_base = gt.q;
       }
@@ -3667,9 +4357,14 @@ void gicp_localization::LocalizationNode::performLocalization() {
       Eigen::Quaternionf dq = cand_q.normalized() * gt_q_in_base.normalized().conjugate();
       const double w = std::clamp(static_cast<double>(std::abs(dq.w())), 0.0, 1.0);
       gt_rot_err_deg = 2.0 * std::acos(w) * 180.0 / M_PI;
-      gt_dt = this->scan_stamp.seconds() - gt.stamp;
+      gt_dt = registration_stamp - gt.stamp;
     }
   }
+  const bool rtk_fixed_wrong_lock =
+      this->gt_recovery_enabled_ &&
+      this->gt_recovery_sanity_radius_ > 0.0 &&
+      gt_pose_composed_in_base &&
+      gt_pos_err > this->gt_recovery_sanity_radius_;
 
   if (this->debug_pub_enabled_) {
     auto publish_float = [](const rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr& pub, double value) {
@@ -3837,10 +4532,19 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
   bool gicp_rejected_fitness = false;
   bool gicp_rejected_fitness_ratio = false;
+  bool gicp_rejected_rtk_sanity = false;
   bool gicp_rejected_jump = false;
   bool gicp_rejected_hessian = false;
   if (effectively_converged && candidate_pose_valid) {
-    if (fitness_score > this->gicp_fitness_reject_threshold_) {
+    if (rtk_fixed_wrong_lock) {
+      gicp_rejected_rtk_sanity = true;
+    } else if (!analysis_hessian.allFinite()) {
+      // Geometry diagnostics are part of the acceptance contract. A
+      // non-finite small_gicp Hessian cannot be projected or conditioned
+      // reliably even if a separate fitness calculation happened to be
+      // finite.
+      gicp_rejected_hessian = true;
+    } else if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
     } else if (this->fitness_ratio_reject_ > 0.0 && fitness_ratio > 0.0 &&
                fitness_ratio > this->fitness_ratio_reject_) {
@@ -3863,7 +4567,6 @@ void gicp_localization::LocalizationNode::performLocalization() {
         gicp_rejected_jump = true;
       }
     } else if (this->gicp_hessian_cond_max_ > 0.0 &&
-               std::isfinite(hessian_condition) &&
                hessian_condition > this->gicp_hessian_cond_max_ &&
                ((this->gicp_hessian_fitness_warn_ > 0.0 &&
                  fitness_score > this->gicp_hessian_fitness_warn_) ||
@@ -3890,6 +4593,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   }
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
+                             !gicp_rejected_rtk_sanity &&
                              !gicp_rejected_hessian && !gicp_rejected_jump;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
@@ -3907,6 +4611,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",
                 fitness_ratio, this->fitness_ratio_reject_, fitness_baseline,
                 build_scan_debug_log("rejected_fitness_ratio").c_str());
+  } else if (gicp_rejected_rtk_sanity) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "GICP REJECTED: candidate is %.2fm from the fresh RTK-fixed pose "
+        "(limit %.2fm): %s",
+        gt_pos_err, this->gt_recovery_sanity_radius_,
+        build_scan_debug_log("rejected_rtk_fixed_sanity").c_str());
   } else if (gicp_rejected_hessian) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (hessian_cond=%.3e > %.3e AND [fitness=%.4f|trans=%.3fm|rot=%.3fdeg] crossed [%.4f|%.3fm|%.3fdeg] — degenerate slide): %s",
@@ -4021,7 +4732,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     this->consecutive_failures_ = 0;
     // Mark this as the last known-good fix; the dead-reckoning covariance growth
     // (P3) measures elapsed time from here.
-    this->last_accepted_scan_stamp_ = this->scan_stamp.seconds();
+    this->last_accepted_scan_stamp_ = registration_stamp;
 
     // Log pose and correction
     Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
@@ -4038,11 +4749,19 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // falls back to the IMU-integrated prior. Freezing at last_gicp_pose_ causes cascade
     // divergence at feature-poor corners: each subsequent scan's guess drifts further from
     // reality, fitness gets worse, and the optimizer never recovers.
+    if (gicp_rejected_rtk_sanity) {
+      // A fresh, composed RTK-fixed pose is definitive evidence of a wrong
+      // basin, so authorize the existing fixed-only recovery immediately.
+      this->consecutive_failures_ = std::max(
+          this->consecutive_failures_,
+          this->gt_recovery_min_consecutive_failures_ - 1);
+    }
     ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
+                       : gicp_rejected_rtk_sanity ? "RTK-fixed sanity rejected wrong lock"
                        : gicp_rejected_hessian ? "degenerate geometry"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
@@ -4161,32 +4880,54 @@ void gicp_localization::LocalizationNode::publishPose() {
 }
 
 void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+  if (!this->enu_origin_validated_.load()) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Ignoring gt_odom until the live adapter ENU origin matches the map");
+    return;
+  }
+  if (msg->header.frame_id != this->map_frame) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Rejecting gt_odom in frame '%s'; expected map frame '%s'. Check the "
+        "adapter odom_frame_id and ENU datum.",
+        msg->header.frame_id.c_str(), this->map_frame.c_str());
+    return;
+  }
+
   GtSample s;
   s.stamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
   s.p = Eigen::Vector3f(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
   s.q = Eigen::Quaternionf(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                            msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
-  s.q.normalize();
   s.v_lin_body = Eigen::Vector3f(msg->twist.twist.linear.x,
                                  msg->twist.twist.linear.y,
                                  msg->twist.twist.linear.z);
   s.v_ang_body = Eigen::Vector3f(msg->twist.twist.angular.x,
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
-  // Carry Atlas-reported position covariance per-sample. The RTK quality
-  // gate is no longer applied here -- every sample is pushed into the buffer
-  // regardless of FIXED/FLOAT/dead-reckoning state. The gate now runs at
-  // the CONSUMER side:
-  //   * tryRtkCalibrationStep (init/calibration)  -> require FIXED
-  //   * scan cross-check (gt_pos_err diagnostic)  -> require FIXED
-  //   * maybeSnapPoseToGT (recovery from GICP failure) -> accept ANY sample
-  // Rationale: Atlas's onboard INS already does coupled GNSS+IMU dead-
-  // reckoning with calibrated sensors during RTK loss. When GICP fails to
-  // match the LiDAR scan, the next-best truth is Atlas's pose at whatever
-  // quality it currently has -- not our own software IMU dead-reckoning.
+  if (!std::isfinite(s.stamp) || !s.p.allFinite() ||
+      !s.q.coeffs().allFinite() || s.q.norm() < 1.0e-6f ||
+      !s.v_lin_body.allFinite() || !s.v_ang_body.allFinite()) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Rejecting gt_odom with non-finite timestamp, pose, or twist");
+    return;
+  }
+  s.q.normalize();
+  // Defense in depth: the adapter topic is already solution-type-gated, but a
+  // malformed or accidentally remapped stream must not enter the GT buffer.
   s.cov_pos_xx = msg->pose.covariance[0];
   s.cov_pos_yy = msg->pose.covariance[7];
   s.cov_pos_zz = msg->pose.covariance[14];
+  if (!this->gtSampleIsRtkFixed(s)) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Rejecting gt_odom that is not RTK-fixed quality "
+        "(covariance=[%.6g, %.6g, %.6g]); continuing with LiDAR+IMU",
+        s.cov_pos_xx, s.cov_pos_yy, s.cov_pos_zz);
+    return;
+  }
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
@@ -4249,7 +4990,8 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   // frame we can't compose.
   // Overrides any param-based initial pose. Sets first_opt_done so odom starts
   // publishing immediately without waiting for the first accepted GICP scan.
-  if (this->use_odom_init_ && !this->use_odom_init_applied_) {
+  if (this->use_odom_init_ && !this->use_odom_init_applied_ &&
+      this->gtSampleIsRtkFixed(s)) {
     Eigen::Vector3f init_p;
     Eigen::Quaternionf init_q;
     if (this->composeGtPoseInBase(s, init_p, init_q)) {
@@ -4289,13 +5031,62 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   }
 }
 
+void gicp_localization::LocalizationNode::callbackEnuOrigin(
+    const std_msgs::msg::String::ConstSharedPtr msg) {
+  if (!this->require_live_enu_origin_) {
+    return;
+  }
+  if (!this->map_enu_origin_loaded_) {
+    this->enu_origin_validated_.store(false);
+    RCLCPP_FATAL(
+        this->get_logger(),
+        "Received live ENU origin but the map has no validated ENU manifest");
+    rclcpp::shutdown();
+    return;
+  }
+
+  try {
+    const EnuOrigin live = parseEnuOrigin(msg->data);
+    const EnuOrigin map{
+        this->map_enu_origin_lat_,
+        this->map_enu_origin_lon_,
+        this->map_enu_origin_alt_};
+    const double error_m = enuOriginDistanceMeters(map, live);
+    if (error_m > this->enu_origin_tolerance_m_) {
+      this->enu_origin_validated_.store(false);
+      RCLCPP_FATAL(
+          this->get_logger(),
+          "Live adapter ENU origin differs from the map manifest by %.3f m "
+          "(limit %.3f m); refusing localization",
+          error_m, this->enu_origin_tolerance_m_);
+      rclcpp::shutdown();
+      return;
+    }
+    if (!this->enu_origin_validated_.exchange(true)) {
+      RCLCPP_INFO(
+          this->get_logger(),
+          "Live adapter ENU origin validated against map manifest "
+          "(difference %.3f m)",
+          error_m);
+    }
+  } catch (const std::exception& e) {
+    this->enu_origin_validated_.store(false);
+    RCLCPP_FATAL(this->get_logger(), "Invalid live adapter ENU origin '%s': %s",
+                 msg->data.c_str(), e.what());
+    rclcpp::shutdown();
+  }
+}
+
 bool gicp_localization::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) const {
   // When the gate is disabled, treat every sample as FIXED -- the operator
   // has explicitly opted into "trust whatever the upstream publishes".
   if (!this->rtk_gate_enabled_) return true;
-  return (s.cov_pos_xx <= this->rtk_gate_max_pose_var_xy_) &&
-         (s.cov_pos_yy <= this->rtk_gate_max_pose_var_xy_) &&
-         (s.cov_pos_zz <= this->rtk_gate_max_pose_var_z_);
+  const auto valid_variance = [](double value, double limit) {
+    return std::isfinite(value) && value > 0.0 && value <= limit;
+  };
+  return valid_variance(s.cov_pos_xx, this->rtk_gate_max_pose_var_xy_) &&
+         valid_variance(s.cov_pos_yy, this->rtk_gate_max_pose_var_xy_) &&
+         valid_variance(s.cov_pos_zz, this->rtk_gate_max_pose_var_z_);
 }
 
 bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
@@ -4587,6 +5378,10 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     return false;
   }
 
+  const double recovery_stamp =
+      this->t_prior_stamp_ > 0.0
+          ? this->t_prior_stamp_
+          : this->scan_stamp.seconds();
   GtSample gt;
   // Log buffer state before the lookup so we can diagnose silent failures.
   size_t buf_size = 0;
@@ -4599,14 +5394,25 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
       buf_newest = this->gt_odom_buffer_.back().stamp;
     }
   }
-  bool got = this->getGtPoseAt(this->scan_stamp.seconds(), gt);
+  bool got = this->getGtPoseAt(recovery_stamp, gt);
   RCLCPP_DEBUG(this->get_logger(),
-               "GT recovery: lookup scan_stamp=%.3f got=%d buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
-               this->scan_stamp.seconds(), got, buf_size, buf_oldest, buf_newest, this->gt_odom_max_dt_);
+               "GT recovery: lookup registration_stamp=%.3f got=%d "
+               "buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
+               recovery_stamp, got, buf_size, buf_oldest, buf_newest,
+               this->gt_odom_max_dt_);
   if (!got) {
     RCLCPP_WARN(this->get_logger(),
-                "GT recovery: deferring snap — no GT sample within max_dt=%.3fs of scan stamp %.3f (streak=%d)",
-                this->gt_odom_max_dt_, this->scan_stamp.seconds(), this->consecutive_failures_);
+                "GT recovery: deferring snap — no GT sample within "
+                "max_dt=%.3fs of registration stamp %.3f (streak=%d)",
+                this->gt_odom_max_dt_, recovery_stamp,
+                this->consecutive_failures_);
+    return false;
+  }
+  if (!this->gtSampleIsRtkFixed(gt)) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "GT recovery: deferring snap because the time-matched odometry is not "
+        "RTK-fixed quality; continuing with LiDAR+IMU");
     return false;
   }
 
@@ -4650,7 +5456,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
   } else {
     std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
     if (this->first_imu_received &&
-        std::abs(this->imu_meas.stamp - this->scan_stamp.seconds()) < 0.2) {
+        std::abs(this->imu_meas.stamp - recovery_stamp) < 0.2) {
       // P3: imu_meas is bias-corrected at buffering time — use as-is.
       omega_base_body = this->imu_meas.ang_vel;
       omega_from_imu = true;
@@ -4665,7 +5471,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     lin_resolved = true;
   } else {
     Eigen::Vector3f v_fd_world;
-    if (this->getGtFiniteDiffVelWorld(this->scan_stamp.seconds(), v_fd_world)) {
+    if (this->getGtFiniteDiffVelWorld(recovery_stamp, v_fd_world)) {
       v_base_body = q_new.conjugate() * v_fd_world;
       lin_resolved = true;
       lin_from_fd = true;
@@ -4731,7 +5537,9 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
 
   {
     geometry_msgs::msg::PoseStamped snap_msg;
-    snap_msg.header.stamp = this->scan_stamp;
+    snap_msg.header.stamp = rclcpp::Time(
+        static_cast<int64_t>(std::llround(recovery_stamp * 1.0e9)),
+        this->get_clock()->get_clock_type());
     snap_msg.header.frame_id = this->map_frame;
     snap_msg.pose.position.x = p_new.x();
     snap_msg.pose.position.y = p_new.y();
@@ -4745,7 +5553,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
 
   this->consecutive_failures_ = 0;
   // A GT snap restores a known-good pose, so restart the dead-reckon clock (P3).
-  this->last_accepted_scan_stamp_ = this->scan_stamp.seconds();
+  this->last_accepted_scan_stamp_ = recovery_stamp;
   return true;
 }
 
@@ -5691,7 +6499,7 @@ void gicp_localization::LocalizationNode::updateState() {
   // Bound the effective timestep used for the proportional corrections. The
   // observer applies dt*K, which is forward-Euler and stable only for dt*K < 2;
   // at Kv=11.25 that bound is hit at dt≈0.18 s, so a 0.3-0.5 s scan gap (dropped
-  // Luminar frames / high-speed racing) would otherwise inject an unstable
+  // LiDAR frames / high-speed racing) would otherwise inject an unstable
   // correction from a single GICP residual. At nominal ~10 Hz dt_eff == dt.
   const double dt_eff = std::min(dt, this->geo_observer_dt_max_);
 

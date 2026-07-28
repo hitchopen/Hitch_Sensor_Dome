@@ -95,7 +95,14 @@ public:
   // `ingested` (optional): set true only when the cloud passed extraction and
   // TimeKeeper validation and was inserted into odometry estimation; false when
   // the frame was skipped. Offline readers use it for primary accounting.
-  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count = -1, bool* ingested = nullptr);
+  // `raw_sensor_fov_validated` is true only for a cloud returned by
+  // merge_clouds(), which has already checked every constituent sensor before
+  // transforming or concatenating it.
+  size_t points_callback(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+    int epoch_anchor_count = -1,
+    bool* ingested = nullptr,
+    bool raw_sensor_fov_validated = false);
 
   // Live subscription entry point for the primary LiDAR. Online mapping with
   // concatenation is rejected until this path has a future-sweep release queue;
@@ -183,6 +190,7 @@ private:
   std::string expected_time_field;
   int expected_time_datatype = 0;
   bool expected_time_is_absolute = false;
+  bool reject_zero_point_times = false;
   bool float64_time_is_epoch_ns = false;  // raw FLOAT64-as-epoch-ns opt-in; false on Robin W
   bool flip_points_y;
 

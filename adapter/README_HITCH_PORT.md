@@ -4,6 +4,8 @@ Point One Atlas normalization boundary. Converts raw Atlas FusionEngine WGS84
 pose/IMU into local-ENU `/gps_p1/*` streams (`filtered_odom`,
 `filtered_odom_rtk_fixed`, `fix`, `imu`, optional `/gnss*`), with
 P1-clock-consistent monotonic stamps and an optional P1 PCAP IMU replay node.
+It also publishes transient-local `/gps_p1/local_enu_origin` metadata so
+GICP++ can compare the live adapter datum with the GLIM map manifest.
 Frames default to the dome TF (`imu_link`, the Atlas Duo Center of Navigation
 — see `config/sensor_dome_tf.yaml` at the repo root).
 
@@ -19,7 +21,8 @@ distinguishes Fixed from Float.
 
 The legacy GLIM compatibility path remains `/pose` plus `/gps/fix`. It cannot
 distinguish Float from Fixed through REP-145 status and is not the production
-adapter path. `/odom_rtk_only` belongs to GICP++ and is not a GLIM input.
+adapter path. GICP++ now consumes `/gps_p1/filtered_odom_rtk_fixed` directly;
+its `/odom_rtk_only` helper output is legacy compatibility only.
 
 The adapter is also useful when:
 
@@ -57,7 +60,7 @@ semantics — so all of it was taken. Upstream PR #15 did not touch this package
 |---|---|
 | `imu_frame_id` / `body_frame_id` default to `imu_link` (Atlas Duo Center of Navigation, per `config/sensor_dome_tf.yaml`) instead of upstream's `gps_antenna_top` | `src/adapter_node.cpp`, `config/adapter.yaml` |
 | `adapter_utils` installed to `lib/` as a library (ARCHIVE/LIBRARY/RUNTIME) rather than `lib/adapter/` — required for the target to link in this workspace | `CMakeLists.txt` |
-| README reframed for the dome (the adapter is the *optional* ingestion path; the default chain is `/imu/data` + `/gps/fix` + `/pose` + `nav_sat_gated_odom`) | `README.md`, this file |
+| README reframed for the dome; GLIM++ and GICP++ production paths consume the adapter's `/gps_p1/*` outputs directly | `README.md`, this file |
 | `local_enu_origin` documented as an earlier-deployment **placeholder** that must be replaced with the deployment datum | `config/adapter.yaml`, `README.md` |
 
 The only merge conflict was the README's opening paragraph, where upstream

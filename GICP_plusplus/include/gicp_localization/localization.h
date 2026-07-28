@@ -3,6 +3,7 @@
 
 // DLIO types (PointType is a global typedef, not in dlio namespace)
 #include "dlio/dlio.h"
+#include "gicp_plusplus/small_gicp_backend.hpp"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -14,6 +15,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
@@ -32,9 +34,14 @@
 
 // STL
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace gicp_localization {
@@ -56,9 +63,8 @@ public:
   // Ground-truth odom sample (public so internal helper signatures can reference it).
   // p/q are header.frame_id=map; v_lin_body / v_ang_body are in child_frame_id (gt_body).
   // cov_pos_{xx,yy,zz} are the diagonal position-variance terms from
-  // pose.covariance[0,7,14] -- carried per-sample so consumers can decide whether
-  // the sample is RTK-FIXED quality (init / calibration / cross-check) or merely
-  // Atlas's INS-dead-reckoning quality (snap-recovery accepts either).
+  // pose.covariance[0,7,14] -- carried per-sample so every state-changing
+  // consumer can require RTK-FIXED quality.
   struct GtSample {
     double stamp;
     Eigen::Vector3f p;
@@ -82,13 +88,20 @@ public:
 
 private:
 
+  using PreparedGicpTarget =
+      gicp_plusplus::SmallGicpBackend<PointType, PointType>::PreparedTarget;
+  using PreparedGicpTargetPtr =
+      gicp_plusplus::SmallGicpBackend<PointType, PointType>::PreparedTargetPtr;
+
   void getParams();
   bool loadMap();
+  bool prepareMapTarget();
 
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc);
   void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  void callbackEnuOrigin(const std_msgs::msg::String::ConstSharedPtr msg);
   // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
   bool getGtPoseAt(double stamp, GtSample& out);
   // P2#2: world-frame (map) velocity of the gt_body origin by central finite
@@ -128,17 +141,24 @@ private:
   // Is the GT sample RTK-FIXED quality? Tests Atlas-reported pose covariance
   // against rtk_gate_max_pose_var_xy_ / rtk_gate_max_pose_var_z_. Used by
   // consumers (init/calibration/cross-check) that need cm-level truth.
-  // maybeSnapPoseToGT does NOT call this — the ported AV-24 rationale was
-  // that Atlas INS dead-reckoning is the next-best fallback to GICP failure.
-  // NOTE (dome wiring): /odom_rtk_only stops publishing entirely when the
-  // fix degrades below RTK-fixed, so in practice snap only ever sees
-  // RTK-fixed samples here and simply defers during outages — there is no
-  // degraded-INS fallback unless gt_odom is re-pointed at an ungated source.
+  // The production gt_odom source is the adapter's fixed-only stream. This
+  // covariance gate is defense in depth and is applied to init, calibration,
+  // cross-check, and recovery. During float/no-fix, state remains LiDAR+IMU.
   bool gtSampleIsRtkFixed(const GtSample& s) const;
 
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
   // Sensor-frame crop box; must run BEFORE deskew (world-frame transform).
   void cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud);
+  static int64_t localMapGridKey(int32_t ix, int32_t iy);
+  void buildLocalMapGrid();
+  PreparedGicpTargetPtr createLocalMapTarget(
+      const Eigen::Vector3f& center, double radius, int build_threads,
+      size_t* candidate_count = nullptr) const;
+  bool rebuildLocalMapTargetSync(const Eigen::Vector3f& center);
+  void buildLocalMapTargetAsync(Eigen::Vector3f center, uint64_t generation);
+  void launchLocalMapTargetBuild(const Eigen::Vector3f& center);
+  void adoptPendingLocalMapTarget(const Eigen::Vector3f& current_center);
+  bool ensureLocalMapTarget(const Eigen::Vector3f& center);
   void deskewPointcloud();
   void performLocalization();
   void publishPose();
@@ -147,9 +167,9 @@ private:
 
   // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
   // buffers, then `mergeAuxClouds` (called from the primary callback) finds
-  // the nearest aux scan per sensor, transforms its XYZ into the primary
-  // sensor frame, rebases per-point timestamps onto the primary clock, and
-  // appends the bytes to a copy of the primary PointCloud2.
+  // the closest absolute point-time range per sensor, transforms its XYZ into
+  // the primary sensor frame, and appends the bytes to a copy of the primary
+  // PointCloud2. Robin W timestamps stay on their shared absolute PTP axis.
   void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
@@ -176,6 +196,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gt_odom_sub;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr enu_origin_sub;
   rclcpp::CallbackGroup::SharedPtr pointcloud_cb_group, initial_pose_cb_group,
       imu_cb_group, gt_odom_cb_group;
 
@@ -191,8 +212,7 @@ private:
   // RTK quality gate for the gt_odom buffer (P1-native). Drops samples whose
   // Atlas-reported pose covariance (pose.covariance[0,7,14] -- xx, yy, zz)
   // exceeds the configured thresholds. The gate inspects the gt_odom message
-  // itself; no separate status topic is involved. Replaces the old
-  // BESTGNSSPOS-enum gate (removed when the NovAtel path was retired).
+  // itself; no separate receiver-specific status topic is involved.
   bool rtk_gate_enabled_;
   double rtk_gate_max_pose_var_xy_;  // m^2; a sample fails if cov[0] or cov[7] > this
   double rtk_gate_max_pose_var_z_;   // m^2; a sample fails if cov[14] > this
@@ -205,6 +225,7 @@ private:
   // base_frame ← gt_body TF once. Snap composes T_map_base = T_map_gtbody * inv(T_base_gtbody).
   bool gt_recovery_enabled_;
   int gt_recovery_min_consecutive_failures_;
+  double gt_recovery_sanity_radius_ = 10.0;
   int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
   // Write-once publication flag for the GT extrinsic cache. Atomic because
   // callbackGtOdom (GT callback group) writes T_base_gtbody_/gt_body_frame_
@@ -219,13 +240,21 @@ private:
 
   // Multi-LiDAR concatenation
   struct AuxLidar {
+    struct BufferedCloud {
+      sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+      bool point_time_valid = false;
+      double point_time_min_s = 0.0;
+      double point_time_max_s = 0.0;
+    };
+
     std::string topic;
     std::string frame;                          // header.frame_id of the aux sensor (URDF link)
     Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux
     bool extrinsic_cached;                       // true once T_primary_aux is resolved
     std::string extrinsic_source = "tf";        // "urdf" | "static" | "tf" (for logging)
-    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
+    std::deque<BufferedCloud> buffer;
     std::mutex mtx;
+    std::condition_variable cv;
     // P4#3: signed header-time offset stats vs the primary (aux - primary),
     // accumulated over MERGED scans only (scan-callback thread). A stable
     // nonzero mean is the signature of a constant per-aux clock offset vs the
@@ -234,13 +263,42 @@ private:
     double dt_min = std::numeric_limits<double>::infinity();
     double dt_max = -std::numeric_limits<double>::infinity();
     uint64_t dt_count = 0;
+    // Best achievable endpoint delta on every primary evaluation, including
+    // rejected candidates. This is the evidence used to tune the phase gate.
+    double endpoint_delta_sum = 0.0;
+    double endpoint_delta_min = std::numeric_limits<double>::infinity();
+    double endpoint_delta_max = 0.0;
+    uint64_t endpoint_delta_count = 0;
+    uint64_t endpoint_delta_reject_count = 0;
+    bool vertical_fov_validated = false;
   };
   std::vector<std::unique_ptr<AuxLidar>> aux_lidars_;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_subs_;
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
   bool concat_enabled_;
-  double concat_time_threshold_;
+  double concat_sweep_time_threshold_;
+  double concat_future_sweep_wait_timeout_ = 0.15;
   size_t concat_buffer_size_;
+
+  // Fail-closed raw-cloud quality gate. Every primary and auxiliary stream is
+  // measured independently before transforms or concatenation can hide a
+  // narrowed vertical field of view.
+  double lidar_min_vertical_fov_deg_ = 27.0;
+  size_t lidar_fov_min_valid_points_ = 100;
+  bool primary_lidar_fov_validated_ = false;
+
+  // Configured Robin W frame period. Robin W is rated 10-20 FPS and this
+  // component is documented to run at 20 Hz (recording/sensor_config.yaml),
+  // so the wire-contract bounds cannot be hardcoded to 10 Hz: at 20 FPS a
+  // 100 ms bound admits two fused frames as one. Set from
+  // localization/seyond_frame_duration_s.
+  double seyond_frame_duration_s_ = 0.100;
+  // Observed primary frame period, tracked so a configured value that does not
+  // match the running sensor is reported instead of silently loosening the
+  // gate. EWMA over header stamps; negative until enough frames have arrived.
+  double seyond_last_primary_stamp_s_ = -1.0;
+  double seyond_observed_frame_interval_s_ = -1.0;
+  uint64_t seyond_frame_interval_samples_ = 0;
   // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
   // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,
   // then a static per-aux matrix from yaml, then live TF as a last resort.
@@ -272,15 +330,6 @@ private:
   // returns true on success; false leaves the caller to fall back to live TF.
   std::vector<double> base_lidar_static_;       // row-major 4x4, "" = unset
   bool resolveBaseLidarExtrinsicOffline(const std::string& lidar_frame);
-
-  // Luminar multi-LiDAR deskew anchor. mergeAuxClouds() captures the PRIMARY
-  // scan's earliest per-point timestamp BEFORE appending aux clouds; the deskew
-  // LUMINAR branch anchors merged-sweep timing on this instead of the global
-  // merged minimum, so an aux scan that began before the primary does not shift
-  // the whole sweep late. Reset (valid=false) each scan; only set on the concat
-  // path. See deskewPointcloud().
-  uint64_t luminar_primary_min_ts_ns_ = 0;
-  bool luminar_primary_min_ts_valid_ = false;
 
   // Publishers
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
@@ -331,12 +380,12 @@ private:
   // Map
   pcl::PointCloud<PointType>::Ptr map_cloud;
   pcl::PointCloud<PointType>::Ptr map_cloud_ds; // downsampled for visualization
-  std::shared_ptr<const nano_gicp::CovarianceList> map_normals;
 
   // Current scan
   pcl::PointCloud<PointType>::Ptr current_scan;
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
+  double t_prior_stamp_ = 0.0;
   double prev_scan_stamp;
   double observer_dt_;
   std::string last_scan_input_frame_;
@@ -344,7 +393,7 @@ private:
   size_t last_preprocessed_point_count_;
 
   // GICP matcher
-  nano_gicp::NanoGICP<PointType, PointType> gicp;
+  gicp_plusplus::SmallGicpBackend<PointType, PointType> gicp;
 
   // Current pose estimate
   Eigen::Matrix4f current_pose;
@@ -384,7 +433,7 @@ private:
   bool imu_require_frame_match_{true};
   // One-shot guard for the defensive IMU header.frame_id consistency check
   // in callbackImu. The dome's single-source design assumes every IMU
-  // message comes from /imu/data (Atlas Duo via fusion_engine_driver) and is
+  // message comes from one explicitly allowed Atlas path and is
   // referenced at imu_frame (= "imu_link" in yaml). If someone re-points
   // imu_topic at a different IMU, the code would silently treat its axes as
   // if they were at imu_link. This flag arms a one-time warning so the
@@ -496,6 +545,16 @@ private:
 
   // Parameters
   std::string map_path_;
+  std::string map_manifest_path_;
+  std::string expected_enu_origin_;
+  bool require_map_manifest_ = true;
+  bool require_live_enu_origin_ = true;
+  double enu_origin_tolerance_m_ = 0.25;
+  bool map_enu_origin_loaded_ = false;
+  double map_enu_origin_lat_ = 0.0;
+  double map_enu_origin_lon_ = 0.0;
+  double map_enu_origin_alt_ = 0.0;
+  std::atomic<bool> enu_origin_validated_{false};
   double map_roll_deg_;
   double map_pitch_deg_;
   double map_yaw_deg_;
@@ -543,6 +602,13 @@ private:
   bool   yaw_gate_enable_;               // turn-aware GICP-vs-IMU yaw consistency veto
   double yaw_gate_max_corr_deg_;         // veto yaw when |yaw corr vs IMU prior| exceeds this...
   double yaw_gate_fitness_ratio_;        // ...AND fitness ratio exceeds this (low-confidence match)
+  // Optional small_gicp ground-vehicle constraints. Defaults retain the
+  // pre-migration unconstrained solve until a Robin W replay validates 4-DoF.
+  std::string gicp_dof_mode_;             // "6dof", "4dof" (fix roll/pitch), or "3dof" (also fix yaw)
+  int gicp_full6dof_every_n_;             // periodic unconstrained refresh; 0 disables
+  uint64_t gicp_dof_scan_counter_{0};
+  double gicp_prior_yaw_info_;            // soft IMU-attitude information, rad^-2
+  double gicp_prior_rollpitch_info_;      // soft IMU-attitude information, rad^-2
   std::deque<double> fitness_history_;   // accepted-frame fitness ring (scan thread only)
 
   // Preprocessing parameters
@@ -580,7 +646,7 @@ private:
 
   // Observer-correction stability bounds (P2#1). The proportional observer applies
   // dt*K corrections; this is forward-Euler and only stable for dt*K < 2. A long
-  // scan gap (dropped Luminar frames / high-speed racing) would otherwise inject a
+  // scan gap (dropped LiDAR frames / high-speed racing) would otherwise inject a
   // huge, unstable correction. Cap the effective timestep, and optionally clamp the
   // per-update position/velocity correction magnitude (0 = clamp disabled).
   double geo_observer_dt_max_;     // s   — cap on dt used in updateState corrections
@@ -626,6 +692,25 @@ private:
   bool visualize_map_;
   double map_voxel_size_vis_;
   double map_voxel_size_ = 0.3;  // GICP target-map voxel leaf (m); 0 disables
+  bool local_map_enable_ = true;
+  double local_map_radius_ = 150.0;
+  double local_map_grid_size_ = 150.0;
+  double local_map_rebuild_distance_ = 30.0;
+  double local_map_valid_center_offset_ = 90.0;
+  size_t local_map_min_points_ = 1000;
+  int local_map_build_threads_ = 1;
+  bool local_map_target_ready_ = false;
+  Eigen::Vector3f local_map_center_ =
+      Eigen::Vector3f::Constant(std::numeric_limits<float>::quiet_NaN());
+  PreparedGicpTargetPtr full_map_target_;
+  PreparedGicpTargetPtr active_local_map_target_;
+  PreparedGicpTargetPtr pending_local_map_target_;
+  Eigen::Vector3f pending_local_map_center_ = Eigen::Vector3f::Zero();
+  std::unordered_map<int64_t, std::vector<uint32_t>> local_map_grid_;
+  std::atomic<bool> local_map_rebuild_busy_{false};
+  std::atomic<uint64_t> local_map_generation_{0};
+  std::mutex local_map_pending_mtx_;
+  std::thread local_map_rebuild_thread_;
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
   rclcpp::TimerBase::SharedPtr input_health_timer_;
   // Hitch Sensor Dome — one-shot timer that warns if gt_odom never

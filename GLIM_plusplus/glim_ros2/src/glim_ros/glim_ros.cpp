@@ -99,6 +99,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     config_sensors.param<int>("sensors", "expected_time_datatype", 0);
   expected_time_is_absolute =
     config_sensors.param<bool>("sensors", "expected_time_is_absolute", false);
+  reject_zero_point_times =
+    config_sensors.param<bool>("sensors", "reject_zero_point_times", false);
   imu_input_rotation = config_sensors.param<Eigen::Quaterniond>("sensors", "imu_input_rotation", Eigen::Quaterniond::Identity());
   if (!imu_input_rotation.coeffs().allFinite() || imu_input_rotation.norm() < 1e-9) {
     throw std::invalid_argument("sensors.imu_input_rotation must be a finite, non-zero quaternion [x,y,z,w]");
@@ -112,11 +114,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       imu_input_rotation.z(),
       imu_input_rotation.w());
   }
-  // [P2 FIX 2026-07-15] Explicit Luminar-contract opt-in: when true, a FLOAT64
-  // per-point time field is decoded as raw uint64 PTP epoch nanoseconds (the
-  // documented Luminar driver variant) instead of IEEE-754 seconds. Default
-  // false so ordinary FLOAT64-seconds sensors (relative offsets, or Hesai
-  // absolute epoch seconds) are never misdecoded.
+  // Explicit compatibility opt-in for a raw uint64 epoch-nanosecond carrier
+  // mislabeled as FLOAT64. Robin W publishes numeric IEEE-754 epoch seconds,
+  // so the Hitch profile keeps this false.
   float64_time_is_epoch_ns = config_sensors.param<bool>("sensors", "float64_time_is_epoch_ns", false);
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
 
@@ -186,7 +186,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // TimeKeeper so it survives the absolute-time stamp overwrite. Previously the
   // offset was added to raw_points->stamp before process(), but the
   // absolute-time branch of replace_points_stamp overwrites the stamp with the
-  // raw min point time and silently discarded it for Luminar/absolute clouds.
+  // raw min point time and silently discarded it for absolute-time clouds.
   time_keeper->set_point_time_offset(points_time_offset);
   preprocessor.reset(new glim::CloudPreprocessor);
 
@@ -1504,11 +1504,37 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 #endif
 
 void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
-  std::lock_guard<std::mutex> lock(aux_buffers_mutex);
   if (aux_index >= aux_concat.aux_sensors.size()) {
     return;
   }
+  std::lock_guard<std::mutex> lock(aux_buffers_mutex);
   auto& aux = aux_concat.aux_sensors[aux_index];
+  glim_ros::VerticalFovMeasurement fov;
+  if (!glim_ros::verticalFovAccepted(
+        *msg, aux_concat.lidar_quality.minimum_vertical_fov_deg,
+        aux_concat.lidar_quality.minimum_valid_points, &fov)) {
+    ++aux.vertical_fov_reject_count;
+    if (aux.vertical_fov_reject_count <= 10 ||
+        aux.vertical_fov_reject_count % 100 == 0) {
+      spdlog::error(
+        "lidar_quality: rejecting live aux cloud on {} before buffering: "
+        "robust vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), "
+        "required >= {:.2f} deg; valid sampled returns={}/{}. Reason: {}.",
+        aux.topic, fov.span_deg, fov.lower_deg, fov.upper_deg,
+        aux_concat.lidar_quality.minimum_vertical_fov_deg, fov.valid_points,
+        fov.sampled_points, fov.reason);
+    }
+    return;
+  }
+  if (!aux.vertical_fov_validated) {
+    aux.vertical_fov_validated = true;
+    spdlog::info(
+      "lidar_quality: live aux vertical-FOV gate passed on {}: robust span "
+      "{:.2f} deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+      aux.topic, fov.span_deg, fov.lower_deg, fov.upper_deg,
+      fov.valid_points);
+  }
+
   aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg, aux_concat.float64_time_is_epoch_ns));
   while (aux.buffer.size() > aux.buffer_size) {
     aux.buffer.pop_front();
@@ -1526,11 +1552,47 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
   points_callback(msg);
 }
 
-size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count, bool* ingested) {
+size_t GlimROS::points_callback(
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+  int epoch_anchor_count,
+  bool* ingested,
+  bool raw_sensor_fov_validated) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (ingested) {
     *ingested = false;
   }
+
+  // Concatenated offline clouds have already had every raw sensor checked in
+  // merge_clouds(). All other callers must be checked here before extraction.
+  if (!raw_sensor_fov_validated) {
+    glim_ros::VerticalFovMeasurement fov;
+    if (!glim_ros::verticalFovAccepted(
+          *msg, aux_concat.lidar_quality.minimum_vertical_fov_deg,
+          aux_concat.lidar_quality.minimum_valid_points, &fov)) {
+      ++aux_concat.lidar_quality.primary_reject_count;
+      if (aux_concat.lidar_quality.primary_reject_count <= 10 ||
+          aux_concat.lidar_quality.primary_reject_count % 100 == 0) {
+        spdlog::error(
+          "lidar_quality: rejecting primary cloud before GLIM: robust "
+          "vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), required "
+          ">= {:.2f} deg; valid sampled returns={}/{}. Reason: {}. "
+          "A narrowed vertical FOV does not provide enough vertical structure "
+          "for stable SLAM.",
+          fov.span_deg, fov.lower_deg, fov.upper_deg,
+          aux_concat.lidar_quality.minimum_vertical_fov_deg, fov.valid_points,
+          fov.sampled_points, fov.reason);
+      }
+      return 0;
+    }
+    if (!aux_concat.lidar_quality.primary_validated) {
+      aux_concat.lidar_quality.primary_validated = true;
+      spdlog::info(
+        "lidar_quality: primary vertical-FOV gate passed: robust span {:.2f} "
+        "deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+        fov.span_deg, fov.lower_deg, fov.upper_deg, fov.valid_points);
+    }
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
@@ -1555,18 +1617,21 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
   if (expected_time_is_absolute) {
     const auto range =
-      glim_ros::luminar_timestamp_range(*msg, float64_time_is_epoch_ns);
+      glim_ros::decode_point_time_range(*msg, float64_time_is_epoch_ns);
     const double header_s = glim_ros::stamp_to_sec(msg->header.stamp);
     const double first_point_s =
       range.valid ? static_cast<double>(range.min_ns) * 1.0e-9 : 0.0;
-    if (!range.valid || !std::isfinite(header_s) ||
+    if (!range.valid ||
+        (reject_zero_point_times && range.zero_count != 0) ||
+        !std::isfinite(header_s) ||
         std::abs(first_point_s - header_s) > 1.0) {
       spdlog::error(
         "rejecting point cloud: '{}' must contain finite absolute epoch times "
-        "within 1 s of header.stamp (header={:.9f}, first_point={:.9f}). "
+        "within 1 s of header.stamp (header={:.9f}, first_point={:.9f}, "
+        "zero_timestamps={}). "
         "For Robin W, expect numeric FLOAT64 Unix seconds reconstructed by the "
         "pinned Seyond ROS 2 driver.",
-        expected_time_field, header_s, first_point_s);
+        expected_time_field, header_s, first_point_s, range.zero_count);
       return 0;
     }
   }
@@ -1585,7 +1650,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
   // [P3 FIX 2026-07-14] points_time_offset is now applied inside TimeKeeper
   // (see the constructor), AFTER any absolute-time stamp overwrite, so it is no
-  // longer silently discarded for Luminar/absolute clouds.
+  // longer silently discarded for absolute-time clouds.
   if (!time_keeper->process(raw_points)) {
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
     return 0;

@@ -217,10 +217,11 @@ else
 fi
 
 # Fail closed if a future source or local edit changes the ROS wire contract.
-# The SDK payload stores a compact point offset (`ts_10us`); the driver hydrates
+# The raw packet stores a compact point offset (`ts_10us`); the driver hydrates
 # it with the packet's absolute PTP/GPS start before PCL creates PointCloud2.
 SEYOND_DRIVER_SOURCE="src/seyond_lidar_ros/src/driver/driver_lidar.cc"
 SEYOND_POINT_TYPES="src/seyond_lidar_ros/src/driver/point_types.h"
+SEYOND_ROS2_ADAPTER="src/seyond_lidar_ros/src/driver/ros2_driver_adapter.hpp"
 grep -Fq "double timestamp;" "$SEYOND_POINT_TYPES" || \
     fail "Seyond PointXYZIT no longer declares timestamp as double/FLOAT64"
 grep -Fq "(double, timestamp, timestamp)" "$SEYOND_POINT_TYPES" || \
@@ -229,7 +230,11 @@ grep -Fq \
     "point.timestamp = point_ptr->ts_10us / ten_us_in_second_c + current_ts_start_;" \
     "$SEYOND_DRIVER_SOURCE" || \
     fail "Seyond point timestamp is no longer absolute packet-start + point-offset seconds"
-ok "Verified Robin W ROS contract: timestamp/FLOAT64 absolute Unix seconds"
+grep -Fq "frame_data.timestamp = frame_start_ts_;" "$SEYOND_DRIVER_SOURCE" || \
+    fail "Seyond completed frames are no longer tagged with frame_start_ts_"
+grep -Fq "int64_t ts_ns = timestamp * 1000;" "$SEYOND_ROS2_ADAPTER" || \
+    fail "Seyond ROS 2 header.stamp is no longer derived from frame-start microseconds"
+ok "Verified Robin W ROS contract: frame-start header + timestamp/FLOAT64 absolute Unix seconds"
 
 info "Building Seyond driver (this may take a few minutes)..."
 source_ros_setup

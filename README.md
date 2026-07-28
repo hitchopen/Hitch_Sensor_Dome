@@ -117,7 +117,8 @@ GICP_plusplus/                LiDAR-only localization (fork of vectr-ucla/DLIO)
   cfg/                    localization.yaml (race) + localization_safe.yaml
   launch/                 localization_with_tf.launch.py + systemd units
   scripts/                merge_glim_submaps.py + diagnostic tooling
-  include/, src/          nano_gicp + localizer + nav_sat_gated_odom
+  include/, src/          small_gicp adapter + localizer + nav_sat_gated_odom
+  thirdparty/small_gicp/  vendored header-only registration backend
   README.md               Fork notice, two-mode design, race vs safe
 ```
 
@@ -211,6 +212,11 @@ apart. Full table, derivations, and the two standing caveats are in
 
 ### LiDAR per-point timestamp standard
 
+The repository targets ROS 2 Humble on Ubuntu 22.04 and ROS 2 Jazzy on Ubuntu
+24.04. Humble compatibility is mandatory for the official Seyond deployment
+path, so the LiDAR contract and its consumers use only APIs common to both
+distributions.
+
 The following `sensor_msgs/PointCloud2` layouts are the **canonical ingestion
 contract for this repository**. Field name, ROS datatype, unit, and origin are
 all part of the contract; datatype alone is not enough to infer the time axis.
@@ -227,12 +233,12 @@ all part of the contract; datatype alone is not enough to infer the time axis.
 
 The two layers must not be conflated:
 
-- **Raw SDK/packet layer:** each point carries a compact offset from its
-  packet/frame time origin. Vendor material may describe this logically as a
-  relative `FLOAT32`; in the pinned driver source the concrete carrier is
-  `ts_10us`, in 10 microsecond ticks. It is not an absolute epoch value.
-- **Hydrated ROS 2 layer:** the driver publishes PCL `double timestamp`, which
-  becomes `sensor_msgs/PointCloud2` field
+- **Raw packet layer:** each point carries `ts_10us`, a compact offset from its
+  packet/frame time origin in 10 microsecond ticks. Robin W frames are 100 ms,
+  so a frame contains at most about 10,000 timestamp quanta. This raw offset is
+  not an absolute epoch value.
+- **Hydrated SDK/PCL/ROS 2 layer:** the driver publishes `double timestamp`, as
+  confirmed by Seyond support. PCL converts it to the `sensor_msgs/PointCloud2` field
   `timestamp/FLOAT64/count=1`, in absolute Unix seconds.
 
 The reviewed driver computes:
@@ -261,6 +267,9 @@ timestamp to `FLOAT32`, because that destroys sub-second deskew precision.
 GLIM uses `perpoint_relative_time=false`, scale `1.0`, and normalizes the
 absolute values to offsets from the first point for deskew. GICP++ uses its
 explicit `seyond` path and deskews directly on the same absolute values.
+The official driver filters invalid returns before publication and hydrates
+every published point timestamp; therefore a zero timestamp is not a valid
+ROS-layer sentinel. GLIM++ and GICP++ reject a Robin W cloud containing one.
 During three-LiDAR concatenation, absolute point timestamps are **not**
 shifted by `aux_header_stamp - primary_header_stamp`; they already identify
 capture time on the shared PTP axis. `float64_time_is_epoch_ns` remains
@@ -283,6 +292,26 @@ The generic GLIM converter retains support for Hesai absolute seconds, Livox
 numeric epoch nanoseconds, relative-time LiDARs, and explicit
 raw-epoch-nanosecond carriers, but those compatibility paths do not redefine
 the Robin W contract above.
+
+### LiDAR vertical-FOV startup gate
+
+Each Robin W must provide approximately its nominal **30 degree vertical field
+of view**. GLIM++ and GICP++ announce this gate at startup, then validate the
+first and every subsequent raw PointCloud2 before cropping, deskewing,
+transforming, or concatenating it. Each of the three streams is checked
+independently, so the wide angular union of a merged cloud cannot hide one
+degraded LiDAR.
+
+The measured span is the 0.5th-to-99.5th percentile of finite, nonzero XYZ
+return elevations. The production threshold is **27 degrees** with at least
+**100 valid sampled returns**. Percentile trimming prevents one stray
+high-angle point from making a narrow cloud pass. A cloud below the threshold,
+with too few valid returns, or with an invalid XYZ layout is logged and
+rejected before it reaches SLAM; a first-pass message is also logged for each
+sensor. The safety knobs are
+`lidar_quality.min_vertical_fov_deg` / `min_valid_points` in GLIM and
+`localization/lidar_quality/min_vertical_fov_deg` / `min_valid_points` in
+GICP.
 
 The fitness-ratio thresholds, `hessianCondMax`, and the
 dense-map profile were calibrated on earlier datasets from a different
@@ -399,10 +428,10 @@ For online scan-to-map localization against a pre-built PCD, the project ships *
 
 Key project upgrades vs. the upstream VECTR DLIO:
 
-1. **Robin W + Atlas Duo targeting** — topic / frame / URDF defaults match the Hitch dome out of the box (`/imu/data`, `/odom_rtk_only`, `/robin_w_*/points`; `base_link`/`imu_link`/`lidar_front_link` from `config/sensor_dome_tf.yaml`).
-2. **RTK-gated INS odometry republisher** ([`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc)) — exposes `/odom_rtk_only` only when `/gps/fix` shows STATUS_GBAS_FIX with cm-grade covariance, closing the "trust whatever arrives on gt_odom" gap that upstream leaves to the operator.
+1. **Robin W + Atlas Duo targeting** — defaults use low-latency `/imu/data`, adapter `/gps_p1/filtered_odom_rtk_fixed`, and `/robin_w_*/points`; adapter `/gps_p1/imu` is also allowed for normalized replay. Frames come from `config/sensor_dome_tf.yaml`.
+2. **Fixed-only RTK policy** — the adapter checks FusionEngine `solution_type == RTK_FIXED` and covariance before publishing `/gps_p1/filtered_odom_rtk_fixed`. Float/no-fix periods use LiDAR+IMU only. The optional [`nav_sat_gated_odom`](GICP_plusplus/src/nav_sat_gated_odom.cc) compatibility bridge is fail-closed for covariance and freshness, but REP-145 `STATUS_GBAS_FIX` is only RTK-class and cannot itself distinguish float from fixed.
 3. **Two-mode design** — `cfg/localization.yaml` (race base) + `cfg/localization_safe.yaml` (overlay) layered by the launch file's `mode:=race|safe|custom` arg, with paired mutually-exclusive systemd units for production deployment.
-4. **GLIM++ map bridge** — `scripts/merge_glim_submaps.py` walks `<dump_path>/NNNNNN/` submap directories, applies each `T_world_origin`, concatenates and writes a single PCD with race-mode filters (Z-clip, centerline mask, outlier removal, voxel downsample). Eliminates the offline_viewer GUI step.
+4. **Verified GLIM++ map bridge** — `GLIM_plusplus/scripts/export_glim_dump_to_pcd.py` decodes the exact compact layout, applies each `T_world_origin` and `inverse(T_world_utm)`, and writes an ENU PCD plus datum manifest. The adapter publishes its resolved datum on transient-local `/gps_p1/local_enu_origin`; GICP refuses point clouds and RTK odometry until that live datum matches the manifest.
 5. **GICP warm-start** — eager kd-tree build at init + one dummy align to burn OpenMP thread-pool spin-up, Eigen JIT, and source-side kd-tree allocation before the first real scan.
 6. **Yaw-rate adaptive observer** — `Kp` and `Kq` in the geometric observer auto-attenuate at high body-frame yaw rate so the IMU prediction takes precedence through corner entries where GICP is most likely to slide.
 7. **Motion-variance gate on IMU calibration** — refuses the stationary-bias calibration window if the vehicle is moving (σ‖a‖ > 0.10 m/s²); falls back to RTK-driven calibration via the gt_odom path.
@@ -410,21 +439,26 @@ Key project upgrades vs. the upstream VECTR DLIO:
 9. **base_link / imu_link split** — localizer reports pose in `base_link` (configurable per vehicle via [`config/sensor_dome_tf.yaml`](config/sensor_dome_tf.yaml)) even though GLIM++ builds the map in `imu_link`. Same map works across vehicles with different body frames.
 
 ```bash
-# 1. Build a map offline with GLIM++ (see Mapping section above), then
-#    merge per-submap dumps into a single PCD:
-python3 GICP_plusplus/scripts/merge_glim_submaps.py \
-    /tmp/dump  /tmp/race_map.pcd \
-    --voxel-res 0.4 --outlier-k 12 --outlier-std 2.0 \
-    --z-min -2.0 --z-max 5.0 --copy-utm
+# The surveyed datum must be identical in the adapter, map export, and GICP.
+ENU_ORIGIN="<lat_deg>,<lon_deg>,<alt_m>"
+
+# 1. Build a map offline with GLIM++ (see Mapping above), then export GLIM
+#    WORLD into the surveyed local-ENU frame. This also writes
+#    /tmp/race_map.pcd.manifest.yaml.
+python3 GLIM_plusplus/scripts/export_glim_dump_to_pcd.py \
+    /tmp/dump /tmp/race_map.pcd \
+    --frame enu --enu-origin "${ENU_ORIGIN}" --voxel-size 0.4
 
 # 2. Run the localizer in race mode (default):
 ros2 launch gicp_localization localization_with_tf.launch.py \
-    map_path:=/tmp/race_map.pcd
+    map_path:=/tmp/race_map.pcd \
+    local_enu_origin:="${ENU_ORIGIN}"
 
 # Or safe mode (3× LiDARs, full coverage, all debug on):
 ros2 launch gicp_localization localization_with_tf.launch.py \
     mode:=safe \
-    map_path:=/tmp/race_map.pcd
+    map_path:=/tmp/race_map.pcd \
+    local_enu_origin:="${ENU_ORIGIN}"
 ```
 
 See [`GICP_plusplus/README.md`](GICP_plusplus/README.md) for the complete file-by-file changelog vs. upstream, side-by-side race vs. safe knob table, systemd unit installation, and latency budget breakdown.

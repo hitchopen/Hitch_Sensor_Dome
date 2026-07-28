@@ -24,6 +24,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
 #include "sensor_msgs/msg/nav_sat_status.hpp"
+#include "std_msgs/msg/string.hpp"
 
 namespace {
 
@@ -103,6 +104,8 @@ public:
     require_positive_finite("imu_p1_sidecar_match_tolerance_sec",
                             imu_p1_sidecar_match_tolerance_sec_);
     require_positive_finite("pose_max_forward_jump_sec", pose_max_forward_jump_sec_);
+    require_positive_finite("rtk_max_var_xy", rtk_max_var_xy_);
+    require_positive_finite("rtk_max_var_z", rtk_max_var_z_);
 
     if (!imu_p1_sidecar_path_.empty()) {
       loadImuP1Sidecar(imu_p1_sidecar_path_);
@@ -149,6 +152,18 @@ public:
     local_cartesian_.Reset(local_origin_lat_, local_origin_lon_, local_origin_alt_);
 
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/gps_p1/imu", rclcpp::SensorDataQoS());
+    auto origin_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+    origin_qos.reliable();
+    origin_qos.transient_local();
+    enu_origin_pub_ = create_publisher<std_msgs::msg::String>(
+      "/gps_p1/local_enu_origin", origin_qos);
+    std_msgs::msg::String origin_msg;
+    std::ostringstream origin_stream;
+    origin_stream << std::fixed << std::setprecision(8)
+                  << local_origin_lat_ << "," << local_origin_lon_ << ","
+                  << std::setprecision(3) << local_origin_alt_;
+    origin_msg.data = origin_stream.str();
+    enu_origin_pub_->publish(origin_msg);
     if (navsat_fix_topic_.empty()) {
       throw std::runtime_error("navsat_fix_topic must not be empty");
     }
@@ -872,6 +887,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr timer_group_;
 
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr enu_origin_pub_;
   rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr navsat_fix_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gnss_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gnss_rtk_pub_;

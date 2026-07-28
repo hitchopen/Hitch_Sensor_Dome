@@ -67,6 +67,8 @@ User=hitch
 Group=hitch
 WorkingDirectory=/home/hitch/ros2_ws
 Environment=ROS_DISTRO=jazzy
+# Set to the same surveyed datum passed to the adapter and map exporter.
+Environment=LOCAL_ENU_ORIGIN=
 
 # Source ROS 2 + the colcon workspace, then launch with mode:=race
 # (the default — explicit here for clarity). The launch file uses the
@@ -78,7 +80,8 @@ ExecStart=/bin/bash -c 'source /opt/ros/${ROS_DISTRO}/setup.bash && \
                             localization_with_tf.launch.py \
                             mode:=race \
                             rviz:=false \
-                            run_rtk_gate:=true'
+                            run_rtk_gate:=false \
+                            local_enu_origin:=${LOCAL_ENU_ORIGIN}'
 
 # --- Performance knobs ---
 CPUAffinity=4 5 6 7

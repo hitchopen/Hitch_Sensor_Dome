@@ -31,13 +31,12 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/robin_w_front/points')
     imu_topic = LaunchConfiguration('imu_topic', default='/imu/data')
-    odom_topic = LaunchConfiguration('odom_topic', default='/odom')
-    # gt_odom is the RTK-quality-gated INS odometry. The nav_sat_gated_odom
-    # helper (built from GICP_plusplus/src/nav_sat_gated_odom.cc) subscribes
-    # to the Atlas Duo's /odom and /gps/fix and republishes here only when
-    # RTK is fixed and covariance is cm-grade. Localizer treats any
-    # arriving message as RTK-fixed (matches the upstream module's contract).
-    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/odom_rtk_only')
+    # The adapter publishes this topic only for genuine SolutionType::RtkFixed.
+    # Float/no-fix periods therefore fall back to LiDAR+IMU localization.
+    gt_odom_topic = LaunchConfiguration(
+        'gt_odom_topic', default='/gps_p1/filtered_odom_rtk_fixed')
+    enu_origin_topic = LaunchConfiguration(
+        'enu_origin_topic', default='/gps_p1/local_enu_origin')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
@@ -52,17 +51,15 @@ def generate_launch_description():
         description='Primary Robin W point cloud topic (the front sensor by default).')
     declare_imu_topic_arg = DeclareLaunchArgument(
         'imu_topic', default_value=imu_topic,
-        description='Atlas Duo IMU topic (used for the motion prior and observer).')
-    declare_odom_topic_arg = DeclareLaunchArgument(
-        'odom_topic', default_value=odom_topic,
-        description='Atlas Duo INS odometry topic (used for init when '
-                    'gt_odom is unavailable). Default /odom.')
+        description='Atlas Duo IMU topic. /imu/data is the low-latency live '
+                    'default; /gps_p1/imu is supported for normalized replay.')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(
         'gt_odom_topic', default_value=gt_odom_topic,
-        description='RTK-gated INS odometry topic (default /odom_rtk_only, '
-                    'produced by nav_sat_gated_odom). Used for cross-check '
-                    'and pose-recovery snap when gt_odom/enable=true and/or '
-                    'gt_recovery/enable=true.')
+        description='Adapter RTK-fixed-only INS odometry. Used for initial '
+                    'pose, cross-check, calibration, and recovery.')
+    declare_enu_origin_topic_arg = DeclareLaunchArgument(
+        'enu_origin_topic', default_value=enu_origin_topic,
+        description='Transient-local adapter datum metadata topic.')
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation.')
@@ -85,6 +82,15 @@ def generate_launch_description():
         description='Path to PCD map file for localization (overrides '
                     'localization.yaml when non-empty). Use the PCD produced '
                     'by GLIM_plusplus offline mapping.')
+    declare_local_enu_origin_arg = DeclareLaunchArgument(
+        'local_enu_origin', default_value='',
+        description='Optional explicit "lat_deg,lon_deg,alt_m" assertion '
+                    'against the map manifest. Live adapter metadata is still '
+                    'validated by default.')
+    declare_require_live_enu_origin_arg = DeclareLaunchArgument(
+        'require_live_enu_origin', default_value='true',
+        description='Require transient-local datum metadata from the live '
+                    'adapter before accepting point clouds or GT odometry.')
 
     # Hitch Sensor Dome — two-mode selector.
     # race (default): front-only LiDAR, tight crop, fewer GICP iters,
@@ -106,29 +112,22 @@ def generate_launch_description():
 
     # Hitch Sensor Dome: RTK-gating republisher controls.
     declare_run_rtk_gate_arg = DeclareLaunchArgument(
-        'run_rtk_gate', default_value='true',
-        description='Spawn nav_sat_gated_odom alongside the localizer. The '
+        'run_rtk_gate', default_value='false',
+        description='Compatibility mode: spawn nav_sat_gated_odom. The '
                     'helper subscribes to ins_odom_topic + ins_fix_topic and '
-                    'republishes on gt_odom_topic only when /gps/fix shows '
-                    'RTK-fixed status. Set false if your bag already contains '
-                    'a pre-gated topic.')
+                    'republishes RTK-class samples on gt_odom_topic. Keep '
+                    'false with the adapter fixed-only topic.')
     declare_ins_odom_topic_arg = DeclareLaunchArgument(
-        'ins_odom_topic', default_value='/odom',
+        'ins_odom_topic', default_value='/gps_p1/filtered_odom',
         description='Atlas Duo INS odometry topic (input to nav_sat_gated_odom).')
     declare_ins_fix_topic_arg = DeclareLaunchArgument(
-        'ins_fix_topic', default_value='/gps/fix',
+        'ins_fix_topic', default_value='/gps_p1/fix',
         description='Atlas Duo NavSatFix topic — the RTK quality signal.')
-    declare_rtk_require_fixed_arg = DeclareLaunchArgument(
-        'rtk_require_fixed', default_value='true',
-        description='If true, require NavSatFix.status >= GBAS_FIX before '
-                    'forwarding an Odometry message. Set false to allow '
-                    'SBAS / single-point through (degraded; recovery snaps '
-                    'will use lower-quality reference poses).')
     declare_rtk_max_pos_sigma_arg = DeclareLaunchArgument(
         'rtk_max_position_stddev', default_value='0.10',
         description='Reject NavSatFix samples whose position covariance σ '
-                    'exceeds this (m). 0.10 m matches RTK-fixed; raise to '
-                    '0.5 for SBAS-class.')
+                    'exceeds this (m). This compatibility bridge always '
+                    'requires RTK-class status.')
 
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
 
@@ -175,6 +174,8 @@ def generate_launch_description():
     # GICP Localization Node
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
+        local_enu_origin_value = LaunchConfiguration(
+            'local_enu_origin').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         mode_value = LaunchConfiguration('mode').perform(context).strip().lower()
 
@@ -199,6 +200,12 @@ def generate_launch_description():
 
         params.append({'localization/lidar_frame': child_frame_value})
         params.append({
+            'localization/expected_enu_origin': local_enu_origin_value,
+            'localization/require_live_enu_origin': ParameterValue(
+                LaunchConfiguration('require_live_enu_origin'),
+                value_type=bool),
+        })
+        params.append({
             'localization/imu_only': ParameterValue(
                 LaunchConfiguration('imu_only'), value_type=bool),
         })
@@ -213,8 +220,8 @@ def generate_launch_description():
             remappings=[
                 ('pointcloud', pointcloud_topic),
                 ('imu', imu_topic),
-                ('odom', odom_topic),
                 ('gt_odom', gt_odom_topic),
+                ('enu_origin', enu_origin_topic),
                 ('localized_pose', 'gicp/localization/pose'),
                 ('localized_odom', 'gicp/localization/odom'),
                 ('localized_path', 'gicp/localization/path'),
@@ -230,7 +237,7 @@ def generate_launch_description():
         ins_fix  = LaunchConfiguration('ins_fix_topic').perform(context)
         out_odom = LaunchConfiguration('gt_odom_topic').perform(context)
         params = [{
-            'require_rtk_fixed': LaunchConfiguration('rtk_require_fixed').perform(context).lower() == 'true',
+            'require_rtk_fixed': True,
             'max_position_stddev': float(LaunchConfiguration('rtk_max_position_stddev').perform(context)),
             'max_fix_age_s': 0.5,
             'report_interval_s': 10.0,
@@ -282,18 +289,19 @@ def generate_launch_description():
         declare_rviz_arg,
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
-        declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
+        declare_enu_origin_topic_arg,
         declare_imu_only_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,
         declare_map_path_arg,
+        declare_local_enu_origin_arg,
+        declare_require_live_enu_origin_arg,
         declare_mode_arg,
         declare_run_rtk_gate_arg,
         declare_ins_odom_topic_arg,
         declare_ins_fix_topic_arg,
-        declare_rtk_require_fixed_arg,
         declare_rtk_max_pos_sigma_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_rtk_gate),

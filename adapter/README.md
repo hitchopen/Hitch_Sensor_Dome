@@ -74,6 +74,9 @@ be described as Fixed-only GNSS mapping.
   other valid solution classes map below it, and invalid covariance is
   published as `COVARIANCE_TYPE_UNKNOWN`.
 - `/gps_p1/imu` (`sensor_msgs/msg/Imu`): retimed Atlas IMU.
+- `/gps_p1/local_enu_origin` (`std_msgs/msg/String`): canonical
+  `lat,lon,alt` datum metadata, reliable and transient-local for GLIM/GICP
+  frame-contract validation.
 
 Set `publish_gnss_pose=false` when a prep/recording pipeline only needs the
 `/gps_p1/*` compatibility streams and should not create `/gnss*` publishers.

@@ -120,6 +120,22 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "--float64-time-is-epoch-ns is an absolute-time encoding and "
             "cannot be combined with --no-point-times-absolute"
         )
+    if args.reject_zero_point_times and not args.point_times_absolute:
+      raise ValueError(
+            "--reject-zero-point-times applies only to an absolute time axis; "
+            "relative sweeps legitimately begin at zero"
+        )
+    if (
+        not math.isfinite(args.min_vertical_fov_deg)
+        or args.min_vertical_fov_deg < 25.0
+        or args.min_vertical_fov_deg > 30.0
+    ):
+        raise ValueError(
+            "--min-vertical-fov-deg must be finite and within [25, 30] "
+            "degrees for the Robin W profile"
+        )
+    if args.min_fov_valid_points < 100 or args.min_fov_valid_points > 20_000:
+        raise ValueError("--min-fov-valid-points must be within [100, 20000]")
     if not math.isfinite(args.gnss_min_baseline) or args.gnss_min_baseline <= 0.0:
         raise ValueError("--gnss-min-baseline must be a finite positive value")
     if not math.isfinite(args.gnss_fit_max_rms):
@@ -204,6 +220,10 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     sensors = {
+        "lidar_quality": {
+            "min_vertical_fov_deg": args.min_vertical_fov_deg,
+            "min_valid_points": args.min_fov_valid_points,
+        },
         "lidar_concat": {
             "enabled": concat_enabled,
             "primary_frame": args.primary_frame,
@@ -237,6 +257,7 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
                 "FLOAT64": 8,
             }[args.point_time_datatype],
             "expected_time_is_absolute": args.point_times_absolute,
+            "reject_zero_point_times": args.reject_zero_point_times,
             "autoconf_perpoint_times": False,
             "autoconf_prefer_frame_time": False,
             "float64_time_is_epoch_ns": args.float64_time_is_epoch_ns,
@@ -463,6 +484,9 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "submap_target_points": args.submap_points,
             "loop_registration_points": args.loop_registration_points,
             "points_topic": args.points_topic,
+            "reject_zero_point_times": args.reject_zero_point_times,
+            "min_vertical_fov_deg": args.min_vertical_fov_deg,
+            "min_fov_valid_points": args.min_fov_valid_points,
             "T_lidar_imu": t_lidar_imu,
             "imu_input_rotation": imu_input_rotation,
             "urdf_path": sensors["lidar_concat"]["urdf_path"],
@@ -549,6 +573,20 @@ def parse_args() -> argparse.Namespace:
     # Hitch Sensor Dome defaults (Seyond Robin W). Override for other rigs.
     parser.add_argument("--points-topic", default="/robin_w_front/points")
     parser.add_argument("--primary-frame", default="lidar_front_link")
+    parser.add_argument(
+        "--min-vertical-fov-deg",
+        type=float,
+        default=27.0,
+        help="Reject a raw LiDAR stream whose robust elevation span is below "
+        "this value. Robin W is nominally 30 degrees; allowed range is 25-30.",
+    )
+    parser.add_argument(
+        "--min-fov-valid-points",
+        type=int,
+        default=100,
+        help="Minimum finite, nonzero sampled XYZ returns required to measure "
+        "vertical FOV.",
+    )
     parser.add_argument("--t-lidar-imu", nargs=7, required=True, type=float)
     parser.add_argument(
         "--imu-input-rotation",
@@ -580,6 +618,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Declare the per-point time axis absolute. The Hitch Sensor Dome "
         "default is true because Robin W uses FLOAT64 Unix seconds.",
+    )
+    parser.add_argument(
+        "--reject-zero-point-times",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject clouds containing an absolute zero timestamp. Enabled for "
+        "the official Robin W ROS contract; disable only for another driver "
+        "whose documented absolute-time layout uses zero as a sentinel.",
     )
     parser.add_argument("--intensity-field", default="reflectance")
     parser.add_argument("--ring-field", default="line_index")

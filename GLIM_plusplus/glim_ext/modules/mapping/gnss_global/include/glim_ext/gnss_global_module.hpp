@@ -174,7 +174,12 @@ public:
     // degrees of yaw, and the in-sample RMS reported ~0 because the fit had
     // reproduced that noisy segment exactly. RMS measures fit CONSISTENCY,
     // not yaw OBSERVABILITY.
-    fit_min_samples = std::max(2, config.param<int>("gnss", "fit_min_samples", 10));
+    fit_min_samples = config.param<int>("gnss", "fit_min_samples", 10);
+    if (fit_min_samples < 10) {
+      throw std::invalid_argument(
+        "gnss.fit_min_samples must be >= 10; shorter windows do not "
+        "reliably observe the world/GNSS yaw");
+    }
     // Independent (out-of-sample) validation. After a candidate transform is
     // estimated, it must additionally predict this many SUBSEQUENT samples —
     // none of which were used in the fit — to within fit_max_rms before it is
@@ -303,13 +308,17 @@ public:
     // flush threw, or the batch never reached one). There is no ISAM2 handle
     // here, so resolve conservatively as lost rather than dropping it from the
     // accounting entirely.
-    if (pending_delivery_count_ > 0) {
-      factors_lost_in_update_ += pending_delivery_count_;
-      logger->error(
-        "{} GNSS prior factor(s) were still awaiting optimizer confirmation at exit — "
-        "the final update did not complete; counting them as UNDELIVERED",
-        pending_delivery_count_);
-      pending_delivery_count_ = 0;
+    {
+      std::lock_guard<std::mutex> delivery_lock(factor_delivery_mtx_);
+      if (pending_delivery_count_ > 0) {
+        factors_lost_in_update_ += pending_delivery_count_;
+        logger->error(
+          "{} GNSS prior factor(s) were still awaiting optimizer confirmation at exit — "
+          "the final update did not complete; counting them as UNDELIVERED",
+          pending_delivery_count_);
+        pending_delivery_count_ = 0;
+        pending_delivery_anchors_.clear();
+      }
     }
     const uint64_t pf = position_factor_count.load();
     const uint64_t of = orientation_factor_count.load();
@@ -515,19 +524,15 @@ public:
       // factors_undelivered=0 for factors that never reached graph.bin, i.e.
       // the one metric operators are told to gate acceptance on could lie.
       // Delivery is now confirmed in on_smoother_update_result() below.
+      std::lock_guard<std::mutex> lock(factor_delivery_mtx_);
       pending_delivery_count_ += factors.size();
       graph_size_at_update_ = isam2.getFactorsUnsafe().size();
-    }
-    if (!delivered_anchors.empty()) {
-      std::lock_guard<std::mutex> lock(delivered_anchor_mtx_);
-      for (const auto& anchor : delivered_anchors) {
-        if (delivered_anchor_positions_.size() <= anchor.submap_id) {
-          delivered_anchor_positions_.resize(
-            anchor.submap_id + 1,
-            Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
-        }
-        delivered_anchor_positions_[anchor.submap_id] = anchor.position;
-      }
+      pending_delivery_anchors_.swap(delivered_anchors);
+    } else if (!delivered_anchors.empty()) {
+      logger->error(
+        "{} GNSS anchor metadata record(s) had no matching factor batch; "
+        "discarding them",
+        delivered_anchors.size());
     }
   }
 
@@ -565,21 +570,46 @@ public:
   //     completed, so it is reported lost.
   // Idempotent: pending == 0 is a no-op, so multiple call sites are safe.
   void resolve_pending_delivery(const gtsam_points::ISAM2Ext& isam2) {
-    const uint64_t pending = pending_delivery_count_;
-    if (pending == 0) {
-      return;
-    }
-    pending_delivery_count_ = 0;
     const size_t graph_size_now = isam2.getFactorsUnsafe().size();
-    if (graph_size_now > graph_size_at_update_) {
+    uint64_t pending = 0;
+    size_t graph_size_before = 0;
+    std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>>
+      confirmed_anchors;
+    {
+      std::lock_guard<std::mutex> lock(factor_delivery_mtx_);
+      pending = pending_delivery_count_;
+      if (pending == 0) {
+        return;
+      }
+      pending_delivery_count_ = 0;
+      graph_size_before = graph_size_at_update_;
+      if (graph_size_now > graph_size_before) {
+        confirmed_anchors.swap(pending_delivery_anchors_);
+      } else {
+        pending_delivery_anchors_.clear();
+      }
+    }
+
+    if (graph_size_now > graph_size_before) {
       factors_delivered_count += pending;
+      if (!confirmed_anchors.empty()) {
+        std::lock_guard<std::mutex> lock(delivered_anchor_mtx_);
+        for (const auto& anchor : confirmed_anchors) {
+          if (delivered_anchor_positions_.size() <= anchor.submap_id) {
+            delivered_anchor_positions_.resize(
+              anchor.submap_id + 1,
+              Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
+          }
+          delivered_anchor_positions_[anchor.submap_id] = anchor.position;
+        }
+      }
     } else {
       factors_lost_in_update_ += pending;
       logger->error(
         "{} GNSS prior factor(s) were handed to the optimizer but the factor graph did "
         "not grow ({} -> {}) — the update was rejected (exception / indeterminant "
         "system) and the batch was DISCARDED. These are counted as UNDELIVERED.",
-        pending, graph_size_at_update_, graph_size_now);
+        pending, graph_size_before, graph_size_now);
     }
   }
 
@@ -1332,6 +1362,8 @@ private:
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
   std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>>
     pending_position_anchors_;
+  std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>>
+    pending_delivery_anchors_;
   std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>
     delivered_anchor_positions_;
 
@@ -1394,8 +1426,9 @@ private:
   std::atomic<uint64_t> factors_delivered_count{0};   // priors CONFIRMED inserted into the graph
   // [H3 FIX 2026-07-27] Batch handed to the optimizer but not yet confirmed,
   // and the graph size when it was handed over. Written in on_smoother_update
-  // and read in on_smoother_update_result; both run on the mapping thread,
-  // strictly in that order, so no lock is required.
+  // and read in on_smoother_update_result. The exit path can inspect these
+  // after a flush timeout, so factor_delivery_mtx_ protects the pending count,
+  // graph-size baseline, and matching anchor metadata as one state.
   uint64_t pending_delivery_count_ = 0;
   size_t graph_size_at_update_ = 0;
   std::atomic<uint64_t> factors_lost_in_update_{0};  // batches discarded by a failed update

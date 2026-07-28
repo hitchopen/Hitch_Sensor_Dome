@@ -34,17 +34,17 @@
 
 topic、frame、字段名均面向 Hitch Sensor Dome 参考配置（3× Seyond Robin W + Point One Atlas Duo + 4× e-con RouteCAM）。
 
-| 项目 | 原 | 现 |
-|------|-----|-----|
-| IMU topic | `/gps_bot/imu` | `/imu/data` |
-| 主 LiDAR | `/luminar_front/points` | `/robin_w_front/points` |
-| 辅 LiDAR | `/luminar_left/points`、`/luminar_right/points` | `/robin_w_rear_left/points`、`/robin_w_rear_right/points` |
-| GNSS | `/gps_nav/odom` | `/gps_p1/fix`（适配器同步 NavSatFix 门控信号） |
-| 摄像头 | `/cam_front_left/image_raw` |（同名保留） |
-| `intensity_field` | `reflectance` (Luminar) | `intensity` (Robin W 默认) |
-| `ring_field` | `line_index` (Luminar) | `ring` (Robin W 默认) |
-| `flip_points_y` | `true` (Luminar SAE Y-right) | `false` (Robin W 设 `coordinate_mode:=3` 后已是 REP-103) |
-| LiDAR–IMU 外参来源 | 手工编辑的 7 维 TUM 数组 | 由 [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 生成的 URDF —— 见 §8 |
+| 项目 | Hitch Sensor Dome 配置 |
+|------|-----|
+| IMU topic | `/imu/data` |
+| 主 LiDAR | `/robin_w_front/points` |
+| 辅 LiDAR | `/robin_w_rear_left/points`、`/robin_w_rear_right/points` |
+| GNSS | `/gps_p1/fix`（适配器同步 NavSatFix 门控信号） |
+| 摄像头 | `/cam_front_left/image_raw` |
+| `intensity_field` | `intensity` |
+| `ring_field` | `ring` |
+| `flip_points_y` | `false`（Robin W 设置 `coordinate_mode:=3` 后符合 REP-103） |
+| LiDAR–IMU 外参来源 | 由 [`config/sensor_dome_tf.yaml`](../config/sensor_dome_tf.yaml) 生成的 URDF —— 见 §8 |
 
 涉及文件：`glim/config/config_sensors.json`、`glim/config/config_ros.json`。
 
