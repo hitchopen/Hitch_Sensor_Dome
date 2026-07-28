@@ -296,19 +296,26 @@ the Robin W contract above.
 ### LiDAR vertical-FOV startup gate
 
 Each Robin W must provide approximately its nominal **30 degree vertical field
-of view**. GLIM++ and GICP++ announce this gate at startup, then validate the
-first and every subsequent raw PointCloud2 before cropping, deskewing,
-transforming, or concatenating it. Each of the three streams is checked
-independently, so the wide angular union of a merged cloud cannot hide one
-degraded LiDAR.
+of view**. GLIM++ and GICP++ announce this gate at startup and validate the
+first usable raw PointCloud2 from each configured LiDAR before localization,
+mapping, transforms, or concatenation can begin. Each of the three streams is
+checked independently, so the wide angular union of a merged cloud cannot hide
+one degraded LiDAR. After all configured streams pass, FOV measurement is
+disabled for the continuous run; this is a launch-time hardware/data-contract
+check, not a per-frame scene-content gate.
 
-The measured span is the 0.5th-to-99.5th percentile of finite, nonzero XYZ
-return elevations. The production threshold is **27 degrees** with at least
-**100 valid sampled returns**. Percentile trimming prevents one stray
-high-angle point from making a narrow cloud pass. A cloud below the threshold,
-with too few valid returns, or with an invalid XYZ layout is logged and
-rejected before it reaches SLAM; a first-pass message is also logged for each
-sensor. The safety knobs are
+The measured span trims only the outer 0.5% of finite, nonzero XYZ return
+elevations, preserving the production threshold's intended margin: **27
+degrees** for a nominal 30-degree sensor, with at least **100 valid sampled
+returns**. Independently, the gate divides that span into bins no wider than
+2 degrees and requires every bin to contain at least 0.1% of valid samples
+(minimum one). This occupancy check prevents a disconnected high-angle cluster
+of any size from making a narrow cloud pass. A cloud below the threshold, with
+an occupancy gap, too few valid returns, or an invalid XYZ layout is logged and
+rejected before SLAM starts; a pass message is logged for each sensor and once
+again when the full startup set is ready. The valid-return setting accepts
+100-10000 while the measurement
+samples at most 20000 points. The safety knobs are
 `lidar_quality.min_vertical_fov_deg` / `min_valid_points` in GLIM and
 `localization/lidar_quality/min_vertical_fov_deg` / `min_valid_points` in
 GICP.

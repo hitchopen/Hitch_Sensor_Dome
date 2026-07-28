@@ -280,12 +280,13 @@ private:
   double concat_future_sweep_wait_timeout_ = 0.15;
   size_t concat_buffer_size_;
 
-  // Fail-closed raw-cloud quality gate. Every primary and auxiliary stream is
-  // measured independently before transforms or concatenation can hide a
-  // narrowed vertical field of view.
+  // Fail-closed startup quality gate. The first usable raw cloud from every
+  // configured LiDAR is measured independently before localization starts;
+  // validated streams are not re-measured in the runtime hot path.
   double lidar_min_vertical_fov_deg_ = 27.0;
   size_t lidar_fov_min_valid_points_ = 100;
   bool primary_lidar_fov_validated_ = false;
+  bool lidar_fov_startup_complete_ = false;
 
   // Configured Robin W frame period. Robin W is rated 10-20 FPS and this
   // component is documented to run at 20 Hz (recording/sensor_config.yaml),
@@ -579,6 +580,7 @@ private:
   double gicp_transformation_epsilon_;
   double gicp_rotation_epsilon_;
   double gicp_fitness_reject_threshold_;
+  double gicp_min_correspondence_ratio_;
   bool gicp_reject_large_jumps_;
   double gicp_hessian_cond_max_;
   double gicp_hessian_fitness_warn_;

@@ -125,6 +125,11 @@ call surface while using small_gicp's parallel kd-tree, covariance estimation,
 GICP factors, and OpenMP reduction. It also preserves the Hitch safety
 contract: non-finite results fail closed, the reported Hessian is re-linearized
 at the final pose, and a degeneracy-projected pose is rescored before use.
+Registration still optimizes small_gicp's Mahalanobis energy, while the public
+fitness gate preserves nanoGICP's calibrated contract: mean squared Euclidean
+nearest-neighbor distance over every source point, in square metres. The
+independent `gicp/minCorrespondenceRatio` floor also rejects solutions
+supported by too little in-radius scan mass.
 
 Large-map handling adopts the device-neutral part of
 [`augcog/DLIO_plusplus#14`](https://github.com/augcog/DLIO_plusplus/pull/14):
@@ -156,9 +161,9 @@ The adapter exposes upstream's optional ground-vehicle LM constraints through
 `gicp/dof/*` and `gicp/prior/*`. The shipped mode remains `6dof`, with prior
 information disabled, to preserve the validated nanoGICP-era behavior during
 the backend migration. Enable `4dof` or nonzero prior information only after a
-Robin W replay has established new fitness, Hessian, and correction baselines:
-small_gicp fitness is mean GICP residual energy, not nanoGICP's mean Euclidean
-nearest-neighbor squared distance.
+Robin W replay has established constraint and correction baselines. The
+Mahalanobis optimizer energy remains available as `final_error` diagnostics;
+it is not compared with the Euclidean fitness thresholds.
 
 GICP++ runs **one dummy align** at init against ~200 randomly-sampled map points to burn those costs at startup instead of on the first localization scan:
 
@@ -387,14 +392,19 @@ inter-header delta (`lidar_concat` remains disabled by default here until
 evidence are ready when it is enabled).
 
 **LiDAR quality gate.** Before timestamp validation, crop, deskew, or
-concatenation, GICP++ measures each raw stream's robust vertical elevation
-span. Robin W is nominally 30 degrees; the shipped profile rejects spans below
-27 degrees or clouds with fewer than 100 valid sampled returns. The outer
-0.5 percent of elevation samples is trimmed at each end so isolated outliers
-cannot make a narrow stream pass. The primary and both auxiliaries are checked
-independently, with startup-pass and throttled rejection logs. Configure this
-with `localization/lidar_quality/min_vertical_fov_deg` and
-`localization/lidar_quality/min_valid_points`.
+concatenation, GICP++ measures the first usable raw cloud from each configured
+stream. It uses a near-extreme vertical elevation span after trimming 0.5% per
+side. Robin W is nominally 30 degrees; the shipped profile rejects spans below
+27 degrees or clouds with fewer than 100 valid sampled returns. A separate
+occupancy gate divides the measured span into bins no wider than 2 degrees and
+requires each bin to contain at least 0.1% of valid samples (minimum one), so a
+disconnected steep-return cluster cannot hide a narrow stream at any cluster
+fraction. Localization remains blocked until the primary and all configured
+auxiliaries pass independently. The checks are then disabled for the
+continuous run. Configure this with
+`localization/lidar_quality/min_vertical_fov_deg` and
+`localization/lidar_quality/min_valid_points` (accepted range 100-10000 from a
+maximum 20000-point sample).
 
 **Also included:** the Atlas `adapter` package at the repo root (optional
 alternative ingestion, see

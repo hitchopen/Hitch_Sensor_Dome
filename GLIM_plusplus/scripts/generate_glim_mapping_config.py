@@ -134,8 +134,8 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "--min-vertical-fov-deg must be finite and within [25, 30] "
             "degrees for the Robin W profile"
         )
-    if args.min_fov_valid_points < 100 or args.min_fov_valid_points > 20_000:
-        raise ValueError("--min-fov-valid-points must be within [100, 20000]")
+    if args.min_fov_valid_points < 100 or args.min_fov_valid_points > 10_000:
+        raise ValueError("--min-fov-valid-points must be within [100, 10000]")
     if not math.isfinite(args.gnss_min_baseline) or args.gnss_min_baseline <= 0.0:
         raise ValueError("--gnss-min-baseline must be a finite positive value")
     if not math.isfinite(args.gnss_fit_max_rms):
@@ -577,15 +577,16 @@ def parse_args() -> argparse.Namespace:
         "--min-vertical-fov-deg",
         type=float,
         default=27.0,
-        help="Reject a raw LiDAR stream whose robust elevation span is below "
-        "this value. Robin W is nominally 30 degrees; allowed range is 25-30.",
+        help="Reject a raw LiDAR stream whose near-extreme elevation span is "
+        "below this value or whose 2-degree occupancy has gaps. "
+        "Robin W is nominally 30 degrees; allowed range is 25-30.",
     )
     parser.add_argument(
         "--min-fov-valid-points",
         type=int,
         default=100,
         help="Minimum finite, nonzero sampled XYZ returns required to measure "
-        "vertical FOV.",
+        "vertical FOV (100-10000; sampling inspects at most 20000 points).",
     )
     parser.add_argument("--t-lidar-imu", nargs=7, required=True, type=float)
     parser.add_argument(

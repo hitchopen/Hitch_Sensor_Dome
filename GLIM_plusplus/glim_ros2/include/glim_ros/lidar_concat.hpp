@@ -833,34 +833,6 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   bool frame_diag_log = false,
   double sweep_time_threshold = 0.010,
   bool float64_time_is_epoch_ns = false) {
-  VerticalFovMeasurement primary_fov;
-  if (!verticalFovAccepted(
-        *primary, lidar_quality.minimum_vertical_fov_deg,
-        lidar_quality.minimum_valid_points, &primary_fov)) {
-    ++lidar_quality.primary_reject_count;
-    if (lidar_quality.primary_reject_count <= 10 ||
-        lidar_quality.primary_reject_count % 100 == 0) {
-      spdlog::error(
-        "lidar_quality: rejecting primary cloud before merge/SLAM: robust "
-        "vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), required "
-        ">= {:.2f} deg; valid sampled returns={}/{}. Reason: {}. "
-        "A narrowed vertical FOV does not provide enough vertical structure "
-        "for stable GLIM.",
-        primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
-        lidar_quality.minimum_vertical_fov_deg, primary_fov.valid_points,
-        primary_fov.sampled_points, primary_fov.reason);
-    }
-    return nullptr;
-  }
-  if (!lidar_quality.primary_validated) {
-    lidar_quality.primary_validated = true;
-    spdlog::info(
-      "lidar_quality: primary vertical-FOV gate passed: robust span {:.2f} "
-      "deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
-      primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
-      primary_fov.valid_points);
-  }
-
   const double t_primary = stamp_to_sec(primary->header.stamp);
   const auto primary_point_time_range = decode_point_time_range(*primary, float64_time_is_epoch_ns);
   const uint32_t point_step = primary->point_step;
@@ -915,6 +887,39 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       over_budget ? ", budget exceeded (non-fatal)" : "");
     return true;  // skip this scan
   };
+
+  if (!lidar_quality.primary_validated) {
+    VerticalFovMeasurement primary_fov;
+    if (!verticalFovAccepted(
+          *primary, lidar_quality.minimum_vertical_fov_deg,
+          lidar_quality.minimum_valid_points, &primary_fov)) {
+      ++lidar_quality.primary_reject_count;
+      if (lidar_quality.primary_reject_count <= 10 ||
+          lidar_quality.primary_reject_count % 100 == 0) {
+        spdlog::error(
+          "lidar_quality: rejecting primary startup cloud before merge/SLAM: "
+          "occupied vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), "
+          "required >= {:.2f} deg; occupancy={}/{} bins ({} points/bin "
+          "required); valid sampled returns={}/{}. Reason: {}.",
+          primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
+          lidar_quality.minimum_vertical_fov_deg, primary_fov.occupied_bins,
+          primary_fov.occupancy_bins, primary_fov.minimum_points_per_bin,
+          primary_fov.valid_points, primary_fov.sampled_points,
+          primary_fov.reason);
+      }
+      emit_frame_diag(primary->width * primary->height, *primary);
+      on_required_failure(0, "primary startup vertical FOV below minimum");
+      return nullptr;
+    }
+    lidar_quality.primary_validated = true;
+    spdlog::info(
+      "lidar_quality: primary startup FOV gate passed: occupied span {:.2f} "
+      "deg (elevation {:.2f}..{:.2f} deg, occupancy={}/{} bins, "
+      "{} valid sampled returns)",
+      primary_fov.span_deg, primary_fov.lower_deg, primary_fov.upper_deg,
+      primary_fov.occupied_bins, primary_fov.occupancy_bins,
+      primary_fov.valid_points);
+  }
 
   int x_off, y_off, z_off;
   if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
@@ -1037,30 +1042,34 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       continue;
     }
 
-    VerticalFovMeasurement aux_fov;
-    if (!verticalFovAccepted(
-          *match, lidar_quality.minimum_vertical_fov_deg,
-          lidar_quality.minimum_valid_points, &aux_fov)) {
-      ++aux.vertical_fov_reject_count;
-      if (aux.vertical_fov_reject_count <= 10 ||
-          aux.vertical_fov_reject_count % 100 == 0) {
-        spdlog::error(
-          "lidar_quality: rejecting aux cloud on {} before transform/merge: "
-          "robust vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), "
-          "required >= {:.2f} deg; valid sampled returns={}/{}. Reason: {}.",
-          aux.topic, aux_fov.span_deg, aux_fov.lower_deg, aux_fov.upper_deg,
-          lidar_quality.minimum_vertical_fov_deg, aux_fov.valid_points,
-          aux_fov.sampled_points, aux_fov.reason);
-      }
-      continue;
-    }
     if (!aux.vertical_fov_validated) {
+      VerticalFovMeasurement aux_fov;
+      if (!verticalFovAccepted(
+            *match, lidar_quality.minimum_vertical_fov_deg,
+            lidar_quality.minimum_valid_points, &aux_fov)) {
+        ++aux.vertical_fov_reject_count;
+        if (aux.vertical_fov_reject_count <= 10 ||
+            aux.vertical_fov_reject_count % 100 == 0) {
+          spdlog::error(
+            "lidar_quality: rejecting aux startup cloud on {} before "
+            "transform/merge: occupied vertical FOV {:.2f} deg "
+            "(elevation {:.2f}..{:.2f} deg), required >= {:.2f} deg; "
+            "occupancy={}/{} bins ({} points/bin required); valid sampled "
+            "returns={}/{}. Reason: {}.",
+            aux.topic, aux_fov.span_deg, aux_fov.lower_deg, aux_fov.upper_deg,
+            lidar_quality.minimum_vertical_fov_deg, aux_fov.occupied_bins,
+            aux_fov.occupancy_bins, aux_fov.minimum_points_per_bin,
+            aux_fov.valid_points, aux_fov.sampled_points, aux_fov.reason);
+        }
+        continue;
+      }
       aux.vertical_fov_validated = true;
       spdlog::info(
-        "lidar_quality: aux vertical-FOV gate passed on {}: robust span "
-        "{:.2f} deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+        "lidar_quality: aux startup FOV gate passed on {}: occupied span "
+        "{:.2f} deg (elevation {:.2f}..{:.2f} deg, occupancy={}/{} bins, "
+        "{} valid sampled returns)",
         aux.topic, aux_fov.span_deg, aux_fov.lower_deg, aux_fov.upper_deg,
-        aux_fov.valid_points);
+        aux_fov.occupied_bins, aux_fov.occupancy_bins, aux_fov.valid_points);
     }
 
     // Validate the FULL field schema, not just point_step: the merged cloud
@@ -1163,6 +1172,33 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         }
       }
     }
+  }
+
+  if (!lidar_quality.startup_validation_complete) {
+    const size_t validated_aux_count = static_cast<size_t>(std::count_if(
+      aux_sensors.begin(), aux_sensors.end(),
+      [](const AuxLidarSensor& aux) {
+        return aux.vertical_fov_validated;
+      }));
+    if (validated_aux_count != aux_sensors.size()) {
+      ++lidar_quality.startup_wait_count;
+      if (lidar_quality.startup_wait_count <= 10 ||
+          lidar_quality.startup_wait_count % 100 == 0) {
+        spdlog::warn(
+          "lidar_quality: startup validation incomplete: primary passed, "
+          "{}/{} auxiliary LiDARs passed; mapping has not started",
+          validated_aux_count, aux_sensors.size());
+      }
+      emit_frame_diag(total_points, *merged);
+      on_required_failure(
+        merged_aux_count, "LiDAR startup FOV validation incomplete");
+      return nullptr;
+    }
+    lidar_quality.startup_validation_complete = true;
+    spdlog::info(
+      "lidar_quality: startup validation complete for primary + {} auxiliary "
+      "LiDAR(s); runtime FOV checks disabled",
+      aux_sensors.size());
   }
 
   emit_frame_diag(total_points, *merged);
@@ -1271,15 +1307,15 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
       "[25, 30] degrees for the Robin W profile");
   }
   if (minimum_valid_points < static_cast<int>(kDefaultMinimumFovPoints) ||
-      minimum_valid_points > static_cast<int>(kMaximumFovSamplePoints)) {
+      minimum_valid_points > static_cast<int>(kMaximumMinimumFovPoints)) {
     throw std::runtime_error(
-      "lidar_quality.min_valid_points must be within [100, 20000]");
+      "lidar_quality.min_valid_points must be within [100, 10000]");
   }
   out.lidar_quality.minimum_valid_points =
     static_cast<size_t>(minimum_valid_points);
   spdlog::info(
-    "lidar_quality: vertical-FOV gate active: nominal Robin W {:.1f} deg, "
-    "reject robust spans below {:.1f} deg or clouds with fewer than {} valid "
+    "lidar_quality: startup FOV gate active: nominal Robin W {:.1f} deg, "
+    "reject occupied spans below {:.1f} deg or clouds with fewer than {} valid "
     "sampled returns",
     kNominalRobinWVerticalFovDeg,
     out.lidar_quality.minimum_vertical_fov_deg,

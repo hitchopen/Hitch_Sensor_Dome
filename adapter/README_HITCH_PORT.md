@@ -98,9 +98,10 @@ audit counters, origin resolution rules) were taken.
 
 **Run audit.** Four drop counters (`pose_dropped_invalid`,
 `imu_dropped_invalid_stamp`, `imu_sidecar_miss_drop`,
-`imu_dropped_clock_not_ready`) plus `p1_clock_ready` and `p1_clock_drift_ms`
-are always reported in the run-summary line, so a run report can **prove** zero
-loss rather than infer it from matching in/out totals. Together with GLIM++'s
+`imu_dropped_clock_not_ready`) plus `p1_clock_ready`, `p1_clock_drift_ms`, and
+`p1_clock_reset_count` are always reported in the run-summary line, so a run
+report can **prove** zero loss and detect a mid-run clock re-anchor rather than
+infer it from matching in/out totals. Together with GLIM++'s
 `gnss_global summary:` line this closes the RTK timing audit chain from PCAP to
 map factors. All four are expected to be `0` on a healthy run.
 

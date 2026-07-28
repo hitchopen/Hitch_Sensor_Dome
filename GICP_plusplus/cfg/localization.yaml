@@ -407,15 +407,16 @@
     gicp/transformationEpsilon: 0.004
     gicp/rotationEpsilon: 0.004
 
-    # GICP result gating: reject poor registrations and fall back to IMU
-    # dead-reckoning. The thresholds below are tuned conservatively; tighten
-    # once you have a Hitch-dome run with ground-truth-fixed accepts.
-    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
+    # Fitness retains the nano_gicp contract after the small_gicp migration:
+    # mean squared Euclidean nearest-neighbor distance over ALL source points
+    # (m^2), while the optimizer itself still uses small_gicp's Mahalanobis
+    # energy. Good alignments on the full map hit ~0.01–0.05 m^2
+    # (p90 0.04, p99 0.39).
     # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    gicp/fitnessRejectThreshold: 1.0   # Reject if all-point mean squared NN distance exceeds this
+    gicp/minCorrespondenceRatio: 0.50  # Reject if too little scan mass has an in-radius GICP match
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
 
     # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========

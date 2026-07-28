@@ -156,21 +156,25 @@ inferring it from matching in/out totals:
 ```text
 pose_in=… navsat_fix_out=… gnss_out=… gnss_rtk_out=… odom_out=… rtk_out=… imu_in=… imu_out=…
 pose_dropped_invalid=… imu_dropped_invalid_stamp=… imu_sidecar_miss_drop=… imu_dropped_clock_not_ready=…
-p1_clock_ready=… p1_clock_drift_ms=…
+p1_clock_ready=… p1_clock_drift_ms=… p1_clock_reset_count=…
 ```
 
 - `pose_dropped_invalid` — NaN / invalid-solution FusionEngine poses rejected
   before publication (cold-start samples land here); also counts poses dropped
-  for an invalid or quarantined-forward-spike P1 stamp.
+  for an invalid, quarantined-forward-spike, or inconsistent P1/arrival pair.
 - `imu_dropped_invalid_stamp` — IMU samples dropped at ingest for a non-finite /
   ≤0 / ≥4e9 (sentinel) header stamp, before they can reach a consumer buffer.
 - `imu_sidecar_miss_drop` — IMU samples dropped because no sidecar P1 stamp
   matched within tolerance (sidecar replay mode only).
 - `imu_dropped_clock_not_ready` — IMU samples dropped from the bounded
   not-ready queue before the P1→ROS clock mapper initialized.
-- `p1_clock_ready` / `p1_clock_drift_ms` — end-to-end P1→ROS retiming
+- `p1_clock_ready` / `p1_clock_drift_ms` / `p1_clock_reset_count` —
+  end-to-end P1→ROS retiming
   evidence: the mapper reached readiness, and the measured offset drift over
-  the run. Together with GLIM's `gnss_global summary` line (bracket widths,
+  the current epoch. A reset count above zero records an accepted device/bag
+  epoch change that would otherwise make a fresh zero-drift envelope look
+  identical to a clean uninterrupted run. Together with GLIM's
+  `gnss_global summary` line (bracket widths,
   gap/non-monotonic rejections, factor counts) these close the RTK timing
   audit chain from PCAP to map factors.
 

@@ -40,6 +40,15 @@ inline FixGateVerdict validateNavSatFix(
     double future_fix_tolerance_s) {
   FixGateVerdict result;
 
+  if (!std::isfinite(max_position_stddev_m) ||
+      max_position_stddev_m <= 0.0 ||
+      !std::isfinite(max_fix_age_s) || max_fix_age_s <= 0.0 ||
+      !std::isfinite(future_fix_tolerance_s) ||
+      future_fix_tolerance_s < 0.0) {
+    result.reason = "invalid NavSatFix gate thresholds";
+    return result;
+  }
+
   if (!std::isfinite(fix.latitude) || !std::isfinite(fix.longitude) ||
       !std::isfinite(fix.altitude) || fix.latitude < -90.0 ||
       fix.latitude > 90.0 || fix.longitude < -180.0 ||
@@ -84,8 +93,7 @@ inline FixGateVerdict validateNavSatFix(
     max_variance = std::max(max_variance, variance);
   }
   result.max_position_stddev_m = std::sqrt(max_variance);
-  if (max_position_stddev_m > 0.0 &&
-      result.max_position_stddev_m > max_position_stddev_m) {
+  if (result.max_position_stddev_m > max_position_stddev_m) {
     result.failure = FixGateFailure::COVARIANCE;
     result.reason = "position covariance exceeds limit";
     return result;
@@ -99,12 +107,12 @@ inline FixGateVerdict validateNavSatFix(
     return result;
   }
   result.age_s = consumer_stamp_s - fix_stamp_s;
-  if (result.age_s < -std::max(0.0, future_fix_tolerance_s)) {
+  if (result.age_s < -future_fix_tolerance_s) {
     result.failure = FixGateFailure::FUTURE;
     result.reason = "fix timestamp is in the future";
     return result;
   }
-  if (max_fix_age_s > 0.0 && result.age_s > max_fix_age_s) {
+  if (result.age_s > max_fix_age_s) {
     result.failure = FixGateFailure::STALE;
     result.reason = "fix timestamp is stale";
     return result;

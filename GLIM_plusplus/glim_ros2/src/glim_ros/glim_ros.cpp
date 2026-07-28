@@ -608,7 +608,7 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 // ALL the following are true:
 //
 //   (1) FIX QUALITY — the most recent NavSatFix on ins_fix_topic shows
-//       status.status >= STATUS_GBAS_FIX (i.e., RTK-class). This is
+//       status.status == STATUS_GBAS_FIX (i.e., RTK-class). This is
 //       relaxable via the ins_require_rtk_fixed parameter.
 //
 //   (2) COVARIANCE  — position_covariance diagonal stddev is below
@@ -682,6 +682,12 @@ FixVerdict validate_fix(
   bool require_rtk_class,
   const std::array<double, 36>* fallback_pose_cov = nullptr) {
   FixVerdict v;
+  if (!std::isfinite(max_age_s) || max_age_s <= 0.0 ||
+      !std::isfinite(future_tolerance_s) || future_tolerance_s < 0.0 ||
+      !std::isfinite(max_stddev) || max_stddev <= 0.0) {
+    v.reason = "invalid NavSatFix gate thresholds";
+    return v;
+  }
   if (!fix) {
     if (require_rtk_class) {
       v.reason = "no NavSatFix received yet";
@@ -728,8 +734,15 @@ FixVerdict validate_fix(
     v.reason = "NavSatFix reports NO_FIX";
     return v;
   }
+  if (fix->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX ||
+      fix->status.status > sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
+    v.reason = std::string("fix status ") +
+               std::to_string(static_cast<int>(fix->status.status)) +
+               " is outside REP-145";
+    return v;
+  }
   if (require_rtk_class &&
-      fix->status.status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
+      fix->status.status != sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
     v.reason = std::string("fix status ") + fix_status_name(fix->status.status) +
                " is below RTK class";
     return v;
@@ -1509,30 +1522,35 @@ void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr
   }
   std::lock_guard<std::mutex> lock(aux_buffers_mutex);
   auto& aux = aux_concat.aux_sensors[aux_index];
-  glim_ros::VerticalFovMeasurement fov;
-  if (!glim_ros::verticalFovAccepted(
-        *msg, aux_concat.lidar_quality.minimum_vertical_fov_deg,
-        aux_concat.lidar_quality.minimum_valid_points, &fov)) {
-    ++aux.vertical_fov_reject_count;
-    if (aux.vertical_fov_reject_count <= 10 ||
-        aux.vertical_fov_reject_count % 100 == 0) {
-      spdlog::error(
-        "lidar_quality: rejecting live aux cloud on {} before buffering: "
-        "robust vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), "
-        "required >= {:.2f} deg; valid sampled returns={}/{}. Reason: {}.",
-        aux.topic, fov.span_deg, fov.lower_deg, fov.upper_deg,
-        aux_concat.lidar_quality.minimum_vertical_fov_deg, fov.valid_points,
-        fov.sampled_points, fov.reason);
-    }
-    return;
-  }
   if (!aux.vertical_fov_validated) {
+    glim_ros::VerticalFovMeasurement fov;
+    if (!glim_ros::verticalFovAccepted(
+          *msg, aux_concat.lidar_quality.minimum_vertical_fov_deg,
+          aux_concat.lidar_quality.minimum_valid_points, &fov)) {
+      ++aux.vertical_fov_reject_count;
+      if (aux.vertical_fov_reject_count <= 10 ||
+          aux.vertical_fov_reject_count % 100 == 0) {
+        spdlog::error(
+          "lidar_quality: rejecting live aux startup cloud on {} before "
+          "buffering: occupied vertical FOV {:.2f} deg "
+          "(elevation {:.2f}..{:.2f} deg), required >= {:.2f} deg; "
+          "occupancy={}/{} bins ({} points/bin required); valid sampled "
+          "returns={}/{}. Reason: {}.",
+          aux.topic, fov.span_deg, fov.lower_deg, fov.upper_deg,
+          aux_concat.lidar_quality.minimum_vertical_fov_deg,
+          fov.occupied_bins, fov.occupancy_bins,
+          fov.minimum_points_per_bin, fov.valid_points,
+          fov.sampled_points, fov.reason);
+      }
+      return;
+    }
     aux.vertical_fov_validated = true;
     spdlog::info(
-      "lidar_quality: live aux vertical-FOV gate passed on {}: robust span "
-      "{:.2f} deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
+      "lidar_quality: live aux startup FOV gate passed on {}: occupied span "
+      "{:.2f} deg (elevation {:.2f}..{:.2f} deg, occupancy={}/{} bins, "
+      "{} valid sampled returns)",
       aux.topic, fov.span_deg, fov.lower_deg, fov.upper_deg,
-      fov.valid_points);
+      fov.occupied_bins, fov.occupancy_bins, fov.valid_points);
   }
 
   aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg, aux_concat.float64_time_is_epoch_ns));
@@ -1562,9 +1580,11 @@ size_t GlimROS::points_callback(
     *ingested = false;
   }
 
-  // Concatenated offline clouds have already had every raw sensor checked in
-  // merge_clouds(). All other callers must be checked here before extraction.
-  if (!raw_sensor_fov_validated) {
+  // Concatenated offline clouds have completed one-shot validation for every
+  // raw sensor in merge_clouds(). Other paths validate the primary once,
+  // before the first cloud can enter extraction.
+  if (!raw_sensor_fov_validated &&
+      !aux_concat.lidar_quality.primary_validated) {
     glim_ros::VerticalFovMeasurement fov;
     if (!glim_ros::verticalFovAccepted(
           *msg, aux_concat.lidar_quality.minimum_vertical_fov_deg,
@@ -1573,24 +1593,27 @@ size_t GlimROS::points_callback(
       if (aux_concat.lidar_quality.primary_reject_count <= 10 ||
           aux_concat.lidar_quality.primary_reject_count % 100 == 0) {
         spdlog::error(
-          "lidar_quality: rejecting primary cloud before GLIM: robust "
+          "lidar_quality: rejecting primary startup cloud before GLIM: "
+          "occupied "
           "vertical FOV {:.2f} deg (elevation {:.2f}..{:.2f} deg), required "
-          ">= {:.2f} deg; valid sampled returns={}/{}. Reason: {}. "
-          "A narrowed vertical FOV does not provide enough vertical structure "
-          "for stable SLAM.",
+          ">= {:.2f} deg; occupancy={}/{} bins ({} points/bin required); "
+          "valid sampled returns={}/{}. Reason: {}.",
           fov.span_deg, fov.lower_deg, fov.upper_deg,
-          aux_concat.lidar_quality.minimum_vertical_fov_deg, fov.valid_points,
+          aux_concat.lidar_quality.minimum_vertical_fov_deg,
+          fov.occupied_bins, fov.occupancy_bins,
+          fov.minimum_points_per_bin, fov.valid_points,
           fov.sampled_points, fov.reason);
       }
       return 0;
     }
-    if (!aux_concat.lidar_quality.primary_validated) {
-      aux_concat.lidar_quality.primary_validated = true;
-      spdlog::info(
-        "lidar_quality: primary vertical-FOV gate passed: robust span {:.2f} "
-        "deg (elevation {:.2f}..{:.2f} deg, {} valid sampled returns)",
-        fov.span_deg, fov.lower_deg, fov.upper_deg, fov.valid_points);
-    }
+    aux_concat.lidar_quality.primary_validated = true;
+    aux_concat.lidar_quality.startup_validation_complete = true;
+    spdlog::info(
+      "lidar_quality: primary startup FOV gate passed: occupied span {:.2f} "
+      "deg (elevation {:.2f}..{:.2f} deg, occupancy={}/{} bins, "
+      "{} valid sampled returns); runtime FOV checks disabled",
+      fov.span_deg, fov.lower_deg, fov.upper_deg, fov.occupied_bins,
+      fov.occupancy_bins, fov.valid_points);
   }
 
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {

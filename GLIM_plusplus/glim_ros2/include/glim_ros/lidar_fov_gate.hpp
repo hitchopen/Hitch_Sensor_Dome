@@ -17,6 +17,21 @@ constexpr double kNominalRobinWVerticalFovDeg = 30.0;
 constexpr double kDefaultMinimumVerticalFovDeg = 27.0;
 constexpr size_t kDefaultMinimumFovPoints = 100;
 constexpr size_t kMaximumFovSamplePoints = 20000;
+constexpr size_t kMaximumMinimumFovPoints =
+    kMaximumFovSamplePoints / 2;
+constexpr double kFovOccupancyBinWidthDeg = 2.0;
+// Minimum range, in metres, at which a return is allowed to contribute an
+// elevation. Elevation is atan2(z, hypot(x, y)), so a fixed position error d
+// produces an angular error of roughly d/range: at 0.5 m a 2 cm error moves the
+// angle ~2.3 deg, while at the previous 1.0e-4 m floor ANY noise saturates to
+// +/-90 deg. Returns closer than this are the dome, the vehicle, or airborne
+// near-field scatter (spray, precipitation, a wet or dirty window) rather than
+// scene geometry, and they manufacture steep elevations that are not sensor
+// FOV. Excluding them is what stops a SPREAD of near-field junk from filling
+// the occupancy bins and inflating the span -- the occupancy check alone only
+// defeats a single disconnected CLUSTER.
+constexpr double kMinimumElevationRangeM = 0.5;
+constexpr double kMinimumFovBinPointFraction = 0.001;
 
 struct VerticalFovMeasurement {
   bool valid = false;
@@ -26,6 +41,11 @@ struct VerticalFovMeasurement {
   size_t total_points = 0;
   size_t sampled_points = 0;
   size_t valid_points = 0;
+  size_t near_field_points = 0;
+  size_t occupancy_bins = 0;
+  size_t occupied_bins = 0;
+  size_t minimum_points_per_bin = 0;
+  bool occupancy_complete = false;
   const char* reason = "unmeasured";
 };
 
@@ -33,7 +53,9 @@ struct LidarQualityConfig {
   double minimum_vertical_fov_deg = kDefaultMinimumVerticalFovDeg;
   size_t minimum_valid_points = kDefaultMinimumFovPoints;
   bool primary_validated = false;
+  bool startup_validation_complete = false;
   uint64_t primary_reject_count = 0;
+  uint64_t startup_wait_count = 0;
 };
 
 inline bool hostIsBigEndian() {
@@ -63,14 +85,21 @@ inline size_t deterministicBucketOffset(size_t sample_index, size_t width) {
   return static_cast<size_t>(value % static_cast<uint64_t>(width));
 }
 
-// Measures the robust elevation coverage of a raw sensor cloud. Trimming the
-// outer 0.5 percent at each end prevents isolated outliers from making a
-// collapsed vertical field of view look healthy.
+// Measures near-extreme elevation span, then verifies that the interval is
+// continuously populated. Span preserves the original 27-degree threshold
+// calibration; occupancy prevents a disconnected high-angle cluster from
+// making a narrow cloud pass at any cluster fraction.
 inline VerticalFovMeasurement measureVerticalFov(
     const sensor_msgs::msg::PointCloud2& cloud,
     size_t minimum_valid_points = kDefaultMinimumFovPoints) {
   VerticalFovMeasurement result;
   result.reason = "invalid PointCloud2 dimensions or layout";
+
+  if (minimum_valid_points == 0 ||
+      minimum_valid_points > kMaximumMinimumFovPoints) {
+    result.reason = "minimum_valid_points is outside [1, 10000]";
+    return result;
+  }
 
   if (cloud.width == 0 || cloud.height == 0 || cloud.point_step == 0 ||
       cloud.row_step == 0 ||
@@ -166,7 +195,11 @@ inline VerticalFovMeasurement measureVerticalFov(
         std::hypot(static_cast<double>(x), static_cast<double>(y));
     const double range =
         std::hypot(horizontal_range, static_cast<double>(z));
-    if (!std::isfinite(range) || range < 1.0e-4) {
+    if (!std::isfinite(range)) {
+      continue;
+    }
+    if (range < kMinimumElevationRangeM) {
+      ++result.near_field_points;
       continue;
     }
     elevations_deg.push_back(
@@ -196,7 +229,44 @@ inline VerticalFovMeasurement measureVerticalFov(
   result.upper_deg = *upper;
   result.span_deg = result.upper_deg - result.lower_deg;
   result.valid = std::isfinite(result.span_deg) && result.span_deg >= 0.0;
-  result.reason = result.valid ? "ok" : "non-finite elevation span";
+  if (!result.valid) {
+    result.reason = "non-finite elevation span";
+    return result;
+  }
+
+  result.occupancy_bins = std::max<size_t>(
+      1, static_cast<size_t>(
+             std::ceil(result.span_deg / kFovOccupancyBinWidthDeg)));
+  result.minimum_points_per_bin = std::max<size_t>(
+      1, static_cast<size_t>(std::ceil(
+             static_cast<double>(result.valid_points) *
+             kMinimumFovBinPointFraction)));
+  std::vector<size_t> bin_counts(result.occupancy_bins, 0);
+  for (const double elevation_deg : elevations_deg) {
+    if (elevation_deg < result.lower_deg ||
+        elevation_deg > result.upper_deg) {
+      continue;
+    }
+    size_t bin_index = 0;
+    if (result.span_deg > 0.0) {
+      const double normalized =
+          (elevation_deg - result.lower_deg) / result.span_deg;
+      bin_index = std::min(
+          result.occupancy_bins - 1,
+          static_cast<size_t>(normalized * result.occupancy_bins));
+    }
+    ++bin_counts[bin_index];
+  }
+  result.occupied_bins = static_cast<size_t>(std::count_if(
+      bin_counts.begin(), bin_counts.end(),
+      [&](size_t count) {
+        return count >= result.minimum_points_per_bin;
+      }));
+  result.occupancy_complete =
+      result.occupied_bins == result.occupancy_bins;
+  result.reason = result.occupancy_complete
+      ? "ok"
+      : "elevation occupancy contains under-populated gaps";
   return result;
 }
 
@@ -208,9 +278,16 @@ inline bool verticalFovAccepted(
   VerticalFovMeasurement local =
       measureVerticalFov(cloud, minimum_valid_points);
   const bool accepted =
-      local.valid && local.span_deg >= minimum_vertical_fov_deg;
-  if (local.valid && !accepted) {
-    local.reason = "robust vertical FOV is below the configured minimum";
+      std::isfinite(minimum_vertical_fov_deg) &&
+      minimum_vertical_fov_deg > 0.0 && local.valid &&
+      local.occupancy_complete &&
+      local.span_deg + 1.0e-6 >= minimum_vertical_fov_deg;
+  if (!std::isfinite(minimum_vertical_fov_deg) ||
+      minimum_vertical_fov_deg <= 0.0) {
+    local.reason =
+        "minimum_vertical_fov_deg must be finite and positive";
+  } else if (local.valid && local.occupancy_complete && !accepted) {
+    local.reason = "occupied vertical FOV is below the configured minimum";
   }
   if (measurement) {
     *measurement = local;

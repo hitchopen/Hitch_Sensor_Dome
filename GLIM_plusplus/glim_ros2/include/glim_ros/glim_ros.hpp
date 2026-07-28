@@ -96,8 +96,8 @@ public:
   // TimeKeeper validation and was inserted into odometry estimation; false when
   // the frame was skipped. Offline readers use it for primary accounting.
   // `raw_sensor_fov_validated` is true only for a cloud returned by
-  // merge_clouds(), which has already checked every constituent sensor before
-  // transforming or concatenating it.
+  // merge_clouds() after every constituent sensor completed its one-shot
+  // startup FOV validation.
   size_t points_callback(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
     int epoch_anchor_count = -1,

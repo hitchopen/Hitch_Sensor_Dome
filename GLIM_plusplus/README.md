@@ -586,15 +586,19 @@ header-nearest matching. New `lidar_concat` keys in `config_sensors.json`:
 > [LiDAR per-point timestamp standard](../README.md#lidar-per-point-timestamp-standard)
 > for the complete five-vendor contract and the live-topic validation command.
 
-**LiDAR quality gate.** GLIM++ measures every raw stream before preprocessing
-and measures each primary/auxiliary separately before offline concatenation.
-The shipped Robin W profile requires a robust vertical elevation span of at
-least 27 degrees (30 degrees nominal) and at least 100 finite, nonzero sampled
-returns. The outer 0.5 percent of samples is trimmed at each end so one outlier
-cannot hide a narrow stream. Invalid clouds are logged and rejected before
-SLAM; the first passing cloud from each sensor is logged as startup evidence.
-The run-config generator always emits `lidar_quality.min_vertical_fov_deg` and
-`lidar_quality.min_valid_points`.
+**LiDAR quality gate.** GLIM++ measures the first usable raw cloud from each
+configured LiDAR before preprocessing and validates each primary/auxiliary
+separately before offline concatenation or mapping can begin. The shipped Robin
+W profile requires a near-extreme vertical elevation span of at least 27
+degrees (30 degrees nominal) after trimming 0.5% per side, plus at least 100
+finite, nonzero sampled returns. A separate occupancy gate uses bins no wider
+than 2 degrees and requires each bin to contain at least 0.1% of valid samples
+(minimum one), rejecting a narrow stream with a disconnected steep cluster at
+any cluster fraction. The checks are disabled after every configured LiDAR
+passes; runtime frames are not re-measured. The run-config generator always
+emits `lidar_quality.min_vertical_fov_deg` and
+`lidar_quality.min_valid_points` (accepted range 100-10000 from a maximum
+20000-point sample).
 
 **GNSS global module** (extends §7/§8/§13):
 

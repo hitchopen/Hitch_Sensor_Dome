@@ -240,7 +240,8 @@ public:
         // must be able to verify the retiming contract (mapper became ready,
         // and the offset drift over the run stayed sane) end-to-end.
         << " p1_clock_ready=" << (clock_mapper_.ready() ? 1 : 0)
-        << " p1_clock_drift_ms=" << clock_mapper_.driftMs();
+        << " p1_clock_drift_ms=" << clock_mapper_.driftMs()
+        << " p1_clock_reset_count=" << clock_mapper_.resetCount();
     if (!imu_p1_sidecar_.empty()) {
       out << " imu_p1_sidecar_match=" << imu_p1_sidecar_match_count_
           << " imu_p1_sidecar_miss=" << imu_p1_sidecar_miss_count_
@@ -441,13 +442,22 @@ private:
       clock_mapper_.reset();
     }
 
+    // Fed even during pose outages (invalid solution below): the mapper keeps
+    // learning the P1->ROS clock. A rejected pair is dropped before it can
+    // update last_p1_time_, the slew state, or any published timestamp.
+    if (p1_valid && !clock_mapper_.addPosePair(arrival, p1_time)) {
+      ++pose_dropped_invalid_count_;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Dropping pose whose P1/arrival pair is outside the active clock "
+        "envelope (arrival=%.3f, p1=%.3f) -- %lu dropped so far",
+        arrival, p1_time,
+        static_cast<unsigned long>(pose_dropped_invalid_count_));
+      return;
+    }
     if (p1_valid) {
       last_p1_time_ = p1_time;
     }
-    // Fed even during pose outages (invalid solution below): the mapper keeps
-    // learning the P1->ROS clock. It validates its own inputs, and after the
-    // reset() above it re-anchors on this sample.
-    clock_mapper_.addPosePair(arrival, p1_time);
 
     // [P2 FIX 2026-07-09] Fail closed on invalid solutions. FusionEngine
     // emits solution_type=Invalid(0) with NaN lla/rpy on every cold start

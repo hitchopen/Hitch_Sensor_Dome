@@ -1363,6 +1363,7 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("gicp/transformationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/rotationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/fitnessRejectThreshold", 1.0);
+  this->declare_parameter<double>("gicp/minCorrespondenceRatio", 0.50);
   this->declare_parameter<bool>("gicp/rejectLargeJumps", true);
   // Reject scans whose Hessian condition number proxy exceeds this threshold.
   // Straights typically run ~1e4; feature-poor corners spike to 1e8-1e9 and the
@@ -1428,6 +1429,9 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/transformationEpsilon", this->gicp_transformation_epsilon_);
   this->get_parameter("gicp/rotationEpsilon", this->gicp_rotation_epsilon_);
   this->get_parameter("gicp/fitnessRejectThreshold", this->gicp_fitness_reject_threshold_);
+  this->get_parameter(
+      "gicp/minCorrespondenceRatio",
+      this->gicp_min_correspondence_ratio_);
   this->get_parameter("gicp/rejectLargeJumps", this->gicp_reject_large_jumps_);
   this->get_parameter("gicp/hessianCondMax", this->gicp_hessian_cond_max_);
   this->get_parameter("gicp/hessianFitnessWarnThreshold", this->gicp_hessian_fitness_warn_);
@@ -1463,6 +1467,12 @@ void gicp_localization::LocalizationNode::getParams() {
     RCLCPP_WARN(this->get_logger(),
                 "gicp/dof/full6dofEveryN cannot be negative; disabling it");
     this->gicp_full6dof_every_n_ = 0;
+  }
+  if (!std::isfinite(this->gicp_min_correspondence_ratio_) ||
+      this->gicp_min_correspondence_ratio_ <= 0.0 ||
+      this->gicp_min_correspondence_ratio_ > 1.0) {
+    throw std::invalid_argument(
+        "gicp/minCorrespondenceRatio must be finite and within (0, 1]");
   }
   if (!std::isfinite(this->gicp_prior_yaw_info_) ||
       this->gicp_prior_yaw_info_ < 0.0) {
@@ -1550,7 +1560,7 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/flip_y", false);
   this->get_parameter("localization/flip_y", this->flip_y_);
 
-  // Raw-cloud quality gate. Robin W's nominal vertical FOV is 30 degrees; a
+  // Startup raw-cloud quality gate. Robin W's nominal vertical FOV is 30 degrees; a
   // substantially narrower point distribution removes the vertical structure
   // that stabilizes scan registration. The gate runs before crop, deskew, or
   // multi-LiDAR transforms and rejects each sensor stream independently.
@@ -1579,17 +1589,17 @@ void gicp_localization::LocalizationNode::getParams() {
   if (lidar_fov_min_valid_points <
           static_cast<int>(kDefaultMinimumFovPoints) ||
       lidar_fov_min_valid_points >
-          static_cast<int>(kMaximumFovSamplePoints)) {
+          static_cast<int>(kMaximumMinimumFovPoints)) {
     throw std::invalid_argument(
         "localization/lidar_quality/min_valid_points must be within "
-        "[100, 20000]");
+        "[100, 10000]");
   }
   this->lidar_fov_min_valid_points_ =
       static_cast<size_t>(lidar_fov_min_valid_points);
   RCLCPP_INFO(
       this->get_logger(),
-      "LiDAR vertical-FOV gate active: nominal Robin W %.1f deg, reject "
-      "robust spans below %.1f deg or clouds with fewer than %zu valid "
+      "LiDAR startup FOV gate active: nominal Robin W %.1f deg, reject "
+      "occupied spans below %.1f deg or clouds with fewer than %zu valid "
       "sampled returns",
       kNominalRobinWVerticalFovDeg, this->lidar_min_vertical_fov_deg_,
       this->lidar_fov_min_valid_points_);
@@ -1973,8 +1983,11 @@ void gicp_localization::LocalizationNode::getParams() {
   RCLCPP_INFO(this->get_logger(), "Localization mode: %s",
               this->imu_only_mode_ ? "IMU-only (GICP disabled)" : "GICP + IMU");
   RCLCPP_INFO(this->get_logger(),
-              "GICP rejection: fitness>%.3f, large_jump=%s, hessian_cond>%.2e AND (fitness>%.3f OR trans>%.2fm OR rot>%.2fdeg) (%s)",
+              "GICP rejection: fitness>%.3f m^2, correspondence_ratio<%.2f, "
+              "large_jump=%s, hessian_cond>%.2e AND "
+              "(fitness>%.3f OR trans>%.2fm OR rot>%.2fdeg) (%s)",
               this->gicp_fitness_reject_threshold_,
+              this->gicp_min_correspondence_ratio_,
               this->gicp_reject_large_jumps_ ? "on" : "off",
               this->gicp_hessian_cond_max_,
               this->gicp_hessian_fitness_warn_,
@@ -2745,28 +2758,57 @@ void gicp_localization::LocalizationNode::callbackInitialPose(
 void gicp_localization::LocalizationNode::callbackPointCloud(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
 
-  VerticalFovMeasurement fov;
-  if (!verticalFovAccepted(
-          *pc_in, this->lidar_min_vertical_fov_deg_,
-          this->lidar_fov_min_valid_points_, &fov)) {
-    RCLCPP_ERROR_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Rejecting primary LiDAR cloud before SLAM: robust vertical FOV "
-        "%.2f deg (elevation %.2f..%.2f deg), required >= %.2f deg; "
-        "valid sampled returns=%zu/%zu. Reason: %s. A narrowed vertical FOV "
-        "does not provide enough vertical structure for stable GICP.",
-        fov.span_deg, fov.lower_deg, fov.upper_deg,
-        this->lidar_min_vertical_fov_deg_, fov.valid_points,
-        fov.sampled_points, fov.reason);
-    return;
-  }
   if (!this->primary_lidar_fov_validated_) {
+    VerticalFovMeasurement fov;
+    if (!verticalFovAccepted(
+            *pc_in, this->lidar_min_vertical_fov_deg_,
+            this->lidar_fov_min_valid_points_, &fov)) {
+      RCLCPP_ERROR_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Rejecting primary LiDAR startup cloud before SLAM: occupied "
+          "vertical FOV %.2f deg (elevation %.2f..%.2f deg), required "
+          ">= %.2f deg; occupancy=%zu/%zu bins (%zu points/bin required); "
+          "valid sampled returns=%zu/%zu. Reason: %s.",
+          fov.span_deg, fov.lower_deg, fov.upper_deg,
+          this->lidar_min_vertical_fov_deg_, fov.occupied_bins,
+          fov.occupancy_bins, fov.minimum_points_per_bin, fov.valid_points,
+          fov.sampled_points, fov.reason);
+      return;
+    }
     this->primary_lidar_fov_validated_ = true;
     RCLCPP_INFO(
         this->get_logger(),
-        "Primary LiDAR vertical-FOV gate passed: robust span %.2f deg "
-        "(elevation %.2f..%.2f deg, %zu valid sampled returns)",
-        fov.span_deg, fov.lower_deg, fov.upper_deg, fov.valid_points);
+        "Primary LiDAR startup FOV gate passed: occupied span %.2f deg "
+        "(elevation %.2f..%.2f deg, occupancy=%zu/%zu bins, "
+        "%zu valid sampled returns)",
+        fov.span_deg, fov.lower_deg, fov.upper_deg, fov.occupied_bins,
+        fov.occupancy_bins, fov.valid_points);
+  }
+
+  if (!this->lidar_fov_startup_complete_) {
+    bool all_aux_validated = true;
+    if (this->concat_enabled_) {
+      for (const auto& aux : this->aux_lidars_) {
+        std::lock_guard<std::mutex> lock(aux->mtx);
+        if (!aux->vertical_fov_validated) {
+          all_aux_validated = false;
+          break;
+        }
+      }
+    }
+    if (!all_aux_validated) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Waiting for every configured auxiliary LiDAR to pass its startup "
+          "FOV gate; localization has not started");
+      return;
+    }
+    this->lidar_fov_startup_complete_ = true;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "LiDAR startup quality validation complete for primary + %zu "
+        "auxiliary stream(s); runtime FOV checks disabled",
+        this->concat_enabled_ ? this->aux_lidars_.size() : 0U);
   }
 
   if (!this->enu_origin_validated_.load()) {
@@ -3176,20 +3218,37 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
   }
 
   auto& aux = *this->aux_lidars_[aux_index];
-  VerticalFovMeasurement fov;
-  if (!verticalFovAccepted(
-          *msg, this->lidar_min_vertical_fov_deg_,
-          this->lidar_fov_min_valid_points_, &fov)) {
-    RCLCPP_ERROR_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "lidar_concat: rejecting aux LiDAR cloud on '%s' before buffering: "
-        "robust vertical FOV %.2f deg (elevation %.2f..%.2f deg), required "
-        ">= %.2f deg; valid sampled returns=%zu/%zu. Reason: %s.",
-        aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
-        this->lidar_min_vertical_fov_deg_, fov.valid_points,
-        fov.sampled_points, fov.reason);
-    return;
+  {
+    std::lock_guard<std::mutex> lock(aux.mtx);
+    if (!aux.vertical_fov_validated) {
+      VerticalFovMeasurement fov;
+      if (!verticalFovAccepted(
+              *msg, this->lidar_min_vertical_fov_deg_,
+              this->lidar_fov_min_valid_points_, &fov)) {
+        RCLCPP_ERROR_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "lidar_concat: rejecting startup cloud on '%s' before buffering: "
+            "occupied vertical FOV %.2f deg (elevation %.2f..%.2f deg), "
+            "required >= %.2f deg; occupancy=%zu/%zu bins "
+            "(%zu points/bin required); valid sampled returns=%zu/%zu. "
+            "Reason: %s.",
+            aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
+            this->lidar_min_vertical_fov_deg_, fov.occupied_bins,
+            fov.occupancy_bins, fov.minimum_points_per_bin, fov.valid_points,
+            fov.sampled_points, fov.reason);
+        return;
+      }
+      aux.vertical_fov_validated = true;
+      RCLCPP_INFO(
+          this->get_logger(),
+          "Aux LiDAR startup FOV gate passed on '%s': occupied span %.2f deg "
+          "(elevation %.2f..%.2f deg, occupancy=%zu/%zu bins, "
+          "%zu valid sampled returns)",
+          aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
+          fov.occupied_bins, fov.occupancy_bins, fov.valid_points);
+    }
   }
+
   SeyondPointTimeRange point_time_range;
   if (this->sensor == dlio::SensorType::SEYOND &&
       !seyondCloudTimeContractValid(
@@ -3205,13 +3264,8 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
     return;
   }
 
-  bool first_fov_pass = false;
   {
     std::lock_guard<std::mutex> lk(aux.mtx);
-    if (!aux.vertical_fov_validated) {
-      aux.vertical_fov_validated = true;
-      first_fov_pass = true;
-    }
     AuxLidar::BufferedCloud buffered;
     buffered.msg = std::move(msg);
     buffered.point_time_valid = point_time_range.valid;
@@ -3223,14 +3277,6 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
     }
   }
   aux.cv.notify_all();
-  if (first_fov_pass) {
-    RCLCPP_INFO(
-        this->get_logger(),
-        "Aux LiDAR vertical-FOV gate passed on '%s': robust span %.2f deg "
-        "(elevation %.2f..%.2f deg, %zu valid sampled returns)",
-        aux.topic.c_str(), fov.span_deg, fov.lower_deg, fov.upper_deg,
-        fov.valid_points);
-  }
 }
 
 // Resolve every aux LiDAR's T_primary_aux at startup WITHOUT live TF, so the
@@ -4224,17 +4270,19 @@ void gicp_localization::LocalizationNode::performLocalization() {
         ? Eigen::Matrix4f(final_candidate * this->T_prior.inverse())
         : Eigen::Matrix4f(final_candidate * T_base_lidar);
     double applied_fitness = std::numeric_limits<double>::infinity();
+    double applied_optimizer_error =
+        std::numeric_limits<double>::infinity();
     int applied_correspondences = 0;
     if (this->gicp.evaluateFitnessAt(
-            T_eval, &applied_fitness, &applied_correspondences)) {
+            T_eval, &applied_fitness, &applied_correspondences,
+            &applied_optimizer_error)) {
       fitness_score = applied_fitness;
       num_correspondences = applied_correspondences;
       correspondence_ratio = this->current_scan->points.empty()
           ? 0.0
           : static_cast<double>(applied_correspondences) /
                 static_cast<double>(this->current_scan->points.size());
-      final_error =
-          fitness_score * static_cast<double>(num_correspondences);
+      final_error = applied_optimizer_error;
       fitness_ratio = fitness_baseline > 1e-9
           ? fitness_score / fitness_baseline
           : -1.0;
@@ -4411,7 +4459,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
 
     std_msgs::msg::Bool converged_msg;
-    converged_msg.data = (converged || (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_)) && candidate_pose_valid;
+    converged_msg.data =
+        (converged ||
+         (candidate_pose_valid &&
+          fitness_score <= this->gicp_fitness_reject_threshold_)) &&
+        candidate_pose_valid &&
+        correspondence_ratio >= this->gicp_min_correspondence_ratio_;
     this->dbg_converged_pub->publish(converged_msg);
 
     if (gt_pos_err >= 0.0) {
@@ -4531,6 +4584,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
       (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_);
 
   bool gicp_rejected_fitness = false;
+  bool gicp_rejected_correspondence_ratio = false;
   bool gicp_rejected_fitness_ratio = false;
   bool gicp_rejected_rtk_sanity = false;
   bool gicp_rejected_jump = false;
@@ -4546,6 +4600,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
       gicp_rejected_hessian = true;
     } else if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
+    } else if (correspondence_ratio <
+               this->gicp_min_correspondence_ratio_) {
+      gicp_rejected_correspondence_ratio = true;
     } else if (this->fitness_ratio_reject_ > 0.0 && fitness_ratio > 0.0 &&
                fitness_ratio > this->fitness_ratio_reject_) {
       // Wrong-basin gate (P1): fitness far above the map's own rolling-median
@@ -4592,7 +4649,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
   }
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
-                             !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
+                             !gicp_rejected_fitness &&
+                             !gicp_rejected_correspondence_ratio &&
+                             !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_rtk_sanity &&
                              !gicp_rejected_hessian && !gicp_rejected_jump;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
@@ -4606,6 +4665,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
                 fitness_score, this->gicp_fitness_reject_threshold_,
                 build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_correspondence_ratio) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "GICP REJECTED (correspondence_ratio=%.3f < %.3f): %s",
+        correspondence_ratio, this->gicp_min_correspondence_ratio_,
+        build_scan_debug_log("rejected_correspondence_ratio").c_str());
   } else if (gicp_rejected_fitness_ratio) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",

@@ -125,4 +125,37 @@ TEST(SmallGicpBackend, PreparedTargetRejectsMismatchedCovarianceCount) {
       nullptr);
 }
 
+TEST(SmallGicpBackend, FitnessIncludesPointsOutsideCorrespondenceRadius) {
+  gicp_plusplus::SmallGicpBackend<PointType, PointType> backend;
+  backend.setNumThreads(1);
+  backend.setCorrespondenceRandomness(10);
+  backend.setMaxCorrespondenceDistance(2.0);
+  backend.setMaximumIterations(10);
+
+  auto target = makeCloud();
+  auto source = makeCloud();
+  PointType unmatched;
+  unmatched.x = 10.0F;
+  unmatched.y = 0.0F;
+  unmatched.z = 0.0F;
+  source->push_back(unmatched);
+
+  backend.setInputTarget(target);
+  ASSERT_TRUE(backend.calculateTargetCovariances());
+  backend.setInputSource(source);
+  pcl::PointCloud<PointType> output;
+  backend.align(output, Eigen::Matrix4f::Identity());
+  EXPECT_EQ(backend.num_correspondences, static_cast<int>(target->size()));
+  EXPECT_GT(backend.getFitnessScore(), 2.0);
+
+  double fitness = std::numeric_limits<double>::infinity();
+  double optimizer_error = std::numeric_limits<double>::infinity();
+  int inliers = 0;
+  ASSERT_TRUE(backend.evaluateFitnessAt(
+      Eigen::Matrix4f::Identity(), &fitness, &inliers, &optimizer_error));
+  EXPECT_EQ(inliers, static_cast<int>(target->size()));
+  EXPECT_NEAR(optimizer_error, 0.0, 1.0e-9);
+  EXPECT_GT(fitness, 2.0);
+}
+
 }  // namespace

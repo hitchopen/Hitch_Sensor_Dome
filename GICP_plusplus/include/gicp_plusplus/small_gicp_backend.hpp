@@ -389,14 +389,18 @@ class SmallGicpBackend {
     rotation_prior_info_.setZero();
   }
 
-  // [REVIEW FIX 2026-07-08 P1] Evaluate the pure point-residual fitness
-  // (error / inliers) and correspondence support at an ARBITRARY pose in the
-  // same solution space align() used. Needed because degeneracy projection /
+  // Evaluate the legacy-compatible Euclidean fitness and small_gicp
+  // correspondence support at an ARBITRARY pose in the same solution space
+  // align() used. Needed because degeneracy projection /
   // the yaw veto can modify the applied pose AFTER the solve: gating that
   // modified pose on the raw optimizer fitness would validate a pose nobody
   // is applying. Requires a prior align() on the same source/target (reuses
   // its covariances); returns false when evaluation is impossible.
-  bool evaluateFitnessAt(const Eigen::Matrix4f& T, double* fitness, int* inliers) {
+  bool evaluateFitnessAt(
+      const Eigen::Matrix4f& T,
+      double* fitness,
+      int* inliers,
+      double* optimizer_error = nullptr) {
     if (!target_ || target_->empty() || !target_tree_ || !target_covs_ ||
         !input_ || input_->empty() ||
         source_covs_.size() != input_->size() || target_covs_->size() != target_->size() ||
@@ -418,14 +422,16 @@ class SmallGicpBackend {
     const size_t n = static_cast<size_t>(std::count_if(
         factors.begin(), factors.end(), [](const auto& f) { return f.inlier(); }));
     if (inliers) *inliers = static_cast<int>(n);
-    const double f = (n > 0) ? e / static_cast<double>(n)
-                             : std::numeric_limits<double>::infinity();
+    if (optimizer_error) {
+      *optimizer_error =
+          std::isfinite(e) ? e : std::numeric_limits<double>::infinity();
+    }
+    const double f =
+        legacyEuclideanFitness(Eigen::Isometry3d(T.cast<double>()));
     if (fitness) {
       *fitness = std::isfinite(f) ? f : std::numeric_limits<double>::infinity();
     }
-    // [REVIEW FIX 2026-07-08 P2] Non-finite error/fitness = evaluation
-    // failed; callers treat `false` as fail-closed (fitness forced to +inf).
-    return n > 0 && std::isfinite(f);
+    return n > 0 && std::isfinite(e) && std::isfinite(f);
   }
 
   void align(PointCloudSource& output, const Eigen::Matrix4f& guess) {
@@ -487,13 +493,13 @@ class SmallGicpBackend {
     final_transformation_ = result_.T_target_source.matrix().cast<float>();
     final_error_ = result_.error;
     num_correspondences = static_cast<int>(result_.num_inliers);
-    final_fitness_ = num_correspondences > 0
-        ? result_.error / static_cast<double>(num_correspondences)
-        : std::numeric_limits<double>::infinity();
-    // [REVIEW FIX 2026-07-08 P2] NaN error (degenerate covariances, NaN
-    // points) must fail CLOSED: a NaN fitness makes every `>` threshold
-    // comparison false downstream, silently accepting the scan.
-    if (!std::isfinite(final_fitness_)) {
+    // Preserve nano_gicp's public fitness contract: mean squared Euclidean
+    // nearest-neighbor distance over every source point, with no
+    // correspondence-distance cutoff. The localization thresholds and
+    // rolling baselines are calibrated in these m^2 units. small_gicp's
+    // Mahalanobis inlier energy remains available through getFinalError().
+    final_fitness_ = legacyEuclideanFitness(result_.T_target_source);
+    if (!std::isfinite(final_error_) || !std::isfinite(final_fitness_)) {
       final_fitness_ = std::numeric_limits<double>::infinity();
     }
 
@@ -521,6 +527,39 @@ class SmallGicpBackend {
   int num_correspondences;
 
  private:
+  double legacyEuclideanFitness(const Eigen::Isometry3d& T) const {
+    if (!target_tree_ || !input_ || input_->empty() ||
+        !T.matrix().allFinite()) {
+      return std::numeric_limits<double>::infinity();
+    }
+
+    double squared_distance_sum = 0.0;
+    for (const auto& point : input_->points) {
+      const Eigen::Vector4d source_point(
+          static_cast<double>(point.x),
+          static_cast<double>(point.y),
+          static_cast<double>(point.z),
+          1.0);
+      if (!source_point.allFinite()) {
+        return std::numeric_limits<double>::infinity();
+      }
+
+      size_t target_index = 0;
+      double squared_distance = std::numeric_limits<double>::infinity();
+      const size_t found = target_tree_->nearest_neighbor_search(
+          T * source_point, &target_index, &squared_distance);
+      if (found == 0 || !std::isfinite(squared_distance) ||
+          squared_distance < 0.0) {
+        return std::numeric_limits<double>::infinity();
+      }
+      squared_distance_sum += squared_distance;
+      if (!std::isfinite(squared_distance_sum)) {
+        return std::numeric_limits<double>::infinity();
+      }
+    }
+    return squared_distance_sum / static_cast<double>(input_->size());
+  }
+
   int num_threads_;
   int k_correspondences_;
   double max_corr_dist_;

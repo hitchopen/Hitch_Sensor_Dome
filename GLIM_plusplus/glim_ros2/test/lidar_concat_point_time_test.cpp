@@ -1,5 +1,8 @@
+#include <cmath>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -183,6 +186,80 @@ sensor_msgs::msg::PointCloud2 xyz_time_cloud(
       &times[i], sizeof(TimeT));
   }
   return msg;
+}
+
+sensor_msgs::msg::PointCloud2::SharedPtr fov_primary_cloud(
+    double half_span_deg) {
+  std::vector<double> times(101);
+  for (size_t i = 0; i < times.size(); ++i) {
+    times[i] = 1'700'000'000.0 + static_cast<double>(i) * 1.0e-5;
+  }
+  auto msg = std::make_shared<sensor_msgs::msg::PointCloud2>(
+      xyz_time_cloud<double>(
+          "timestamp", sensor_msgs::msg::PointField::FLOAT64,
+          times, times.front()));
+  for (size_t i = 0; i < times.size(); ++i) {
+    const double elevation =
+        (-half_span_deg +
+         2.0 * half_span_deg * static_cast<double>(i) /
+             static_cast<double>(times.size() - 1)) *
+        3.14159265358979323846 / 180.0;
+    const float x = static_cast<float>(10.0 * std::cos(elevation));
+    const float z = static_cast<float>(10.0 * std::sin(elevation));
+    std::memcpy(msg->data.data() + i * msg->point_step, &x, sizeof(x));
+    std::memcpy(msg->data.data() + i * msg->point_step + 8, &z, sizeof(z));
+  }
+  return msg;
+}
+
+TEST(LidarConcatPointTime, PrimaryFovFailureUsesStrictMergeHandler) {
+  std::vector<glim_ros::AuxLidarSensor> aux_sensors;
+  glim_ros::LidarQualityConfig quality;
+  int consecutive_failures = 0;
+
+  EXPECT_THROW(
+      glim_ros::merge_clouds(
+          fov_primary_cloud(10.0), aux_sensors, 0.05, quality,
+          true, 0, &consecutive_failures, true),
+      std::runtime_error);
+  EXPECT_EQ(consecutive_failures, 1);
+  EXPECT_EQ(quality.primary_reject_count, 1U);
+}
+
+TEST(LidarConcatPointTime, StartupFovFailureCannotBeBypassedByDegradedMode) {
+  std::vector<glim_ros::AuxLidarSensor> aux_sensors;
+  glim_ros::LidarQualityConfig quality;
+  int consecutive_failures = 0;
+  const auto primary = fov_primary_cloud(10.0);
+
+  const auto result = glim_ros::merge_clouds(
+      primary, aux_sensors, 0.05, quality,
+      false, 0, &consecutive_failures, true);
+  EXPECT_EQ(result, nullptr);
+  EXPECT_EQ(consecutive_failures, 0);
+  EXPECT_EQ(quality.primary_reject_count, 1U);
+}
+
+TEST(LidarConcatPointTime, StartupFovValidationIsOneShot) {
+  std::vector<glim_ros::AuxLidarSensor> aux_sensors;
+  glim_ros::LidarQualityConfig quality;
+  int consecutive_failures = 0;
+
+  EXPECT_NE(
+      glim_ros::merge_clouds(
+          fov_primary_cloud(15.0), aux_sensors, 0.05, quality,
+          false, 0, &consecutive_failures, true),
+      nullptr);
+  EXPECT_TRUE(quality.primary_validated);
+  EXPECT_TRUE(quality.startup_validation_complete);
+
+  // Runtime clouds are not re-measured after startup validation.
+  EXPECT_NE(
+      glim_ros::merge_clouds(
+          fov_primary_cloud(10.0), aux_sensors, 0.05, quality,
+          false, 0, &consecutive_failures, true),
+      nullptr);
+  EXPECT_EQ(quality.primary_reject_count, 0U);
 }
 
 TEST(LidarConcatPointTime, RobinWContractIsFloat64AbsoluteTime) {

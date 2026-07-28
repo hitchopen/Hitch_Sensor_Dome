@@ -156,54 +156,65 @@ bool posePassesRtkGate(const fusion_engine_msgs::msg::Pose& msg,
 // UB int casts; clamp to a sane floor.
 P1ClockMapper::P1ClockMapper(double bin_seconds) : bin_seconds_(std::max(1.0, bin_seconds)) {}
 
-void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
+bool P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
 {
-  // [P2 FIX 2026-07-09] Input validation + epoch-reset handling. FusionEngine
+  // Input validation and active-epoch bounds. FusionEngine
   // encodes "time not yet available" as 0xFFFFFFFF in both Timestamp fields
-  // (~4.29e9 s): as the FIRST sample it used to poison first_p1_ (every later
-  // genuine sample -> bin < 0 -> mapper never ready -> zero IMU all run); as a
-  // LATER sample it triggered a ~1.7 GB bins_.resize() inside a callback.
-  // A P1 regression (device power-cycle, bag loop) used to freeze the mapper
-  // forever (bin < 0 on every subsequent pair).
+  // (~4.29e9 s). Epoch changes are accepted only through reset(), where the
+  // node also resets every other timestamp-domain state.
   constexpr double kInvalidP1SentinelSec = 4.0e9;  // sentinel converts to ~4.29e9
-  constexpr double kResetThresholdSec = 5.0;       // backward jump = epoch change
   constexpr double kMaxSessionSec = 24.0 * 3600.0; // forward cap (bin count <= 1440)
-  constexpr int kGlitchResetCount = 100;           // persistent forward jump = epoch change
+  constexpr double kMaximumEarlyLagStepSec = 1.0;
 
-  if (!std::isfinite(arrival_ros) || !std::isfinite(p1_time) || p1_time < 0.0 ||
+  if (!std::isfinite(arrival_ros) || !std::isfinite(p1_time) || p1_time <= 0.0 ||
       p1_time >= kInvalidP1SentinelSec) {
-    return;
+    return false;
   }
   if (std::isfinite(first_p1_)) {
     const double rel = p1_time - first_p1_;
-    if (rel < -kResetThresholdSec) {
-      // Backward epoch change: re-learn from scratch.
-      bins_.clear();
-      first_p1_ = p1_time;
-      forward_glitch_streak_ = 0;
-      applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
-    } else if (rel > kMaxSessionSec) {
-      // Single forward glitches are rejected; a persistent forward jump is a
-      // real epoch change and resets the mapper.
-      if (++forward_glitch_streak_ >= kGlitchResetCount) {
-        bins_.clear();
-        first_p1_ = p1_time;
-        forward_glitch_streak_ = 0;
-        applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
-      } else {
-        return;
-      }
-    } else {
-      forward_glitch_streak_ = 0;
+    if (rel < 0.0 || rel > kMaxSessionSec) {
+      return false;
     }
   }
+
+  const double lag = arrival_ros - p1_time;
+  if (!std::isfinite(lag)) {
+    return false;
+  }
+
+  // A forward P1 glitch makes lag abruptly smaller. It must not become the
+  // minimum of a wide clock bin, where one bad pair could shift every later
+  // sample. Use the slewed offset when available, otherwise the best
+  // established bin floor, as the active-domain reference.
+  double lag_reference = applied_offset_;
+  if (!std::isfinite(lag_reference)) {
+    for (const auto& bin : bins_) {
+      if (bin.count > 0) {
+        lag_reference = std::isfinite(lag_reference)
+            ? std::min(lag_reference, bin.min_lag)
+            : bin.min_lag;
+      }
+    }
+  }
+  if (std::isfinite(lag_reference) &&
+      lag < lag_reference - kMaximumEarlyLagStepSec &&
+      std::isfinite(last_pair_arrival_) &&
+      std::isfinite(last_pair_p1_)) {
+    const double arrival_advance = arrival_ros - last_pair_arrival_;
+    const double p1_advance = p1_time - last_pair_p1_;
+    if (p1_advance >
+        std::max(0.0, arrival_advance) + kMaximumEarlyLagStepSec) {
+      return false;
+    }
+  }
+
   if (!std::isfinite(first_p1_)) {
     first_p1_ = p1_time;
   }
 
   const int bin = static_cast<int>(std::floor((p1_time - first_p1_) / bin_seconds_));
   if (bin < 0) {
-    return;
+    return false;
   }
   if (static_cast<size_t>(bin) >= bins_.size()) {
     bins_.resize(static_cast<size_t>(bin) + 1);
@@ -212,7 +223,10 @@ void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
   auto& b = bins_[static_cast<size_t>(bin)];
   b.count++;
   b.center_sum += p1_time;
-  b.min_lag = std::min(b.min_lag, arrival_ros - p1_time);
+  b.min_lag = std::min(b.min_lag, lag);
+  last_pair_arrival_ = arrival_ros;
+  last_pair_p1_ = p1_time;
+  return true;
 }
 
 bool P1ClockMapper::ready() const
@@ -226,7 +240,9 @@ void P1ClockMapper::reset()
   first_p1_ = std::numeric_limits<double>::quiet_NaN();
   applied_offset_ = std::numeric_limits<double>::quiet_NaN();
   last_slew_p1_ = std::numeric_limits<double>::quiet_NaN();
-  forward_glitch_streak_ = 0;
+  last_pair_arrival_ = std::numeric_limits<double>::quiet_NaN();
+  last_pair_p1_ = std::numeric_limits<double>::quiet_NaN();
+  ++reset_count_;
 }
 
 double P1ClockMapper::toRos(double p1_time)
@@ -270,15 +286,17 @@ double P1ClockMapper::toRos(double p1_time)
   // 0.5 ms per second of stream keeps consecutive output stamps' dt within
   // ~0.5% of nominal even while bin refinement moves the raw estimate.
   constexpr double kMaxSlewPerSec = 5e-4;
-  if (!std::isfinite(applied_offset_) || !std::isfinite(last_slew_p1_) ||
-      p1_time < last_slew_p1_ - 1.0) {
+  if (!std::isfinite(applied_offset_) || !std::isfinite(last_slew_p1_)) {
     applied_offset_ = target_offset;  // first use or epoch reset: re-anchor
+    last_slew_p1_ = p1_time;
   } else {
-    const double budget = kMaxSlewPerSec * std::max(0.0, p1_time - last_slew_p1_) + 1e-12;
+    const double monotone_p1 = std::max(p1_time, last_slew_p1_);
+    const double budget =
+        kMaxSlewPerSec * (monotone_p1 - last_slew_p1_) + 1e-12;
     const double delta = target_offset - applied_offset_;
     applied_offset_ += std::clamp(delta, -budget, budget);
+    last_slew_p1_ = monotone_p1;
   }
-  last_slew_p1_ = p1_time;
   return p1_time + applied_offset_;
 }
 

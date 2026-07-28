@@ -33,12 +33,15 @@ class P1ClockMapper {
 public:
   explicit P1ClockMapper(double bin_seconds);
 
-  void addPosePair(double arrival_ros, double p1_time);
+  // Returns false when the pair is invalid, outside the active epoch, or
+  // would move the observed arrival-minus-P1 floor implausibly backwards.
+  bool addPosePair(double arrival_ros, double p1_time);
   bool ready() const;
-  // [P1 FIX 2026-07-15] Force a re-anchor (clear bins + slew + streaks). The
+  // Force a re-anchor (clear bins and slew state). The
   // node calls this when it accepts an epoch change (backward power-cycle OR a
   // persistence-confirmed forward epoch), so the mapper never carries a stale
-  // min-lag from the previous epoch into the new one.
+  // min-lag from the previous epoch into the new one. resetCount() preserves
+  // observability even though the current epoch's bins start clean.
   void reset();
   // [P3 FIX 2026-07-10] Non-const: applies a SLEW-LIMITED offset. Online
   // bin refinement moves the raw offset in steps (each new bin contributes
@@ -48,6 +51,7 @@ public:
   // rate; mapper resets (epoch change) re-anchor it instantly.
   double toRos(double p1_time);
   double driftMs() const;
+  uint64_t resetCount() const { return reset_count_; }
 
 private:
   struct Bin {
@@ -61,12 +65,11 @@ private:
   double bin_seconds_;
   double applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: slewed offset
   double last_slew_p1_ = std::numeric_limits<double>::quiet_NaN();
+  double last_pair_arrival_ = std::numeric_limits<double>::quiet_NaN();
+  double last_pair_p1_ = std::numeric_limits<double>::quiet_NaN();
   double first_p1_ = std::numeric_limits<double>::quiet_NaN();
   std::vector<Bin> bins_;
-  // [P2 FIX 2026-07-09] consecutive forward-glitch counter: a persistent
-  // forward jump (device epoch change) resets the mapper after
-  // kGlitchResetCount rejects instead of freezing it forever.
-  int forward_glitch_streak_ = 0;
+  uint64_t reset_count_ = 0;
 };
 
 }  // namespace adapter
